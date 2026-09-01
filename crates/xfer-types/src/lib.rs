@@ -100,7 +100,7 @@ impl<'a> From<&'a str> for Gid {
 }
 
 impl PeerId {
-    /// 按引擎版本生成 Azureus 风格前缀（如 0.1.0 → `-XR0100-`），
+    /// 按引擎版本生成 Azureus 风格前缀（如 0.2.0 → `-XR0200-`），
     /// 尾部以随机字节填满 20 字节。
     pub fn azureus_prefix(random: &[u8; 12]) -> Self {
         let (maj, min, mic) = version_tuple();
@@ -200,9 +200,12 @@ mod tests {
 
     #[test]
     fn peer_id_prefix_matches_engine_version() {
+        // 期望值从 ENGINE_VERSION 派生，版本升级时无需改测试
+        let (maj, min, mic) = version_tuple();
         let pid = PeerId::azureus_prefix(&[0x41; 12]);
-        assert_eq!(&pid.0[..8], b"-XR0100-");
-        assert_eq!(pid.parse_azureus(), Some((0, 1, 0)));
+        let exp = format!("-XR{maj}{min}{mic}0-");
+        assert_eq!(&pid.0[..8], exp.as_bytes());
+        assert_eq!(pid.parse_azureus(), Some((maj, min, mic)));
         // 非本客户端风格
         let mut other = [0u8; 20];
         other[..8].copy_from_slice(b"-UT3600-");
