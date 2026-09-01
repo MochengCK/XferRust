@@ -57,6 +57,12 @@ futures-util = "0.3"
 name = "xfer"
 path = "src/bin/xfer.rs"
 
+# 发布体积优化：
+# - strip=true        删除符号表/调试信息（省 ~18-20%，无行为影响）
+# - lto="fat"         全量 LTO，跨 crate 消除未用代码（比 thin 更彻底，编译更慢）
+# - opt-level="s"     按体积优化编译（-Os），进一步压缩代码段（换取少量运行时开销）
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
+opt-level = "s"
+strip = true

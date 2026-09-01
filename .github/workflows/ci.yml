@@ -1,10 +1,11 @@
 name: CI
 
-# 触发：push 到 main、v* 标签、PR、手动。打 v* 标签时构建+测试全绿后自动发版并回填发布说明。
+# 触发：push 到 main、PR、手动。
+# 每次 push 到 main 都会构建+测试；release 作业随后按代码版本号自动管理 Release：
+# 无对应版本 → 自动创建（首次自动生成说明）；版本未变 → 仅覆盖产物、保留原说明。
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -77,19 +78,28 @@ jobs:
           "dist/xfer" --version
           "dist/xferrust" --version
 
-      - name: Package artifacts
+      - name: Package artifacts (TUI 与引擎内核分开打包)
         shell: bash
         run: |
           EXT=; [ "$RUNNER_OS" = "Windows" ] && EXT=.exe
-          cp LICENSE dist/
-          cp README.md dist/
-          tar -C dist -czf "xfer-${{ matrix.artifact }}.tar.gz" "xfer$EXT" "xferrust$EXT" LICENSE README.md
+          # TUI 版：仅 xfer
+          mkdir -p pkg-xfer
+          cp "dist/xfer$EXT" "pkg-xfer/xfer$EXT"
+          cp LICENSE README.md pkg-xfer/
+          tar -C pkg-xfer -czf "xfer-${{ matrix.artifact }}.tar.gz" "xfer$EXT" LICENSE README.md
+          # 引擎内核版（无 TUI）：仅 xferrust
+          mkdir -p pkg-xferrust
+          cp "dist/xferrust$EXT" "pkg-xferrust/xferrust$EXT"
+          cp LICENSE README.md pkg-xferrust/
+          tar -C pkg-xferrust -czf "xferrust-${{ matrix.artifact }}.tar.gz" "xferrust$EXT" LICENSE README.md
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xfer-${{ matrix.artifact }}
-          path: xfer-${{ matrix.artifact }}.tar.gz
+          name: build-${{ matrix.artifact }}
+          path: |
+            xfer-${{ matrix.artifact }}.tar.gz
+            xferrust-${{ matrix.artifact }}.tar.gz
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -112,10 +122,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download build artifact
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          name: xfer-${{ matrix.artifact }}
+          name: build-${{ matrix.artifact }}
           path: bin/
 
       - name: Extract binaries
@@ -123,6 +133,7 @@ jobs:
         run: |
           mkdir -p bin
           tar -xzf "bin/xfer-${{ matrix.artifact }}.tar.gz" -C bin
+          tar -xzf "bin/xferrust-${{ matrix.artifact }}.tar.gz" -C bin
           ls -la bin
 
       - name: Run strict functional tests
@@ -150,11 +161,13 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # 发布：仅 v* 标签，构建+测试全绿后创建 Release 并自动回填版本发布说明
+  # 发布：构建+测试全绿后，按代码版本号自动创建/更新 Release。
+  # - 无 v<版本> Release → 首次创建（gh --generate-notes 自动生成说明）
+  # - v<版本> 已存在    → 仅覆盖产物（--clobber），说明保持不变
   # ---------------------------------------------------------------------------
   release:
-    name: Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Release (自动创建/覆盖)
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     needs: [build, test]
     runs-on: ubuntu-latest
     permissions:
@@ -168,30 +181,22 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
-      - name: Extract version from tag
-        id: version
+      - name: "Create or update release (说明仅首次生成, 产物自动覆盖)"
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG#v}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: XferRust v${{ steps.version.outputs.version }}
-          generate_release_notes: true
-          body: |
-            ## XferRust v${{ steps.version.outputs.version }}
-
-            ### 平台二进制（TUI + 引擎内核）
-            - **Linux x86_64** — `xfer-linux-x86_64.tar.gz`（xfer: TUI / xferrust: 引擎内核，无 TUI）
-            - **Windows x86_64** — `xfer-windows-x86_64.tar.gz`（xfer.exe: TUI / xferrust.exe: 引擎内核，无 TUI）
-            - **macOS 通用二进制** — `xfer-darwin-universal.tar.gz`（同时支持 Intel x86_64 与 Apple Silicon arm64；xfer: TUI / xferrust: 引擎内核，无 TUI）
-
-            > 本次发布已在 Linux / Windows / macOS 上通过严格测试：引擎可运行、HTTP / HTTPS 下载、磁力（ut_metadata）下载均校验通过。
-            > 以下为根据 commit / PR 自动生成的变更记录。
-          files: artifacts/**
-          fail_on_unmatched_files: false
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' Cargo.toml | head -1)"
+          [ -n "$VERSION" ] || { echo "无法从 Cargo.toml 提取版本号"; exit 1; }
+          TAG="v${VERSION}"
+          echo "当前代码版本: ${TAG}"
+          ls -1 artifacts/*.tar.gz
+          if gh release view "$TAG" --json id >/dev/null 2>&1; then
+            echo ">>> Release ${TAG} 已存在 → 仅覆盖产物，保留原说明"
+            gh release upload "$TAG" artifacts/*.tar.gz --clobber
+          else
+            echo ">>> Release ${TAG} 不存在 → 首次创建（自动生成说明）"
+            gh release create "$TAG" artifacts/*.tar.gz \
+              --title "XferRust v${VERSION}" --generate-notes
+          fi
