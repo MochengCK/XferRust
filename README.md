@@ -28,10 +28,6 @@
 
 从 GitHub [Releases](https://github.com/MochengCK/XferRust/releases) 页面下载。
 
-> **发布机制**：每次 push 到 `main` 都会自动构建、测试，并把产物更新到对应版本的
-> Release **草稿**；确认无误后在 Releases 页手动发布。发布说明仅在首次创建时自动生成，
-> 后续只覆盖产物、不会改动说明。
-
 ### 从源码构建
 
 需要 [Rust 工具链](https://rustup.rs/)：
