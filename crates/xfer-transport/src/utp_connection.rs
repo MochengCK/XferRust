@@ -24,8 +24,15 @@ use super::utp_packet::*;
 const DEFAULT_PACKET_SIZE: u32 = 1400;
 /// 最小包大小（超时后收缩到此值）。
 const MIN_PACKET_SIZE: u32 = 150;
-/// 接收窗口（1MB，§7.9：≥1MB）。
-const RECV_WINDOW: u32 = 1024 * 1024;
+/// 初始拥塞窗口（包数）。对齐 TCP 初始窗口惯例（RFC 6928）：新连接
+/// 冷启动要尽快完成握手 + 首批数据交换，2 包起步需多轮 RTT 慢启动。
+const INITIAL_CWND_PACKETS: u32 = 10;
+/// 接收窗口（8MB）。吞吐硬顶 = 窗口 / RTT（带宽时延积）：1MB 窗口下
+/// 300ms RTT 的节点最多 ~3.5MB/s；8MB 覆盖 15MB/s × 500ms RTT 的 BDP。
+const RECV_WINDOW: u32 = 8 * 1024 * 1024;
+/// 乱序重组缓冲独立上限：只需容纳真实的乱序突发（通常几个包），
+/// 与通告窗口解耦，防止对端大量乱序灌入时内存失控。
+const REORDER_WINDOW: u32 = 1024 * 1024;
 /// LEDBAT 目标单向延迟（100ms = 100_000µs）。
 const CC_TARGET_US: u32 = 100_000;
 /// 基线延迟窗口（2 分钟）。
@@ -83,7 +90,8 @@ pub struct UtpConnection {
     error: bool,
 
     // sequence
-    seq: u16, // 最后使用的序列号
+    seq: u16, // 下一个待消耗的序列号（ST_DATA/ST_FIN 消耗，ST_STATE 不消耗）
+    syn_seq: u16, // 首次 SYN 的序列号（重传 SYN 必须复发原始序号）
     ack: u16, // 最后连续接收的序列号
     syn_acked: bool,
 
@@ -141,24 +149,35 @@ impl UtpConnection {
     /// SYN 在 `process_tick()` 中被编码到 outbox。
     /// `syn_timeout` 为可选的 SYN 总预算（None = 默认 4 次 RTO 倍增重试）。
     pub fn new_outbound(remote_addr: SocketAddr, now: Instant) -> Self {
-        // 随机连接 ID
+        // BEP 29 / libtorrent（utp_socket_manager::new_utp_socket + send_syn）：
+        // 发起方 conn_id_recv = random（偶数），conn_id_send = conn_id_recv + 1。
+        // SYN 特殊：携带 recv_id（"期望收到 SYN-ACK 的 id"）；之后我方所有
+        // 包携带 send_id（= recv_id + 1）。对端（响应方）据此以 SYN.conn_id
+        // 作为其 send_id、SYN.conn_id + 1 作为其 recv_id：
+        //   - 对端回复携带 SYN.conn_id = 我方 recv_id → 命中本连接注册键；
+        //   - 我方数据包携带 send_id = recv_id + 1 = 对端 recv_id → 对端接受。
+        // 此前实现 send_id=rand、recv_id=send_id+1 且 SYN/数据都带 send_id：
+        // 对端回复（携带 send_id）匹配不到注册在 send_id+1 的连接，我方数据
+        // （携带 send_id）也被对端（期望 send_id+1）丢弃——与任何标准客户端
+        // 都无法完成握手，表现为"uTP 连接无客户端、无速度"后全部回退 TCP。
         let mut id_bytes = [0u8; 2];
         let _ = getrandom::fill(&mut id_bytes);
-        let send_id = u16::from_be_bytes(id_bytes);
-        let recv_id = send_id.wrapping_add(1);
+        let recv_id = u16::from_be_bytes(id_bytes) & 0xFFFE; // 偶数，预留 send=recv+1
+        let send_id = recv_id.wrapping_add(1);
         let mut conn = Self {
             remote_addr,
             recv_id,
             send_id,
             state: UtpState::SynSent,
             error: false,
-            seq: 1,
+            seq: 2, // SYN 从 1 开始并消耗它：首个 DATA 的序号为 2
+            syn_seq: 1,
             ack: 0,
             syn_acked: false,
             pending_send: VecDeque::new(),
             send_queue: VecDeque::new(),
             cur_window: 0,
-            max_window: DEFAULT_PACKET_SIZE * 2,
+            max_window: DEFAULT_PACKET_SIZE * INITIAL_CWND_PACKETS,
             packet_size: DEFAULT_PACKET_SIZE,
             peer_wnd: 0x7FFF_FFFF,
             want_write: false,
@@ -190,7 +209,7 @@ impl UtpConnection {
             ts_diff_echo: 0,
             outbox: Vec::new(),
         };
-        // 在构造时直接编码 SYN 到 outbox
+        // 在构造时直接编码 SYN 到 outbox（携带 recv_id，见 queue_control）
         conn.queue_control(packet_type::ST_SYN, now, 0);
         conn
     }
@@ -205,22 +224,37 @@ impl UtpConnection {
         ack_nr: u16,
         now: Instant,
     ) -> Self {
-        // 响应方：入站包用对端 SYN 中的 id；出站包用 id+1
-        let recv_id = peer_recv_id;
-        let send_id = peer_recv_id.wrapping_add(1);
+        // BEP 29 / libtorrent（响应方）：收到的 SYN 携带发起方的 recv_id，
+        // 记为 C。我方回复（SYN-ACK/数据/ACK）必须携带 C（发起方按自己的
+        // recv_id=C 匹配入站包）；发起方后续数据包携带其 send_id = C + 1，
+        // 因此我方按 C + 1 匹配入站包。即：
+        //   send_id = C（SYN 中的 id），recv_id = C + 1。
+        // 此前实现两者颠倒：回复携带 C+1 被发起方（期望 C）丢弃，发起方
+        // 数据包（携带 C+1）也匹配不到注册在 C 的连接，入站 uTP 同样无法
+        // 完成握手。
+        let send_id = peer_recv_id;
+        let recv_id = peer_recv_id.wrapping_add(1);
+        // BEP 29：响应方返回通道的序号初始化为随机数。SYN-ACK(ST_STATE)
+        // 携带该"下一个待用序号"且不消耗，首个 DATA 复用同一序号——
+        // 发起方按 ack_ = SYN-ACK.seq - 1 记账，期望我方首个 DATA 恰为
+        // SYN-ACK.seq。
+        let mut id_bytes = [0u8; 2];
+        let _ = getrandom::fill(&mut id_bytes);
+        let seq = u16::from_be_bytes(id_bytes);
         let mut conn = Self {
             remote_addr,
             recv_id,
             send_id,
             state: UtpState::SynRecv,
             error: false,
-            seq: 0, // 会在 queue_control 中递增
+            seq,
+            syn_seq: 0,
             ack: ack_nr,
             syn_acked: false,
             pending_send: VecDeque::new(),
             send_queue: VecDeque::new(),
             cur_window: 0,
-            max_window: DEFAULT_PACKET_SIZE * 2,
+            max_window: DEFAULT_PACKET_SIZE * INITIAL_CWND_PACKETS,
             packet_size: DEFAULT_PACKET_SIZE,
             peer_wnd: 0x7FFF_FFFF,
             want_write: false,
@@ -372,7 +406,13 @@ impl UtpConnection {
             }
             packet_type::ST_STATE => {
                 if self.state == UtpState::SynSent {
-                    self.ack = hdr.seq_nr;
+                    // libtorrent：SYN-ACK(ST_STATE) 携带的是对端"下一个待用
+                    // 序号"且未被消耗——累计确认必须记 seq_nr - 1（对端尚未
+                    // 发出任何已消耗序号的包）。若记 seq_nr，我方首个 DATA 的
+                    // ack_nr 比对端已发的多 1，libtorrent 的入站校验
+                    // （ack_nr > 已发最大序号）会把包静默丢弃——BT 握手发不
+                    // 出去，正是"uTP 连接无速度后回退 TCP"的根因。
+                    self.ack = hdr.seq_nr.wrapping_sub(1);
                     self.syn_acked = true;
                     self.state = UtpState::Connected;
                 }
@@ -410,11 +450,14 @@ impl UtpConnection {
 
     fn on_data(&mut self, hdr: &PacketHeader, payload: &[u8], now: Instant) {
         let s = hdr.seq_nr;
+        // 每个数据包都要回 ACK（与 libtorrent 一致）：重复包意味着我方
+        // 上一个 ACK 丢了，不回包会让对端再次超时、收缩窗口、吞吐恶性循环。
+        self.ack_pending = true;
         if payload.is_empty() {
             return;
         }
         if seq_leq(s, self.ack) {
-            return; // 重复/旧包
+            return; // 重复/旧包（仍由上面的 ack_pending 回 ACK）
         }
         if s == self.ack.wrapping_add(1) {
             // 连续：交付，然后排空乱序缓冲
@@ -429,10 +472,9 @@ impl UtpConnection {
                 self.recv_out.extend(p.payload);
                 self.ack = next_seq;
             }
-            self.ack_pending = true;
         } else {
-            // 乱序：缓冲，受窗口约束
-            if self.recv_buffered + payload.len() as u32 <= RECV_WINDOW {
+            // 乱序：缓冲，受重组窗口约束（与通告窗口解耦）
+            if self.recv_buffered + payload.len() as u32 <= REORDER_WINDOW {
                 // 同 seq 重复乱序包：先扣旧
                 if let Some(dup) = self.recv_reorder.remove(&s) {
                     self.recv_buffered -= dup.payload.len() as u32;
@@ -446,7 +488,6 @@ impl UtpConnection {
                 );
                 self.recv_buffered += payload.len() as u32;
             }
-            self.ack_pending = true;
         }
         self.want_read = true;
     }
@@ -482,6 +523,11 @@ impl UtpConnection {
         }
         if freed > 0 {
             self.cur_window = self.cur_window.saturating_sub(freed);
+            // 超时塌缩到最小包只是丢包探测：一旦有新数据被确认（链路恢复），
+            // 恢复默认包大小——否则 150B 载荷永久拖低吞吐（包头开销占比过高）。
+            if self.packet_size < DEFAULT_PACKET_SIZE {
+                self.packet_size = DEFAULT_PACKET_SIZE;
+            }
             if let Some(rtt) = rtt_sample {
                 self.update_rtt(rtt);
             }
@@ -559,8 +605,9 @@ impl UtpConnection {
         if self.fin_pending {
             self.fin_pending = false;
             self.fin_sent = true;
-            self.fin_seq = self.next_seq();
-            self.seq = self.fin_seq;
+            // libtorrent：FIN 携带下一个待用序号但不消耗它（之后不再发
+            // 数据，重传复发同一序号；对端按累计确认覆盖该序号即视为已确认）。
+            self.fin_seq = self.seq;
             if self.state == UtpState::SynSent {
                 self.state = UtpState::Closed;
                 return;
@@ -598,14 +645,17 @@ impl UtpConnection {
                 }
                 let chunk = self.pending_send.len().min(self.packet_size as usize);
                 let payload: Vec<u8> = self.pending_send.drain(..chunk).collect();
+                // seq_ 即"下一个待用序号"：响应方首个 DATA 复用 SYN-ACK 的
+                // 序号（ST_STATE 不消耗序号），与 libtorrent 发起方的期望
+                // （ack_+1）一致。发送后消耗。
                 let op = OutPacket {
                     payload: payload.clone(),
-                    seq: self.next_seq(),
+                    seq: self.seq,
                     send_time: now,
                     size: payload.len() as u32,
                     retransmits: 0,
                 };
-                self.seq = op.seq;
+                self.seq = self.seq.wrapping_add(1);
                 self.queue_data_packet(op, now);
             }
         }
@@ -823,7 +873,20 @@ impl UtpConnection {
     }
 
     fn queue_control(&mut self, type_: u8, now: Instant, seq_for_ack: u16) {
-        let seq_field = if type_ == packet_type::ST_FIN {
+        // BEP 29 / libtorrent：SYN 特殊——携带 recv_id（发起方期望收到
+        // SYN-ACK 的 id；libtorrent send_syn 注释 "using recv_id here is
+        // intentional"）；其余所有包（响应方的 SYN-ACK、双方的数据/ACK/
+        // FIN/RESET）携带 send_id。
+        let conn_id = if type_ == packet_type::ST_SYN {
+            self.recv_id
+        } else {
+            self.send_id
+        };
+        // SYN 重传必须复发原始序号（seq_ 已在首发后前移）；FIN 用冻结的
+        // fin_seq_；ST_STATE（含 SYN-ACK）携带"下一个待用序号"且不消耗。
+        let seq_field = if type_ == packet_type::ST_SYN {
+            self.syn_seq
+        } else if type_ == packet_type::ST_FIN {
             self.fin_seq
         } else {
             self.seq
@@ -840,10 +903,16 @@ impl UtpConnection {
             } else {
                 ext_type::EXT_NONE
             },
-            connection_id: self.send_id,
+            connection_id: conn_id,
             timestamp: now_micros(),
             timestamp_diff: self.ts_diff_echo,
-            wnd_size: self.advertised_wnd(),
+            // libtorrent send_syn：SYN 阶段窗口尚未建立，通告 0；其余包
+            // 通告真实接收窗口。
+            wnd_size: if type_ == packet_type::ST_SYN {
+                0
+            } else {
+                self.advertised_wnd()
+            },
             seq_nr: seq_field,
             ack_nr: if seq_for_ack == 0 {
                 self.ack
@@ -892,10 +961,6 @@ impl UtpConnection {
     /// 取出已编码的出站包（供 UDP socket 发送）。
     pub fn drain_outbox(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.outbox)
-    }
-
-    fn next_seq(&self) -> u16 {
-        self.seq.wrapping_add(1)
     }
 }
 
@@ -1077,17 +1142,82 @@ mod tests {
 
     #[test]
     fn connection_id_direction() {
-        // BEP 29: 发起方所有出站包用 id C，响应方用 C+1
+        // BEP 29: 发起方 conn_id_recv = random（偶数），conn_id_send = recv + 1。
+        // SYN 携带 recv_id；响应方 send_id = SYN.conn_id，recv_id = SYN.conn_id + 1。
         let now = Instant::now();
-        let init = UtpConnection::new_outbound(addr(6881), now);
-        // 发起方 send_id = C，recv_id = C+1
-        assert_eq!(init.recv_id, init.send_id.wrapping_add(1));
+        let mut init = UtpConnection::new_outbound(addr(6881), now);
+        // 发起方 recv_id 为偶数，send_id = recv_id + 1
+        assert_eq!(init.recv_id & 1, 0, "发起方 recv_id 应为偶数");
+        assert_eq!(init.send_id, init.recv_id.wrapping_add(1));
 
-        // 模拟对端：响应方收到 SYN（携带 id=C）
-        // 响应方 recv_id = C，send_id = C+1
-        let resp = UtpConnection::new_inbound(addr(6881), init.send_id, 1, now);
-        assert_eq!(resp.recv_id, init.send_id); // 响应方收 C
-        assert_eq!(resp.send_id, init.send_id.wrapping_add(1)); // 响应方发 C+1
+        // SYN 必须携带 recv_id（对端按它回包）
+        let syn = init.drain_outbox().pop().unwrap();
+        let (syn_hdr, _, _) = parse_packet(&syn).unwrap();
+        assert_eq!(syn_hdr.type_, packet_type::ST_SYN);
+        assert_eq!(syn_hdr.connection_id, init.recv_id, "SYN 应携带 recv_id");
+
+        // 模拟对端（响应方）：收到 SYN（携带 id=C）→ send_id=C，recv_id=C+1
+        let resp = UtpConnection::new_inbound(addr(6881), init.recv_id, 1, now);
+        assert_eq!(resp.recv_id, init.recv_id.wrapping_add(1)); // 响应方收 C+1
+        assert_eq!(resp.send_id, init.recv_id); // 响应方发 C（命中发起方 recv_id）
+    }
+
+    /// libtorrent 语义的握手序号记账：
+    /// - 响应方 SYN-ACK 携带"下一个待用序号" R 且不消耗；
+    /// - 发起方据此累计确认 ack = R - 1（否则首个 DATA 的 ack_nr 超前被丢弃）；
+    /// - 响应方首个 DATA 复用序号 R（发起方按 ack_+1 期望）。
+    #[test]
+    fn handshake_seq_accounting_libtorrent_style() {
+        let now = Instant::now();
+        let mut init = UtpConnection::new_outbound(addr(6881), now);
+        init.process_tick(now);
+        let syn = init.drain_outbox().pop().unwrap();
+        let (syn_hdr, _, _) = parse_packet(&syn).unwrap();
+        assert_eq!(syn_hdr.seq_nr, 1, "SYN 从序号 1 开始");
+
+        // 响应方：SYN-ACK 携带随机序号 R，不消耗
+        let mut resp = UtpConnection::new_inbound(
+            addr(6881),
+            syn_hdr.connection_id,
+            syn_hdr.seq_nr,
+            now,
+        );
+        let syn_ack = resp.drain_outbox().pop().unwrap();
+        let (ack_hdr, _, _) = parse_packet(&syn_ack).unwrap();
+        assert_eq!(ack_hdr.type_, packet_type::ST_STATE);
+        assert_eq!(ack_hdr.ack_nr, syn_hdr.seq_nr, "SYN-ACK 应确认 SYN");
+        assert_eq!(ack_hdr.connection_id, syn_hdr.connection_id, "SYN-ACK 携带 C");
+        let responder_seq = ack_hdr.seq_nr;
+
+        // 发起方收到 SYN-ACK：累计确认记 R - 1
+        init.handle_packet(&syn_ack, now);
+        assert!(init.is_connected());
+        assert_eq!(
+            init.ack, responder_seq.wrapping_sub(1),
+            "发起方 ack 应为 SYN-ACK.seq - 1"
+        );
+
+        // 发起方首个 DATA：ack_nr = R - 1，conn_id = C + 1
+        init.write(b"hello");
+        init.process_tick(now);
+        let data_pkt = init.drain_outbox().pop().unwrap();
+        let (data_hdr, _, _) = parse_packet(&data_pkt).unwrap();
+        assert_eq!(data_hdr.type_, packet_type::ST_DATA);
+        assert_eq!(data_hdr.seq_nr, 2, "发起方首个 DATA 序号为 2");
+        assert_eq!(data_hdr.ack_nr, responder_seq.wrapping_sub(1));
+        assert_eq!(data_hdr.connection_id, syn_hdr.connection_id.wrapping_add(1));
+
+        // 响应方首个 DATA：复用 SYN-ACK 的序号 R（ST_STATE 不消耗序号）
+        resp.handle_packet(&data_pkt, now);
+        assert_eq!(resp.ack, 2, "响应方累计确认发起方的 DATA");
+        resp.write(b"world");
+        resp.process_tick(now);
+        let resp_data = resp.drain_outbox().pop().unwrap();
+        let (rd_hdr, _, _) = parse_packet(&resp_data).unwrap();
+        assert_eq!(
+            rd_hdr.seq_nr, responder_seq,
+            "响应方首个 DATA 应复用 SYN-ACK 序号 R"
+        );
     }
 
     #[test]

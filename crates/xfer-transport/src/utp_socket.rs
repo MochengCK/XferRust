@@ -348,8 +348,26 @@ impl UtpManager {
         let now = Instant::now();
 
         if hdr.type_ == packet_type::ST_SYN {
-            // 新入站连接
             let peer_recv_id = hdr.connection_id;
+            // 重传的 SYN 携带 SYN.conn_id（= 响应方的 send_id），不会命中
+            // 按 recv_id（= conn_id + 1）注册的连接；回找已接受该 SYN 的
+            // 连接交给它重发 SYN-ACK，避免把重传 SYN 误当新连接重复建链。
+            let prospective_recv_id = peer_recv_id.wrapping_add(1);
+            let is_retrans = self
+                .connections
+                .get(&prospective_recv_id)
+                .map(|ctx| ctx.conn.remote_addr() == src)
+                .unwrap_or(false);
+            if is_retrans {
+                if let Some(ctx) = self.connections.get_mut(&prospective_recv_id) {
+                    ctx.conn.handle_packet(data, now);
+                    ctx.sync_phase();
+                }
+                self.process_connection_tick(prospective_recv_id, now);
+                return;
+            }
+
+            // 新入站连接
             let syn_seq = hdr.seq_nr;
 
             let conn = UtpConnection::new_inbound(src, peer_recv_id, syn_seq, now);

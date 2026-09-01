@@ -67,30 +67,14 @@ fn probe_libtorrent() -> bool {
         .unwrap_or(false)
 }
 
-/// 金标准：从真实 libtorrent seeder 完整下载。
-///
-/// 修复前（64KB 请求）此测试超时失败——libtorrent 拒绝超过 16KiB 的
-/// request，引擎有节点无速度；修复后（16KiB 标准块）应完整下载成功。
-#[tokio::test]
-async fn download_from_real_libtorrent_seeder() {
-    if !probe_libtorrent() {
-        eprintln!(
-            "跳过：未安装 python3 libtorrent 绑定（pip3 install libtorrent）。\
-             安装后本测试将以真实客户端做金标准验收。"
-        );
-        return;
-    }
-
-    let base = std::env::temp_dir().join(format!("e2e-realclient-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    let dl_dir = base.join("dl");
-    std::fs::create_dir_all(&dl_dir).unwrap();
-
-    // 3MB 数据（256KB piece → 12 片，多块流水线可充分展开）
-    let data: Vec<u8> = (0..(3 * 1024 * 1024u64)).map(|i| (i.wrapping_mul(7) % 251) as u8).collect();
+/// 启动真实 libtorrent seeder（uTP 默认开启），返回
+/// (child, seeder_port, .torrent 字节, tracker announce URL)。
+async fn start_real_seeder(
+    base: &std::path::Path,
+    data: &[u8],
+) -> (tokio::process::Child, u16, Vec<u8>, String) {
     let data_file = base.join("seed.bin");
-    std::fs::write(&data_file, &data).unwrap();
+    std::fs::write(&data_file, data).unwrap();
 
     let (taddr, seed_ref) = start_tracker().await;
     let tracker_url = format!("http://{taddr}/announce");
@@ -133,9 +117,33 @@ async fn download_from_real_libtorrent_seeder() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     *seed_ref.write().unwrap() = vec![SocketAddr::from(([127, 0, 0, 1], seeder_port))];
-
-    // 使用 seeder 生成的真实 .torrent 驱动引擎（元信息零偏差）
     let tb = std::fs::read(&torrent_file).unwrap();
+    (child, seeder_port, tb, tracker_url)
+}
+
+/// 金标准：从真实 libtorrent seeder 完整下载。
+///
+/// 修复前（64KB 请求）此测试超时失败——libtorrent 拒绝超过 16KiB 的
+/// request，引擎有节点无速度；修复后（16KiB 标准块）应完整下载成功。
+#[tokio::test]
+async fn download_from_real_libtorrent_seeder() {
+    if !probe_libtorrent() {
+        eprintln!(
+            "跳过：未安装 python3 libtorrent 绑定（pip3 install libtorrent）。\
+             安装后本测试将以真实客户端做金标准验收。"
+        );
+        return;
+    }
+
+    let base = std::env::temp_dir().join(format!("e2e-realclient-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let dl_dir = base.join("dl");
+    std::fs::create_dir_all(&dl_dir).unwrap();
+
+    // 3MB 数据（256KB piece → 12 片，多块流水线可充分展开）
+    let data: Vec<u8> = (0..(3 * 1024 * 1024u64)).map(|i| (i.wrapping_mul(7) % 251) as u8).collect();
+    let (mut child, _seeder_port, tb, tracker_url) = start_real_seeder(&base, &data).await;
     let meta = parse_torrent(&tb).expect("解析真实 .torrent 失败");
 
     let cfg = TorrentConfig {
@@ -175,5 +183,96 @@ async fn download_from_real_libtorrent_seeder() {
 
     let out = std::fs::read(dl_dir.join("seed.bin")).unwrap();
     assert_eq!(out, data, "下载文件与源数据不一致");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 金标准（uTP 版）：从真实 libtorrent seeder 经 uTP 完整下载。
+///
+/// 覆盖此前与任何标准客户端都无法完成 uTP 握手的连接 ID 方向 bug
+/// （发起方 recv/send id 颠倒 + SYN-ACK 序号记账错误）。配置为
+/// TCP+uTP（uTP 优先）：若 uTP 握手失败会回退 TCP——下载可能仍成功，
+/// 因此额外断言确实有对端走 uTP 传输，防止 uTP 静默失效。
+#[tokio::test]
+async fn download_from_real_libtorrent_seeder_over_utp() {
+    if !probe_libtorrent() {
+        eprintln!(
+            "跳过：未安装 python3 libtorrent 绑定（pip3 install libtorrent）。\
+             安装后本测试将以真实客户端做 uTP 金标准验收。"
+        );
+        return;
+    }
+
+    let base = std::env::temp_dir().join(format!("e2e-realclient-utp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let dl_dir = base.join("dl");
+    std::fs::create_dir_all(&dl_dir).unwrap();
+
+    let data: Vec<u8> = (0..(3 * 1024 * 1024u64)).map(|i| (i.wrapping_mul(7) % 251) as u8).collect();
+    let (mut child, _seeder_port, tb, tracker_url) = start_real_seeder(&base, &data).await;
+    let meta = parse_torrent(&tb).expect("解析真实 .torrent 失败");
+
+    let cfg = TorrentConfig {
+        dir: dl_dir.clone(),
+        peer_id: PeerId::azureus_prefix(&[6u8; 12]),
+        listen_port: 0,
+        max_peers: 8,
+        adaptive: false,
+        numwant: 50,
+        announce_urls: vec![tracker_url],
+        pipeline: 0,
+        udp_announce_urls: Vec::new(),
+        enable_dht: false,
+        dht_port: 0,
+        encryption: xfer_bt::EncryptionMode::PlaintextOnly,
+        bt_protocol: xfer_bt::BtProtocol::TcpAndUtp,
+        download_limit: 0,
+        upload_limit: 0,
+        seed_mode: false,
+        seed_duration: 0,
+    };
+    let engine = TorrentEngine::new(meta, cfg).unwrap();
+    // 后台记录是否有对端走 uTP（连接可能在完成时已断开并进入快照）。
+    let utp_used = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watch = {
+        let e = engine.clone();
+        let flag = utp_used.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if e.peers_info()
+                    .iter()
+                    .any(|p| p.protocol == "utp" && p.connected)
+                {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            }
+        })
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(90),
+        engine.clone().run(CancellationToken::new()),
+    )
+    .await;
+    let _ = watch.abort();
+
+    let _ = child.kill().await;
+
+    let inner = match result {
+        Err(_) => panic!("经 uTP 从真实 libtorrent seeder 下载超时"),
+        Ok(r) => r,
+    };
+    inner.expect("经 uTP 从真实 libtorrent seeder 下载应成功");
+
+    let out = std::fs::read(dl_dir.join("seed.bin")).unwrap();
+    assert_eq!(out, data, "下载文件与源数据不一致");
+    let saw_utp = utp_used.load(std::sync::atomic::Ordering::Relaxed)
+        || engine.peers_info().iter().any(|p| p.protocol == "utp");
+    assert!(saw_utp, "下载成功但没有任何对端走 uTP 传输（uTP 失效被 TCP 兜底）");
     let _ = std::fs::remove_dir_all(&base);
 }

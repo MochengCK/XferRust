@@ -1,0 +1,172 @@
+name: CI
+
+# 触发：push 到 main、v* 标签、PR、手动。打 v* 标签时构建+测试全绿后自动发版并回填发布说明。
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 构建：3 平台各自原生构建 TUI(xfer) 与引擎内核(xferrust) 两个二进制
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+          - os: windows-latest
+            artifact: windows-x86_64
+          - os: macos-latest
+            artifact: darwin-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries (TUI + engine kernel)
+        run: cargo build --release --bin xfer --bin xferrust
+
+      - name: Version smoke test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then EXT=.exe; else EXT=; fi
+          "target/release/xferrust$EXT" --version
+          "target/release/xfer$EXT" --version
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then EXT=.exe; else EXT=; fi
+          mkdir -p dist
+          cp "target/release/xferrust$EXT" "dist/xferrust$EXT"
+          cp "target/release/xfer$EXT" "dist/xfer$EXT"
+          cp LICENSE dist/
+          cp README.md dist/
+          tar -C dist -czf "xfer-${{ matrix.artifact }}.tar.gz" "xfer$EXT" "xferrust$EXT" LICENSE README.md
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfer-${{ matrix.artifact }}
+          path: xfer-${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 严格测试：3 平台各自黑盒测试编译产物（引擎运行 / HTTP / HTTPS / 磁力）
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test ${{ matrix.artifact }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+          - os: windows-latest
+            artifact: windows-x86_64
+          - os: macos-latest
+            artifact: darwin-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: xfer-${{ matrix.artifact }}
+          path: bin/
+
+      - name: Extract binaries
+        shell: bash
+        run: |
+          mkdir -p bin
+          tar -xzf "bin/xfer-${{ matrix.artifact }}.tar.gz" -C bin
+          ls -la bin
+
+      - name: Run strict functional tests
+        shell: bash
+        env:
+          HTTPS_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/Cargo.lock
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then PY=python; else PY=python3; fi
+          $PY scripts/ci_test.py \
+            --xfer "bin/xfer" \
+            --xferrust "bin/xferrust" \
+            --out "test-out" \
+            --token ci \
+            --https-url "$HTTPS_URL"
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.artifact }}
+          path: test-out/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 发布：仅 v* 标签，构建+测试全绿后创建 Release 并自动回填版本发布说明
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: XferRust v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          body: |
+            ## XferRust v${{ steps.version.outputs.version }}
+
+            ### 平台二进制（TUI + 引擎内核）
+            - **Linux x86_64** — `xfer-linux-x86_64.tar.gz`（xfer: TUI / xferrust: 引擎内核，无 TUI）
+            - **Windows x86_64** — `xfer-windows-x86_64.tar.gz`（xfer.exe: TUI / xferrust.exe: 引擎内核，无 TUI）
+            - **macOS arm64** — `xfer-darwin-arm64.tar.gz`（xfer: TUI / xferrust: 引擎内核，无 TUI）
+
+            > 本次发布已在 Linux / Windows / macOS 上通过严格测试：引擎可运行、HTTP / HTTPS 下载、磁力（ut_metadata）下载均校验通过。
+            > 以下为根据 commit / PR 自动生成的变更记录。
+          files: artifacts/**
+          fail_on_unmatched_files: false
