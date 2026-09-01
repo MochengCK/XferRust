@@ -5,7 +5,7 @@
 1. 版本冒烟        —— xfer / xferrust --version 退出码 0 且含版本号
 2. 引擎可运行      —— 启动 xferrust 守护进程，经 WS RPC 探活（engine runs）
 3. HTTP 下载       —— 本地静态服务器 + 下载后 SHA-256 逐字节校验
-4. HTTPS 下载      —— 外部 TLS 源（默认本仓库 raw Cargo.lock），与 urllib 拉取结果校验
+4. HTTPS 下载      —— 外部 TLS 源（需为公开稳定文件，经 --https-url 传入），与 urllib 拉取结果校验
 5. 磁力下载        —— 本地 tracker + seeder（scripts/ci_bt.py），ut_metadata + piece 全流程
 
 用法：
@@ -30,6 +30,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+# Windows 控制台默认用 cp1252 编码，无法输出中文（测试名/引擎中文日志），
+# 强制 UTF-8 并把无法编码的字符替换为占位符，保证永不因编码崩溃。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 
 def bin_path(base: str) -> str:
@@ -56,7 +64,12 @@ def free_port() -> int:
 
 
 def run(cmd, timeout=60, cwd=None):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+    # Windows 默认按 cp1252 解码子进程输出，引擎中文日志会导致 UnicodeDecodeError；
+    # 统一按 UTF-8 解码，非法字节替换为占位符。
+    return subprocess.run(
+        cmd, capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=timeout, cwd=cwd,
+    )
 
 
 def wait_until(fn, timeout, interval=1.0, desc=""):

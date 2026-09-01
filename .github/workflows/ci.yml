@@ -128,7 +128,10 @@ jobs:
       - name: Run strict functional tests
         shell: bash
         env:
-          HTTPS_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.event.repository.default_branch }}/Cargo.lock
+          PYTHONUTF8: "1"
+          # HTTPS 测试源：需为公开可访问的稳定文件（私有仓库的 raw 链接会 404）。
+          # 如你有自建镜像/文件源，改这一行即可。
+          HTTPS_URL: https://raw.githubusercontent.com/torvalds/linux/master/README
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then PY=python; else PY=python3; fi
           $PY scripts/ci_test.py \
