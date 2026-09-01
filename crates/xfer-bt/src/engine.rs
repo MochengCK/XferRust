@@ -2238,9 +2238,18 @@ impl TorrentEngine {
         // 必须重新 announce 并等下一轮 tracker interval 才能重连（长时间无速度）。
         let mut ext_handshake_sent = false;
         if !self.has_metadata() {
-            self.run_metadata_exchange(&mut peer_stream, &mut reader, &cell)
-                .await?;
+            if let Err(e) = self
+                .run_metadata_exchange(&mut peer_stream, &mut reader, &cell)
+                .await
+            {
+                // 本连接请求过但未收到的分片必须释放，否则永久占用全局
+                // requested 集合 → 其他 peer 永不重试 → metadata 收不齐。
+                // 释放只会造成重复请求（幂等覆盖），不会造成数据丢失。
+                self.release_unreceived_metadata_pieces();
+                return Err(e);
+            }
             if !self.has_metadata() {
+                self.release_unreceived_metadata_pieces();
                 return Err("元数据获取失败".into());
             }
             // 元数据交换阶段已发过扩展握手，下面不再重复发送
@@ -2961,10 +2970,13 @@ impl TorrentEngine {
         // 并行度上限为 METADATA_PIPELINE，冷启动等待大幅缩短。
         let mut in_flight: usize = 0;
         // 首片请求：未知 total_size 时从 piece 0 开始，收到 data 后计算分片数。
-        // 0 未收到时总是请求（即使已在途，多 peer 冗余请求无害且防断线后卡死）。
+        // 0 未收到时总是请求——即使已在途也冗余请求：请求 0 的 peer 断开后，
+        // requested 里的 0 不会自动释放，若非冗余则 0 永远没人再请求 → 卡死。
+        // REJECT 分支会从 requested 移除 0，让后续 peer 可重试。
         {
             let mut md = self.metadata.lock().unwrap();
-            if !md.pieces.contains_key(&0) && md.requested.insert(0) {
+            if !md.pieces.contains_key(&0) {
+                md.requested.insert(0);
                 in_flight += 1;
             }
         }
@@ -3217,6 +3229,29 @@ impl TorrentEngine {
             }
         }
         None
+    }
+
+    /// 释放「已请求但未收到」的元数据分片占用：peer 会话失败/断开时调用。
+    ///
+    /// 流水线模式下，本连接请求过的分片若在收到 data 前断开，会永久留在全局
+    /// `requested` 集合 → 其他 peer 的 `next_metadata_piece` 永远不会再选它 →
+    /// metadata 收不齐直到整体超时。释放只可能造成重复请求（幂等覆盖），
+    /// 不会丢失已收到的分片，因此多 peer 并发下也是安全的。
+    fn release_unreceived_metadata_pieces(&self) {
+        let mut md = self.metadata.lock().unwrap();
+        let Some(count) = md.piece_count() else {
+            // 未知 total_size（首片未收到）：此时只有 piece 0 可能在途，
+            // 全部释放（0 会由后续 peer 的冗余首片请求重新拾起）。
+            if !md.pieces.contains_key(&0) {
+                md.requested.remove(&0);
+            }
+            return;
+        };
+        for i in 0..count {
+            if md.requested.contains(&i) && !md.pieces.contains_key(&i) {
+                md.requested.remove(&i);
+            }
+        }
     }
 
     /// 计算 Allowed Fast Set (BEP 6)。
