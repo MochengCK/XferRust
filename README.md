@@ -16,11 +16,31 @@
 
 ## 安装
 
-从源码构建（需要 [Rust 工具链](https://rustup.rs/)）：
+### 预编译产物（推荐）
+
+每个平台发布两个独立压缩包，**按需下载一个即可**：
+
+| 平台 | TUI 版（交互界面 + 下载） | 引擎内核版（无 TUI，后台服务 / 嵌入集成） |
+|---|---|---|
+| Linux x86_64 | `xfer-tui-linux-x86_64.tar.gz` | `xferrust-linux-x86_64.tar.gz` |
+| Windows x86_64 | `xfer-tui-windows-x86_64.tar.gz` | `xferrust-windows-x86_64.tar.gz` |
+| macOS 通用（Intel + Apple Silicon） | `xfer-tui-darwin-universal.tar.gz` | `xferrust-darwin-universal.tar.gz` |
+
+从 GitHub [Releases](https://github.com/MochengCK/XferRust/releases) 页面下载。
+
+> **发布机制**：每次 push 到 `main` 都会自动构建、测试，并把产物更新到对应版本的
+> Release **草稿**；确认无误后在 Releases 页手动发布。发布说明仅在首次创建时自动生成，
+> 后续只覆盖产物、不会改动说明。
+
+### 从源码构建
+
+需要 [Rust 工具链](https://rustup.rs/)：
 
 ```bash
 cargo build --release
-# 产物：target/release/xfer（命令行界面）、target/release/xferrust（守护进程）
+# 产物：
+#   target/release/xfer      命令行界面（TUI 版）
+#   target/release/xferrust  引擎守护进程（无 TUI，供应用集成）
 ```
 
 查看版本：`xfer --version`
