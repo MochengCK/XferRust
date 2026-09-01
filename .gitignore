@@ -1,0 +1,8 @@
+/target
+/fuzz/target
+
+# macOS
+.DS_Store
+
+# 临时测试产物
+test.bin

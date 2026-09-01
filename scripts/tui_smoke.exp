@@ -1,0 +1,139 @@
+#!/usr/bin/expect -f
+# TUI 冒烟测试：覆盖两个场景。
+#
+# 场景一（交互渲染）：expect 持续读取 TUI 输出，验证渲染线程正常出帧
+#   （首帧、输入弹窗、退出确认弹窗均可见）。
+#
+# 场景二（pty 输出背压）：expect 在 sleep 期间不读取 TUI 的终端输出，
+#   pty 输出缓冲随即被全屏渲染写满，渲染线程阻塞在 stdout 写上
+#   （这是历史 bug 的根因：主线程同步渲染被写阻塞，导致键盘失灵、
+#   任务误杀、下载失败）。此时验证：
+#   1. 键盘输入仍被及时处理（任务立即创建、下载立即开始）
+#   2. 下载在 UI 阻塞期间持续进行（数据文件持续增长）
+#   3. Ctrl-C ×2 干净退出（退出码 0）
+#
+# 用法：expect scripts/tui_smoke.exp [xfer 二进制路径]
+# 依赖：python3（内嵌限速 HTTP 服务器）、expect。
+# 运行前需先构建：cargo build --bin xfer
+# 说明：ratatui 逐单元格输出，中文之间穿插光标定位序列，因此断言
+#   使用 ASCII 锚点（XferRust / ESC）。
+
+set timeout 90
+
+set repo [file normalize [file join [file dirname [info script]] ..]]
+set bin [lindex $argv 0]
+if {$bin eq ""} { set bin [file join $repo target debug xfer] }
+if {![file executable $bin]} {
+    puts stderr "找不到可执行文件: $bin（先 cargo build --bin xfer）"
+    exit 2
+}
+
+# 工作目录兼作隔离 HOME：会话与控制文件不污染真实 ~/.xfer
+set workdir /tmp/xfer-tui-smoke
+file delete -force $workdir
+file mkdir $workdir
+set env(HOME) $workdir
+set env(SMOKE_PIDFILE) [file join $workdir server.pid]
+
+# 内嵌限速服务器：256MB、每连接 100KB/s、支持 Range（自写 pidfile 供退出时清理）
+log_user 0
+spawn python3 -c {
+import http.server, os, time
+open(os.environ["SMOKE_PIDFILE"], "w").write(str(os.getpid()))
+DATA = bytes(range(256)) * (256 * 1024 * 1024 // 256)
+RATE = 100 * 1024
+class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        rng = self.headers.get("Range")
+        start, end = 0, len(DATA) - 1
+        if rng and rng.startswith("bytes="):
+            s, _, e = rng[6:].partition("-")
+            start = int(s)
+            end = int(e) if e else len(DATA) - 1
+        chunk = DATA[start:end + 1]
+        self.send_response(206 if rng else 200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(chunk)))
+        if rng:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, len(DATA)))
+        self.end_headers()
+        for i in range(0, len(chunk), RATE):
+            self.wfile.write(chunk[i:i + RATE])
+            self.wfile.flush()
+            time.sleep(1)
+http.server.ThreadingHTTPServer(("127.0.0.1", 18630), H).serve_forever()
+}
+sleep 1
+# 等待服务器就绪（pidfile 出现即完成自举；最多再等 5s）
+set server_pid ""
+for {set i 0} {$i < 10} {incr i} {
+    if {[file exists [file join $workdir server.pid]]} {
+        set server_pid [exec cat [file join $workdir server.pid]]
+        break
+    }
+    sleep 0.5
+}
+if {$server_pid eq ""} {
+    puts stderr "SMOKE FAIL: 测试服务器启动失败"
+    exit 2
+}
+
+proc fail {msg server_pid} {
+    exec kill $server_pid 2>/dev/null
+    puts stderr "SMOKE FAIL: $msg"
+    exit 1
+}
+
+# TUI 本体：下载目录即 workdir（控制文件会写到 workdir/.xfer/ctrl）
+spawn $bin tui -d $workdir
+exec stty rows 30 columns 120 < $spawn_out(slave,name)
+
+# ---- 场景一：交互渲染 ----
+set timeout 10
+expect {
+    "XferRust" {}
+    timeout { fail "首帧未渲染" $server_pid }
+}
+send "a"
+expect {
+    "ESC" {}
+    timeout { fail "输入弹窗未渲染" $server_pid }
+}
+# 让弹窗状态稳定后再输入 URL（避免首字符赶在 handle_key 就绪前）
+sleep 0.3
+send "http://127.0.0.1:18630/file.bin\r"
+
+# ---- 场景二：pty 输出背压 ----
+# sleep 期间不读输出：制造 pty 背压（旧版在此完全卡死）
+set timeout 90
+sleep 8
+set data [file join $workdir file.bin]
+set s1 [file size $data]
+sleep 2
+set s2 [file size $data]
+
+send "\x03"
+sleep 1
+send "\x03"
+expect eof
+set status [lindex [wait] 3]
+exec kill $server_pid 2>/dev/null
+
+log_user 1
+if {$status != 0} {
+    puts "SMOKE FAIL: TUI 退出码异常 status=$status"
+    exit 3
+}
+if {$s1 <= 0} {
+    puts "SMOKE FAIL: 背压期间下载未启动 size1=$s1"
+    exit 4
+}
+# 成功：仍在增长，或已完整下完（s2 == 总长）
+set total 268435456
+if {$s2 <= $s1 && $s2 != $total} {
+    puts "SMOKE FAIL: 下载在 UI 背压期间停滞 size1=$s1 size2=$s2"
+    exit 5
+}
+puts "SMOKE OK: 交互渲染正常；背压期间下载持续增长（$s1 → $s2 bytes），TUI 干净退出"
+exit 0

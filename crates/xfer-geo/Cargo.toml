@@ -1,0 +1,8 @@
+[package]
+name = "xfer-geo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ip2region xdb 离线 IP 地理库只读查询器（TUI peer 国家/地区显示用）"
+
+[dependencies]

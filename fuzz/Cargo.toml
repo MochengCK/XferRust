@@ -1,0 +1,23 @@
+[package]
+name = "xferrust-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+xfer-bencode = { path = "../crates/xfer-bencode" }
+xfer-transport = { path = "../crates/xfer-transport" }
+xfer-dht = { path = "../crates/xfer-dht" }
+
+[[bin]]
+name = "fuzz_bencode"
+path = "fuzz_targets/fuzz_bencode.rs"
+
+[[bin]]
+name = "fuzz_utp_packet"
+path = "fuzz_targets/fuzz_utp_packet.rs"
+
+[[bin]]
+name = "fuzz_krpc"
+path = "fuzz_targets/fuzz_krpc.rs"

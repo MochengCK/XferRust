@@ -1,0 +1,22 @@
+[package]
+name = "xfer-dht"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "KRPC（BEP 5）+ K-bucket 路由表 + get_peers/announce_peer + bootstrap"
+
+[dependencies]
+xfer-types = { path = "../xfer-types" }
+xfer-bencode = { path = "../xfer-bencode" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha1 = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

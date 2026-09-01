@@ -1,0 +1,23 @@
+[package]
+name = "xfer-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BT 网络发现：UDP tracker / PEX / LSD / UPnP-NAT-PMP"
+
+[dependencies]
+xfer-types = { path = "../xfer-types" }
+xfer-bencode = { path = "../xfer-bencode" }
+serde = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha1 = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

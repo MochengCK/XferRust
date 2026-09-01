@@ -1,0 +1,30 @@
+[package]
+name = "xfer-bt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BitTorrent peer wire 协议（BEP 3）+ MSE（BEP 8）+ 下载引擎"
+
+[dependencies]
+xfer-types = { path = "../xfer-types" }
+xfer-storage = { path = "../xfer-storage" }
+xfer-bencode = { path = "../xfer-bencode" }
+xfer-crypto = { path = "../xfer-crypto" }
+xfer-dht = { path = "../xfer-dht" }
+xfer-discovery = { path = "../xfer-discovery" }
+xfer-transport = { path = "../xfer-transport" }
+serde = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha1 = { workspace = true }
+hex = { workspace = true }
+getrandom = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+futures-util = "0.3"
+xfer-engine = { path = "../xfer-engine" }

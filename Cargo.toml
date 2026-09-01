@@ -1,0 +1,62 @@
+[workspace]
+members = ["crates/*"]
+exclude = ["fuzz"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+getrandom = "0.3"
+base64 = "0.22"
+crossterm = "0.28"
+ratatui = "0.28"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect"] }
+
+# 根 bin：引擎守护进程入口
+[package]
+name = "xferrust"
+description = "XferCore 下载引擎（Rust 实现）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xfer-types = { path = "crates/xfer-types" }
+xfer-rpc = { path = "crates/xfer-rpc" }
+xfer-engine = { path = "crates/xfer-engine" }
+xfer-geo = { path = "crates/xfer-geo" }
+unicode-width = "0.1"
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+tokio-tungstenite = { workspace = true }
+base64 = { workspace = true }
+futures-util = "0.3"
+
+[[bin]]
+name = "xfer"
+path = "src/bin/xfer.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

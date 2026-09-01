@@ -1,0 +1,37 @@
+[package]
+name = "xfer-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
+xfer-types = { path = "../xfer-types" }
+xfer-http = { path = "../xfer-http" }
+xfer-storage = { path = "../xfer-storage" }
+xfer-bt = { path = "../xfer-bt" }
+xfer-bencode = { path = "../xfer-bencode" }
+base64 = { workspace = true }
+getrandom = { workspace = true }
+futures-util = "0.3"
+
+[dev-dependencies]
+axum = { workspace = true }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures-util = "0.3"
+serde_json = { workspace = true }
+xfer-types = { path = "../xfer-types" }
+xfer-bencode = { path = "../xfer-bencode" }
+xfer-bt = { path = "../xfer-bt" }
+xfer-http = { path = "../xfer-http" }
