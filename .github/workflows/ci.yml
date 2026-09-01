@@ -162,13 +162,14 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # 发布：构建+测试全绿后，按代码版本号自动创建/更新 Release（默认草稿，不直接发布）。
-  # - 无 v<版本> Release → 首次创建为草稿（gh --generate-notes 自动生成说明）
-  # - v<版本> 已存在    → 仅覆盖草稿产物（--clobber），说明与草稿状态保持不变
+  # 发布：构建+测试全绿后，按代码版本号自动管理 Release（默认草稿，不直接发布）。
+  # - 无 v<版本> Release → 首次创建为草稿（自动生成说明，标题仅版本号）
+  # - v<版本> 是草稿     → 仅覆盖草稿产物（--clobber），说明与草稿状态保持不变
+  # - v<版本> 已发布     → 不覆盖（跳过，保持已发布版本不动）
   # 确认无误后，在 GitHub Releases 页手动点 "Publish release" 发布。
   # ---------------------------------------------------------------------------
   release:
-    name: Release (草稿)
+    name: Release (草稿/不覆盖已发布)
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     needs: [build, test]
     runs-on: ubuntu-latest
@@ -183,7 +184,7 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
-      - name: "Create or update release draft (说明仅首次生成, 产物自动覆盖)"
+      - name: "Create or update release draft (说明仅首次生成, 产物只覆盖草稿)"
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -194,11 +195,16 @@ jobs:
           TAG="v${VERSION}"
           echo "当前代码版本: ${TAG}"
           ls -1 artifacts/*.tar.gz
-          if gh release view "$TAG" --json id >/dev/null 2>&1; then
-            echo ">>> 草稿 ${TAG} 已存在 → 仅覆盖产物，保留原说明与草稿状态"
-            gh release upload "$TAG" artifacts/*.tar.gz --clobber
+          if gh release view "$TAG" --json isDraft --jq .isDraft >/dev/null 2>&1; then
+            IS_DRAFT="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
+            if [ "$IS_DRAFT" = "true" ]; then
+              echo ">>> 草稿 ${TAG} 已存在 → 仅覆盖产物，保留原说明与草稿状态"
+              gh release upload "$TAG" artifacts/*.tar.gz --clobber
+            else
+              echo ">>> ${TAG} 已发布 → 不覆盖已发布版本，跳过产物更新"
+            fi
           else
-            echo ">>> 草稿 ${TAG} 不存在 → 首次创建为草稿（自动生成说明）"
+            echo ">>> 无 ${TAG} Release → 首次创建为草稿（自动生成说明）"
             gh release create "$TAG" artifacts/*.tar.gz \
-              --title "XferRust v${VERSION}" --draft --generate-notes
+              --title "v${VERSION}" --draft --generate-notes
           fi
