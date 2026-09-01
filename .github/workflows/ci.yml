@@ -19,7 +19,8 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 构建：3 平台各自原生构建 TUI(xfer) 与引擎内核(xferrust) 两个二进制
+  # 构建：3 平台各自产出 TUI(xfer) 与引擎内核(xferrust) 两个二进制。
+  # macOS 在 arm64 运行器上同时编译 arm64 + x86_64 并 lipo 合成通用二进制。
   # ---------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.artifact }}
@@ -30,35 +31,56 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: linux-x86_64
+            targets: ""
           - os: windows-latest
             artifact: windows-x86_64
+            targets: ""
           - os: macos-latest
-            artifact: darwin-arm64
+            artifact: darwin-universal
+            targets: "aarch64-apple-darwin x86_64-apple-darwin"
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binaries (TUI + engine kernel)
-        run: cargo build --release --bin xfer --bin xferrust
-
-      - name: Version smoke test
+      - name: Build + smoke test (Linux / Windows)
+        if: matrix.os != 'macos-latest'
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then EXT=.exe; else EXT=; fi
-          "target/release/xferrust$EXT" --version
-          "target/release/xfer$EXT" --version
+          EXT=; [ "$RUNNER_OS" = "Windows" ] && EXT=.exe
+          cargo build --release --bin xfer --bin xferrust
+          mkdir -p dist
+          cp "target/release/xfer$EXT" "dist/xfer$EXT"
+          cp "target/release/xferrust$EXT" "dist/xferrust$EXT"
+          "dist/xfer$EXT" --version
+          "dist/xferrust$EXT" --version
+
+      - name: "Build + smoke test (macOS universal: Intel + Apple Silicon)"
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          cargo build --release --target aarch64-apple-darwin --bin xfer --bin xferrust
+          cargo build --release --target x86_64-apple-darwin --bin xfer --bin xferrust
+          mkdir -p dist
+          lipo -create -output dist/xfer \
+            target/aarch64-apple-darwin/release/xfer \
+            target/x86_64-apple-darwin/release/xfer
+          lipo -create -output dist/xferrust \
+            target/aarch64-apple-darwin/release/xferrust \
+            target/x86_64-apple-darwin/release/xferrust
+          file dist/xfer
+          "dist/xfer" --version
+          "dist/xferrust" --version
 
       - name: Package artifacts
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then EXT=.exe; else EXT=; fi
-          mkdir -p dist
-          cp "target/release/xferrust$EXT" "dist/xferrust$EXT"
-          cp "target/release/xfer$EXT" "dist/xfer$EXT"
+          EXT=; [ "$RUNNER_OS" = "Windows" ] && EXT=.exe
           cp LICENSE dist/
           cp README.md dist/
           tar -C dist -czf "xfer-${{ matrix.artifact }}.tar.gz" "xfer$EXT" "xferrust$EXT" LICENSE README.md
@@ -86,7 +108,7 @@ jobs:
           - os: windows-latest
             artifact: windows-x86_64
           - os: macos-latest
-            artifact: darwin-arm64
+            artifact: darwin-universal
     steps:
       - uses: actions/checkout@v4
 
@@ -164,7 +186,7 @@ jobs:
             ### 平台二进制（TUI + 引擎内核）
             - **Linux x86_64** — `xfer-linux-x86_64.tar.gz`（xfer: TUI / xferrust: 引擎内核，无 TUI）
             - **Windows x86_64** — `xfer-windows-x86_64.tar.gz`（xfer.exe: TUI / xferrust.exe: 引擎内核，无 TUI）
-            - **macOS arm64** — `xfer-darwin-arm64.tar.gz`（xfer: TUI / xferrust: 引擎内核，无 TUI）
+            - **macOS 通用二进制** — `xfer-darwin-universal.tar.gz`（同时支持 Intel x86_64 与 Apple Silicon arm64；xfer: TUI / xferrust: 引擎内核，无 TUI）
 
             > 本次发布已在 Linux / Windows / macOS 上通过严格测试：引擎可运行、HTTP / HTTPS 下载、磁力（ut_metadata）下载均校验通过。
             > 以下为根据 commit / PR 自动生成的变更记录。
