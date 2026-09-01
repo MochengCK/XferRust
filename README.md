@@ -1,7 +1,8 @@
 # XferRust
 
-一个用 Rust 写的高性能、低资源占用的下载引擎。支持 **HTTP(S)** 与 **BitTorrent（BT）**
-下载，自带命令行界面，也可作为后台服务供网页端、桌面应用等程序集成。
+一个用 Rust 编写的高性能、低资源占用的独立下载引擎，支持 **HTTP(S)** 与
+**BitTorrent（BT）** 下载，自带命令行界面，也可作为后台服务供网页端、桌面应用等
+程序集成。
 
 ## 它能做什么
 
@@ -80,7 +81,9 @@ xfer tui [-d 目录] [-j 并发数]
 | `-d, --dir` | 当前目录 | 下载保存目录 |
 | `-j, --max-concurrent` | `3` | 最大并发下载数 |
 
-主界面内嵌引擎（无需守护进程），实时刷新。
+主界面内嵌引擎（无需守护进程），实时刷新。任务与设置持久化在会话文件
+`~/.xfer/session.json`（每 30 秒自动保存，退出时保存），重启后自动恢复
+历史任务；`-d` / `-j` 未显式指定时沿用会话中保存的设置。
 
 **列表视图**
 
@@ -93,7 +96,7 @@ xfer tui [-d 目录] [-j 并发数]
 ├───────────────────────────────────────────────┤
 │ （操作反馈消息，显示 2 秒）                    │
 └───────────────────────────────────────────────┘
- a 添加 · Enter 详情 · ↑↓ 选择 · p 暂停 · r 恢复 · x 移除 · c 清除完成 · q 退出
+ a 添加 · Enter 详情 · ↑↓ 选择 · r 暂停/恢复 · x 移除 · c 清除完成 · s 设置 · q 退出
 ```
 
 | 按键 | 动作 |
@@ -101,12 +104,25 @@ xfer tui [-d 目录] [-j 并发数]
 | `a` | 弹出输入框，粘贴 URL 后 `Enter` 添加任务，`ESC` 取消 |
 | `↑` `↓` 或 `k` `j` | 上下选择任务 |
 | `Enter` | 进入任务详情（进度仪表 + 速度走势图） |
-| `p` / `r` / `x` | 暂停 / 恢复 / 移除选中任务 |
+| `r` | 暂停 / 恢复选中任务（切换） |
+| `x` | 移除选中任务（确认后删除，可勾选同时删除已下载文件） |
 | `c` | 清除全部已完成记录 |
+| `s` | 打开设置页 |
+| `Tab` | 任务列表 / 侧栏分类焦点切换 |
+| `1` ~ `5` | 快捷切换分类筛选 |
 | `q` / `Ctrl-C` | 退出 |
 
 **详情视图**：Gauge 进度仪表（百分比、已下载/总大小、速度、剩余时间、平均速度）
-+ 最近 60 秒速度 Sparkline 走势。`ESC` 返回列表，`p` / `r` / `x` 同列表。
++ 最近 60 秒速度 Sparkline 走势。`ESC` / `Enter` 返回列表，`r` / `x` 同列表；
+`Tab` 在 tracker / peer 表格间切换焦点，方向键与 `PgUp` / `PgDn` 滚动，
+`t` 为 BT 任务追加 tracker。
+
+**设置页**（`s` 键）：可调最大并发数、HTTP 分片连接数（`split`）、
+每服务器最大连接数、`bt-max-peers`、`min-split-size`、下载/上传限速、
+默认下载目录，管理全局 tracker 列表与 tracker 订阅源，以及界面语言
+（简体 / 繁體 / English，可持久化到会话）。
+
+> 界面语言也可在启动时通过环境变量指定：`XFER_LANG=zh|en|zh_tw xfer`。
 
 ### 2. 单任务下载
 
@@ -136,8 +152,9 @@ xfer download https://example.com/iso --checksum sha-256=ab34…
 ```bash
 xfer daemon [--rpc-listen-port=端口] [--rpc-secret=密钥]
             [--dir=目录] [--max-concurrent-downloads=N]
-            [--log=文件] [--log-level=级别]
 ```
+
+> `--log` / `--log-level` 仅 `xferrust` 生效（见下表），`xfer daemon` 接受但暂不启用。
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
@@ -145,10 +162,14 @@ xfer daemon [--rpc-listen-port=端口] [--rpc-secret=密钥]
 | `--rpc-secret` | 无 | 鉴权密钥；未设置免鉴权 |
 | `--dir` | `.` | 默认下载目录 |
 | `--max-concurrent-downloads` | `5` | 最大并发 |
-| `--log` / `--log-level` | 无 | 文件日志 / 级别（error/warn/notice/info/debug） |
+| `--log` / `--log-level` | 无 | 文件日志 / 级别（error/warn/notice/info/debug）；仅 `xferrust` 生效——日志按大小轮转（单文件 10 MB、保留 5 份） |
 
 `xferrust` 二进制参数与 `xfer daemon` 相同，供与应用打包集成。
 未知 `--k=v` 选项会被忽略并告警。
+
+守护进程与 TUI 共用会话文件 `~/.xfer/session.json`：启动时恢复历史任务与
+设置（仅显式传入 `--dir` / `--max-concurrent-downloads` 才覆盖会话设置），
+运行期间自动保存，退出时写入。
 
 ### 4. 远程子命令（操作运行中的守护进程）
 
@@ -234,7 +255,7 @@ xferrust --rpc-listen-port=6800 --rpc-secret=mytoken
 | `--rpc-secret` | 无 | RPC 鉴权密钥；未设置则免鉴权 |
 | `--dir` | `.` | 默认下载目录 |
 | `--max-concurrent-downloads` | `5` | 最大并发下载数 |
-| `--log` / `--log-level` | 无 | 文件日志与级别（error/warn/notice/info/debug） |
+| `--log` / `--log-level` | 无 | 文件日志与级别（error/warn/notice/info/debug）；仅 `xferrust` 生效（按大小轮转，单文件 10 MB、保留 5 份） |
 
 ### 2. 连接与协议
 
@@ -283,6 +304,8 @@ xferrust --rpc-listen-port=6800 --rpc-secret=mytoken
 | `task.getFiles` | `gid` | 文件列表 |
 | `task.getUris` | `gid` | URI 列表 |
 | `task.getPeers` | `gid` | peer 列表（BT） |
+| `task.getTrackers` | `gid` | tracker 列表（BT） |
+| `task.addTrackers` | `gid`, `trackers`(数组,非空) | `{"ok": true}` |
 | `task.getOption` | `gid` | 选项对象（全局打底 + 任务级覆盖） |
 | `task.changeOption` | `gid`, 键值对 | `{"ok": true}` |
 
@@ -304,15 +327,31 @@ xferrust --rpc-listen-port=6800 --rpc-secret=mytoken
 | `engine.getVersion` | — | `{"name", "version", "features"}` |
 | `engine.globalStat` | — | `{"downloadSpeed", "uploadSpeed", "numActive", "numWaiting", "numStopped", "numStoppedTotal"}` |
 | `engine.getOptions` | — | 全局选项对象 |
-| `engine.changeOptions` | 键值对（生效项：`max-concurrent-downloads`、`dir`、`split`、`max-connection-per-server`、`min-split-size`、`bt-max-peers`、`bt-adaptive`、`bt-trackers`） | `{"ok": true}` |
+| `engine.changeOptions` | 键值对（生效项：`max-concurrent-downloads`、`dir`、`split`、`max-connection-per-server`、`min-split-size`、`bt-max-peers`、`bt-adaptive`、`max-overall-download-limit`、`max-overall-upload-limit`、`bt-encryption`、`bt-protocol`；其余忽略） | `{"ok": true}` |
 | `engine.saveSession` | — | `{"ok": true}` |
 | `engine.shutdown` / `engine.forceShutdown` | — | `{"ok": true}` |
+
+全局 tracker 与订阅源：
+
+| 方法 | 参数 | 返回 |
+|---|---|---|
+| `engine.getTrackers` | — | `{"trackers": [URL, ...]}` |
+| `engine.addTracker` | `tracker`(URL) | `{"ok": true}` |
+| `engine.removeTracker` | `tracker`(URL) | `{"ok": true}` |
+| `engine.getSubscriptions` | — | 订阅源列表 |
+| `engine.addSubscription` | `name`, `url`, `enabled`(可选,默认 true) | 订阅源对象 |
+| `engine.removeSubscription` | `id` | `{"ok": true}` |
+| `engine.toggleSubscription` | `id` | `{"ok": true}` |
+| `engine.refreshSubscription` | `id` | `{"count": n}`（拉取条数） |
+| `engine.refreshAllSubscriptions` | — | `{"count": n}` |
+| `engine.getAutoUpdateTrackers` | — | `{"enabled": bool}` |
+| `engine.setAutoUpdateTrackers` | `enabled`(bool) | `{"ok": true}` |
 
 #### 4.3 任务状态对象
 
 ```
 gid, status, totalLength, completedLength, uploadLength, downloadSpeed,
-uploadSpeed, connections, errorCode, errorMessage, dir,
+uploadSpeed, bitfield, connections, errorCode, errorMessage, elapsedMs, dir,
 files[{index, path, length, completedLength, selected, uris[{uri, status}]}],
 numSeeders, seeder, numPieces, pieceLength
 ```

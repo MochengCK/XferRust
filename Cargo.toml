@@ -31,7 +31,7 @@ tokio-tungstenite = { version = "0.26", default-features = false, features = ["c
 # 根 bin：引擎守护进程入口
 [package]
 name = "xferrust"
-description = "XferCore 下载引擎（Rust 实现）"
+description = "用 Rust 编写的独立下载引擎，支持 HTTP(S) 与 BitTorrent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
