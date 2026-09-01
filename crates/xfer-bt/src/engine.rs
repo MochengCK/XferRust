@@ -132,12 +132,15 @@ const PIPELINE_MAX: usize = 256;
 const MAX_QUEUED_PIECES: usize = 4;
 /// 片队列容量硬上限：防止极小片（16KiB）导致占片数爆炸。
 const MAX_QUEUED_PIECES_HARD: usize = 64;
-/// 连接阶段短超时（§7.8：30s）。
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// 连接阶段短超时（§7.8：30s → 10s：冷启动时 tracker 返回的 peer 大量为死地址，
+/// 缩短等待让连接槽快速周转，减少"占着槽等超时"的冷启动拖尾）。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// MSE/PE 握手超时：防止对端只连接不发数据时握手无限挂起。
-const MSE_TIMEOUT: Duration = Duration::from_secs(15);
+/// 15s → 8s：多数 MSE 协商在 2~3 个 RTT 内完成，缩短让明文对端更快回退。
+const MSE_TIMEOUT: Duration = Duration::from_secs(8);
 /// uTP 拨号握手等待上限：超时/失败即回退 TCP（保证快速换路）。
-const UTP_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// 5s → 2s：对端不支持 uTP 时白等 5s 才回退 TCP，冷启动大量 peer 依次卡 5s。
+const UTP_DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 /// 冷启动突发倍数（§7.8：首轮 3 倍突发）。
 const COLD_START_BURST: usize = 3;
 /// 冷启动爬坡周期（§7.8：1s）。
@@ -185,6 +188,9 @@ const METADATA_PIECE_SIZE: usize = 16 * 1024;
 const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 /// 磁力元数据获取阶段的 announce 补充间隔（秒）。
 const METADATA_ANNOUNCE_INTERVAL: u64 = 5;
+/// 元数据分片流水线深度：一次向同一 peer 在途请求多个分片（BEP 9 允许）。
+/// 避免大 metadata 逐片串行请求（每片一个 RTT），冷启动大幅提速。
+const METADATA_PIPELINE: usize = 8;
 
 /// ut_metadata 消息类型（BEP 9 msg_type 字段）。
 const UT_METADATA_REQUEST: i64 = 0;
@@ -1238,8 +1244,9 @@ impl TorrentEngine {
 
     /// 并发 announce 全部 tracker（HTTP + UDP），聚合所有成功响应的 peers。
     ///
-    /// 对 `started`/`stopped`/`completed` 事件，只需首个成功响应（避免重复状态报告）；
-    /// 周期性 announce（None）则聚合全部 tracker 的 peers 以最大化 peer 来源。
+    /// 对 `stopped`/`completed` 事件，只需首个成功响应（避免重复状态报告）；
+    /// `started` 与周期性 announce（None）则聚合全部 tracker 的 peers ——
+    /// 冷启动首轮必须尽量拿全 peer 池，只取第一个 tracker 会显著缩小候选集。
     ///
     /// 所有 tracker 请求并发发送，总体超时 15 秒，避免串行等待不可用的 tracker 阻塞主循环。
     async fn announce_all(&self, event: Option<&str>) -> Option<AnnounceResponse> {
@@ -1249,7 +1256,8 @@ impl TorrentEngine {
             .load(Ordering::Relaxed)
             .saturating_sub(done);
         let info_hash = InfoHash::from_bytes(&self.info_hash);
-        let is_event = event.is_some();
+        // 仅 stopped/completed 需要"首个成功即返回"；started/周期 announce 聚合全部
+        let first_only = matches!(event, Some("stopped") | Some("completed"));
         let mut all_peers: Vec<SocketAddr> = Vec::new();
         let mut best_interval: u64 = 0;
         let mut any_success = false;
@@ -1336,10 +1344,28 @@ impl TorrentEngine {
             });
         }
 
-        // 并发等待所有 tracker，总体超时 15 秒
-        let announce_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        // 并发等待所有 tracker：stopped/completed 首个成功即返回；
+        // started/周期 announce 聚合，但 started 用 3s 短窗口——冷启动不能被
+        // 某个慢 tracker 拖住（慢 tracker 12s 响应会让冷启动整体卡 12s）。
+        let overall_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let started_agg = matches!(event, Some("started"));
+        let agg_deadline = if started_agg {
+            Some(tokio::time::Instant::now() + Duration::from_secs(3))
+        } else {
+            None
+        };
         loop {
-            match tokio::time::timeout_at(announce_deadline, join_set.join_next()).await {
+            // 聚合模式下每轮重新取 min(整体截止, 聚合窗口)；首轮窗口到期即收尾
+            let deadline = match (agg_deadline, overall_deadline) {
+                (Some(agg), overall) => {
+                    if tokio::time::Instant::now() >= agg && any_success {
+                        break; // 首轮 3s 窗口已过且有成功响应 → 带已收集 peers 返回
+                    }
+                    agg.min(overall)
+                }
+                (None, overall) => overall,
+            };
+            match tokio::time::timeout_at(deadline, join_set.join_next()).await {
                 Ok(Some(task_result)) => match task_result {
                     Ok(Ok(r)) => {
                         if r.failure.is_none() {
@@ -1354,7 +1380,7 @@ impl TorrentEngine {
                                 best_interval = r.interval;
                             }
                             any_success = true;
-                            if is_event {
+                            if first_only {
                                 return Some(r);
                             }
                             all_peers.extend(r.peers);
@@ -1990,8 +2016,12 @@ impl TorrentEngine {
     /// 内联 await `run_peer`，调用方在返回后再 `unregister_peer`。
     async fn dial_and_run(self: &Arc<Self>, addr: SocketAddr, cell: Arc<PeerCell>) {
         let proto = self.bt_protocol();
+        // 磁力冷启动：元数据未就绪时优先 TCP —— uTP 探测（最多 2s）对
+        // metadata 交换无增益，反而让每个不支持 uTP 的对端白等一轮；
+        // metadata 就绪后再走 uTP 优先（出站拨号路径无锁读原子量）。
+        let prefer_tcp_cold_start = !self.has_metadata();
         // uTP 优先
-        if proto.allows_utp() {
+        if proto.allows_utp() && !prefer_tcp_cold_start {
             let handle_opt = self.utp.lock().unwrap().clone();
             if let Some(handle) = handle_opt {
                 match handle.connect_established(addr, UTP_DIAL_TIMEOUT).await {
@@ -2142,7 +2172,7 @@ impl TorrentEngine {
                     .map_err(|e| format!("握手发送失败: {e}"))?;
             }
             let hs: Handshake = match timeout(
-                Duration::from_secs(15),
+                Duration::from_secs(8),
                 reader.read_handshake(&mut peer_stream),
             )
             .await
@@ -2890,7 +2920,9 @@ impl TorrentEngine {
         // （对端可能在 BT 握手后已先行发出，直接从读循环中取）
         let mut peer_meta_id = cell.state.lock().unwrap().ut_metadata_id;
         if peer_meta_id == 0 {
-            let hs_deadline = Instant::now() + Duration::from_secs(15);
+            // 8s：扩展握手只需 1~2 个 RTT，纯老客户端（不支持 BEP 10）不回包，
+            // 缩短判定时间让冷启动更快放弃不支持 ut_metadata 的对端。
+            let hs_deadline = Instant::now() + Duration::from_secs(8);
             while peer_meta_id == 0 {
                 if self.shutdown.is_cancelled() {
                     return Err("引擎已停止".into());
@@ -2901,7 +2933,7 @@ impl TorrentEngine {
                 if Instant::now() >= hs_deadline {
                     return Err("对端未协商 ut_metadata".into());
                 }
-                let msg = match timeout(Duration::from_secs(10), reader.read_message(peer_stream))
+                let msg = match timeout(Duration::from_secs(8), reader.read_message(peer_stream))
                     .await
                 {
                     Ok(Ok(Some(m))) => m,
@@ -2924,15 +2956,36 @@ impl TorrentEngine {
 
         let deadline = Instant::now() + METADATA_TIMEOUT;
 
-        // 首片请求：未知 total_size 时从 piece 0 开始，收到 data 后计算分片数
+        // 流水线请求：同一 peer 在途请求多个分片（BEP 9 允许并发请求）。
+        // 大 metadata（几百 KB = 几十片）逐片串行要几十个 RTT，流水线后
+        // 并行度上限为 METADATA_PIPELINE，冷启动等待大幅缩短。
+        let mut in_flight: usize = 0;
+        // 首片请求：未知 total_size 时从 piece 0 开始，收到 data 后计算分片数。
+        // 0 未收到时总是请求（即使已在途，多 peer 冗余请求无害且防断线后卡死）。
         {
             let mut md = self.metadata.lock().unwrap();
-            md.requested.insert(0);
+            if !md.pieces.contains_key(&0) && md.requested.insert(0) {
+                in_flight += 1;
+            }
         }
-        peer_stream
-            .write_all(&ut_metadata_request(peer_meta_id, 0))
-            .await
-            .map_err(|e| format!("metadata 请求发送失败: {e}"))?;
+        if in_flight > 0 {
+            peer_stream
+                .write_all(&ut_metadata_request(peer_meta_id, 0))
+                .await
+                .map_err(|e| format!("metadata 请求发送失败: {e}"))?;
+        }
+        // 已知道分片数则立即填满流水线
+        while in_flight < METADATA_PIPELINE {
+            if let Some(next) = self.next_metadata_piece() {
+                peer_stream
+                    .write_all(&ut_metadata_request(peer_meta_id, next))
+                    .await
+                    .map_err(|e| format!("metadata 请求发送失败: {e}"))?;
+                in_flight += 1;
+            } else {
+                break;
+            }
+        }
 
         loop {
             if self.shutdown.is_cancelled() {
@@ -2961,12 +3014,16 @@ impl TorrentEngine {
                             if self.has_metadata() {
                                 return Ok(());
                             }
-                            // 请求下一个缺失分片
-                            if let Some(next) = self.next_metadata_piece() {
-                                peer_stream
-                                    .write_all(&ut_metadata_request(peer_meta_id, next))
-                                    .await
-                                    .map_err(|e| format!("metadata 请求发送失败: {e}"))?;
+                            // 收到一片，流水线补发一片（保持 METADATA_PIPELINE 在途）
+                            in_flight = in_flight.saturating_sub(1);
+                            if in_flight < METADATA_PIPELINE {
+                                if let Some(next) = self.next_metadata_piece() {
+                                    peer_stream
+                                        .write_all(&ut_metadata_request(peer_meta_id, next))
+                                        .await
+                                        .map_err(|e| format!("metadata 请求发送失败: {e}"))?;
+                                    in_flight += 1;
+                                }
                             }
                         }
                         Err(e) => {
@@ -3110,6 +3167,13 @@ impl TorrentEngine {
             .and_then(Value::as_int)
             .unwrap_or(-1);
         if msg_type == UT_METADATA_REJECT {
+            // 流水线模式下，一片被拒后必须从 requested 集合移除，
+            // 否则其他 peer 永远不会再请求该片 → metadata 永久收不齐。
+            // 从拒绝消息中解析 piece 索引并解除占用。
+            if let Some(p) = dict.get(b"piece".as_slice()).and_then(Value::as_int) {
+                let mut md = self.metadata.lock().unwrap();
+                md.requested.remove(&(p as usize));
+            }
             return Err("对端拒绝提供元数据".into());
         }
         if msg_type != UT_METADATA_DATA {

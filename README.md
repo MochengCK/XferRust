@@ -88,7 +88,7 @@ xfer tui [-d 目录] [-j 并发数]
 **列表视图**
 
 ```
-┌ XferRust v0.1.0 ──────────────────────────────┐
+┌ XferRust v0.2.0 ──────────────────────────────┐
 │ 总速度 9.6 MiB/s   活动 2  等待 1  停止 1      │
 ├─ 任务（4）────────────────────────────────────┤
 │ active   ████████░░░░ 66.7% ubuntu.iso  ...   │ ← 选中行高亮
@@ -268,7 +268,7 @@ xferrust --rpc-listen-port=6800 --rpc-secret=mytoken
 // 请求
 {"jsonrpc": "2.0", "id": 1, "method": "engine.getVersion", "params": {"token": "mytoken"}}
 // 成功响应
-{"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.1.0", "features": ["http", "resume", "checksum", "bt", "events"]}}
+{"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.2.0", "features": ["http", "resume", "checksum", "bt", "events"]}}
 // 错误响应
 {"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": "Unauthorized"}}
 ```
