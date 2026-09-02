@@ -347,6 +347,19 @@ xferrust --rpc-listen-port=6800 --rpc-secret=mytoken
 | `engine.getAutoUpdateTrackers` | — | `{"enabled": bool}` |
 | `engine.setAutoUpdateTrackers` | `enabled`(bool) | `{"ok": true}` |
 
+订阅源行为：
+
+- **添加/启用即自动拉取**：`addSubscription`、`toggleSubscription`（重新启用）会
+  立即在后台拉取一次并同步到全局 tracker 列表，所有客户端（TUI / RPC）行为一致，
+  无需调用方手动补刷新。
+- **同步语义（非只增不减）**：订阅源刷新时，远程新增的 tracker 加入全局列表；
+  远程已移除且该订阅源曾贡献的 tracker 从全局列表剔除。手动添加的
+  (`engine.addTracker`) 与其他订阅源仍提供的 tracker 不受影响。
+- **每日自动更新**：后台每小时检查一次，距上次成功更新 ≥24h 的订阅源才会刷新
+  （`autoUpdateTrackers` 开启时）。手动 `refreshSubscription` /
+  `refreshAllSubscriptions` 不受 TTL 限制，立即全量刷新。
+- **安全阀**：远程返回空列表视为异常，保留现有 tracker 并记录错误，避免误清空。
+
 #### 4.3 任务状态对象
 
 ```

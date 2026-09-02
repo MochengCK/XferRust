@@ -727,6 +727,18 @@ pub struct TorrentEngine {
     encryption_mode: std::sync::atomic::AtomicU8,
     /// 当前传输协议模式（运行时可热切换，拨号路径无锁读）。
     bt_protocol_mode: std::sync::atomic::AtomicU8,
+    /// 运行时动态注入的 announce URL（订阅源刷新 / 用户热添加）：
+    /// 与 `config` 的静态列表合并去重后使用。引擎启动后 announce
+    /// 列表被克隆进配置快照，若无此机制，新增 tracker 只能等
+    /// 暂停/恢复重建引擎后才生效。
+    dynamic_announces: Mutex<DynamicAnnounces>,
+}
+
+/// 动态 announce 列表：按协议分流（http / udp）。
+#[derive(Default)]
+struct DynamicAnnounces {
+    http: Vec<String>,
+    udp: Vec<String>,
 }
 
 impl TorrentEngine {
@@ -815,6 +827,7 @@ impl TorrentEngine {
             utp: Mutex::new(None),
             encryption_mode: std::sync::atomic::AtomicU8::new(encryption_code),
             bt_protocol_mode: std::sync::atomic::AtomicU8::new(protocol_code),
+            dynamic_announces: Mutex::new(DynamicAnnounces::default()),
         });
         engine.refresh_done_bytes();
         Ok(engine)
@@ -865,6 +878,7 @@ impl TorrentEngine {
             utp: Mutex::new(None),
             encryption_mode: std::sync::atomic::AtomicU8::new(encryption_code),
             bt_protocol_mode: std::sync::atomic::AtomicU8::new(protocol_code),
+            dynamic_announces: Mutex::new(DynamicAnnounces::default()),
         });
         Ok(engine)
     }
@@ -1262,14 +1276,17 @@ impl TorrentEngine {
         let mut best_interval: u64 = 0;
         let mut any_success = false;
 
-        // 并发 HTTP tracker announce
-        let http_urls: Vec<String> = self
-            .config
-            .announce_urls
-            .iter()
-            .filter(|url| !url.starts_with("wss://") && !url.starts_with("ws://"))
-            .cloned()
-            .collect();
+        // 并发 HTTP tracker announce：静态配置 + 运行时动态注入（合并去重）
+        let http_urls: Vec<String> = {
+            let dyn_list = self.dynamic_announces.lock().unwrap();
+            self.config
+                .announce_urls
+                .iter()
+                .filter(|url| !url.starts_with("wss://") && !url.starts_with("ws://"))
+                .chain(dyn_list.http.iter())
+                .cloned()
+                .collect()
+        };
 
         // 并发 announce 全部 tracker（HTTP + UDP 同一 JoinSet，总超时 15 秒）。
         // UDP 原先串行（每个最长 ~10s），多 tracker 时冷启动被逐个阻塞。
@@ -1301,8 +1318,18 @@ impl TorrentEngine {
             });
         }
 
-        // UDP tracker（§7.7：5s 重发 / 10s 超时；与 HTTP 并行）
-        for url in &self.config.udp_announce_urls {
+        // UDP tracker（§7.7：5s 重发 / 10s 超时；与 HTTP 并行）：
+        // 静态配置 + 运行时动态注入
+        let udp_urls: Vec<String> = {
+            let dyn_list = self.dynamic_announces.lock().unwrap();
+            self.config
+                .udp_announce_urls
+                .iter()
+                .chain(dyn_list.udp.iter())
+                .cloned()
+                .collect()
+        };
+        for url in &udp_urls {
             let url = url.clone();
             let peer_id = self.peer_id;
             let port = self.actual_listen_port.load(Ordering::Relaxed);
@@ -1451,7 +1478,15 @@ impl TorrentEngine {
         let port = self.actual_listen_port.load(Ordering::Relaxed);
         let done = self.done_bytes.load(Ordering::Relaxed);
         let total = self.total_bytes.load(Ordering::Relaxed);
-        let urls = self.config.announce_urls.clone();
+        let urls: Vec<String> = {
+            let dyn_list = self.dynamic_announces.lock().unwrap();
+            self.config
+                .announce_urls
+                .iter()
+                .chain(dyn_list.http.iter())
+                .cloned()
+                .collect()
+        };
         tokio::spawn(async move {
             for url in urls {
                 let req = AnnounceRequest {
@@ -1857,6 +1892,33 @@ impl TorrentEngine {
             self.encryption_mode.store(e.code(), Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// 运行时注入 announce URL（订阅源刷新 / 用户热添加）：
+    /// 按 scheme 分流（`udp://` → UDP 列表，`ws://`/`wss://` 暂不支持，
+    /// 其余 → HTTP 列表），与静态配置列表去重。下一轮 announce 立即
+    /// 生效，无需暂停/恢复重建引擎。
+    pub fn add_announce_urls(&self, urls: &[String]) {
+        let mut dyn_list = self.dynamic_announces.lock().unwrap();
+        for url in urls {
+            let url = url.trim();
+            if url.is_empty() {
+                continue;
+            }
+            if url.starts_with("udp://") {
+                if !dyn_list.udp.iter().any(|u| u == url)
+                    && !self.config.udp_announce_urls.iter().any(|u| u == url)
+                {
+                    dyn_list.udp.push(url.to_string());
+                }
+            } else if url.starts_with("ws://") || url.starts_with("wss://") {
+                // WebSocket tracker 暂不支持（与静态列表过滤一致）
+            } else if !dyn_list.http.iter().any(|u| u == url)
+                && !self.config.announce_urls.iter().any(|u| u == url)
+            {
+                dyn_list.http.push(url.to_string());
+            }
+        }
     }
 
     /// 对端列表（getPeers 用）：当前在线 + 本会话已断开的最后快照。
@@ -4495,4 +4557,44 @@ mod tests {
         let st = test_peer_state(have, false);
         assert_eq!(peer_progress(&st), Some(100.0));
     }
+    /// 运行时注入 announce URL：按 scheme 分流、与静态配置去重、
+    /// 批内去重、空白行忽略、ws/wss 不支持（跳过）。
+    #[test]
+    fn add_announce_urls_classifies_and_dedups() {
+        let dir = std::env::temp_dir().join(format!("xfer-ann-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let cfg = TorrentConfig {
+            dir: dir.clone(),
+            announce_urls: vec!["http://static.example/announce".into()],
+            udp_announce_urls: vec!["udp://static.example:80/announce".into()],
+            ..Default::default()
+        };
+        let engine = TorrentEngine::new_magnet([1u8; 20], cfg).unwrap();
+
+        engine.add_announce_urls(&[
+            "http://dyn.example/a".into(),
+            "http://dyn.example/a".into(),            // 批内重复
+            "http://static.example/announce".into(),  // 与静态重复
+            "udp://dyn.example:6969/a".into(),
+            "wss://dyn.example/ws".into(),            // 暂不支持 → 跳过
+            "  ".into(),                              // 空白 → 跳过
+        ]);
+
+        let dyn_list = engine.dynamic_announces.lock().unwrap();
+        assert_eq!(
+            dyn_list.http,
+            vec!["http://dyn.example/a".to_string()],
+            "HTTP 动态列表：仅新增一条（批内/静态去重）"
+        );
+        assert_eq!(
+            dyn_list.udp,
+            vec!["udp://dyn.example:6969/a".to_string()],
+            "UDP 动态列表：仅新增一条"
+        );
+        drop(dyn_list);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
+

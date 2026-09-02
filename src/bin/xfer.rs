@@ -1637,7 +1637,7 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                     let mgr = app.mgr.clone();
                     let id = sub.id.clone();
                     let name = sub.name.clone();
-                    tokio::task::block_in_place(|| {
+                    let r = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current()
                             .block_on(async { mgr.refresh_subscription(&id).await })
                     })
@@ -1652,7 +1652,8 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                     .unwrap_or_else(|e| {
                         format!("{}: {e}", tr("刷新失败", "Refresh failed"))
                     });
-                    // refresh_subscription 内部会更新全局 trackers
+                    // refresh_subscription 内部会同步更新全局 trackers
+                    app.message = Some((r, std::time::Instant::now()));
                     refresh_app(app);
                 }
             }
@@ -1809,27 +1810,15 @@ fn submit_subscription(app: &mut App, val: &str) {
     };
     match app.mgr.add_subscription(&name, &url, true) {
         Ok(sub) => {
-            let sname = sub.name.clone();
-            let msg = format!("{}: {sname}", tr("已添加订阅源", "Subscription added"));
+            // 引擎侧已排队立即刷新（add_subscription 内部 kick 后台
+            // 刷新循环），tracker 列表随 300ms 轮询自动更新
+            let msg = format!(
+                "{}: {}（{}）",
+                tr("已添加订阅源", "Subscription added"),
+                sub.name,
+                tr("正在获取 tracker", "fetching trackers")
+            );
             app.message = Some((msg, std::time::Instant::now()));
-            // 立即刷新一次
-            let mgr = app.mgr.clone();
-            let id = sub.id.clone();
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(async { mgr.refresh_subscription(&id).await })
-            })
-            .map(|n| {
-                format!(
-                    "{} {sname}：{} {n} {}",
-                    tr("已刷新", "Refreshed"),
-                    tr("获取", "got"),
-                    tr("个 tracker", "trackers")
-                )
-            })
-            .unwrap_or_else(|e| {
-                format!("{}: {e}", tr("首次刷新失败", "First refresh failed"))
-            });
             refresh_app(app);
         }
         Err(e) => {
@@ -3173,13 +3162,6 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
         Line::from(vec![
             Span::styled(pad_label(&tr("引擎", "Engine")), dim),
             Span::raw(format!("{ENGINE_NAME} v{ENGINE_VERSION}")),
-        ]),
-        Line::from(vec![
-            Span::styled(pad_label(&tr("调度模式", "Scheduler")), dim),
-            Span::raw(tr(
-                "自适应（实时动态调整连接数）",
-                "Adaptive (live connection tuning)",
-            )),
         ]),
         Line::from(vec![
             Span::styled(pad_label(&tr("运行时间", "Uptime")), dim),

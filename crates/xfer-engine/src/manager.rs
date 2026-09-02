@@ -50,6 +50,110 @@ fn generate_id() -> String {
     hex::encode(buf)
 }
 
+/// 当前 Unix 秒。
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// 订阅源刷新的同步语义（调用方持有 Inner 锁）：
+/// 远程列表 `remote` 与该订阅源在全局列表中的现状对齐。
+///
+/// - 新增（远程有、全局无）：追加并标记来源；
+/// - 认领（远程有、全局已有）：补标记来源（此前可能是其他来源
+///   引入的），使该订阅源后续能同步移除它；
+/// - 遗弃（该订阅源曾贡献、远程已无）：
+///   - 仍被其他启用的订阅源上次提供，或手动添加 → 保留；
+///   - 否则 → 从全局剔除（被遗弃的服务器自动移除）。
+///
+/// 返回 (新增的 URL, 从全局列表移除的 URL)。
+fn sync_trackers_locked(
+    inner: &mut Inner,
+    sub_id: &str,
+    remote: &[String],
+) -> (Vec<String>, Vec<String>) {
+    // 本订阅源曾贡献、但本次远程已遗弃的 tracker
+    let dropped: Vec<String> = inner
+        .tracker_sources
+        .iter()
+        .filter(|(_, srcs)| srcs.contains(sub_id))
+        .map(|(url, _)| url.clone())
+        .filter(|url| !remote.iter().any(|r| r == url))
+        .collect();
+
+    let mut removed = Vec::new();
+    for url in dropped {
+        if release_tracker_claim(inner, sub_id, &url) {
+            removed.push(url);
+        }
+    }
+
+    // 新增与认领
+    let mut added = Vec::new();
+    for url in remote {
+        if !inner.global_trackers.contains(url) {
+            inner.global_trackers.push(url.clone());
+            added.push(url.clone());
+        }
+        inner
+            .tracker_sources
+            .entry(url.clone())
+            .or_default()
+            .insert(sub_id.to_string());
+    }
+    (added, removed)
+}
+
+/// 解除订阅源对单个 tracker 的认领；若之后不再被任何来源需要
+/// （其他启用订阅源上次仍提供 / 手动添加），从全局列表移除。
+///
+/// 返回是否已从全局列表移除。
+fn release_tracker_claim(inner: &mut Inner, sub_id: &str, url: &str) -> bool {
+    if let Some(srcs) = inner.tracker_sources.get_mut(url) {
+        srcs.remove(sub_id);
+    }
+    // 仍有其他来源（含手动）认领 → 保留
+    let srcs_empty = inner
+        .tracker_sources
+        .get(url)
+        .is_none_or(|s| s.is_empty());
+    if !srcs_empty {
+        return false;
+    }
+    // 无认领：若其他启用订阅源上次仍提供 → 保留（暂处无来源态，
+    // 由提供方下次刷新重新认领）
+    let other_provides = inner.tracker_subscriptions.iter().any(|s| {
+        s.id != sub_id && s.enabled && s.last_trackers.iter().any(|t| t == url)
+    });
+    if other_provides {
+        return false;
+    }
+    inner.tracker_sources.remove(url);
+    inner.global_trackers.retain(|t| *t != url);
+    true
+}
+
+/// 解除订阅源对其全部 tracker 的认领，不再被任何来源需要的从全局
+/// 列表移除。用于禁用 / 移除订阅源。
+/// 返回实际从全局列表移除的 URL。
+fn unclaim_trackers_locked(inner: &mut Inner, sub_id: &str) -> Vec<String> {
+    let candidates: Vec<String> = inner
+        .tracker_sources
+        .iter()
+        .filter(|(_, srcs)| srcs.contains(sub_id))
+        .map(|(url, _)| url.clone())
+        .collect();
+    let mut removed = Vec::new();
+    for url in candidates {
+        if release_tracker_claim(inner, sub_id, &url) {
+            removed.push(url);
+        }
+    }
+    removed
+}
+
 struct Inner {
     tasks: HashMap<Gid, Arc<Task>>,
     /// 等待队列（队首优先）。
@@ -67,6 +171,11 @@ struct Inner {
     session: Option<PathBuf>,
     /// 全局 BT tracker 列表（设置页配置，所有 BT 任务自动注入）。
     global_trackers: Vec<String>,
+    /// tracker 来源标记：URL → 贡献它的订阅源 id 集合（含 "manual"
+    /// 表示用户手动添加）。订阅同步语义的依据：订阅源刷新时，其
+    /// 曾贡献而远程已移除的 tracker 会被剔除；手动添加或其他订阅源
+    /// 仍提供的保留。会话恢复时缺失来源的旧 tracker 视同手动。
+    tracker_sources: HashMap<String, HashSet<String>>,
     /// Tracker 订阅源（远程 URL，定期获取更新 tracker 列表）。
     tracker_subscriptions: Vec<TrackerSubscription>,
     /// 是否启用 Tracker 订阅自动更新（默认 true）。
@@ -90,6 +199,11 @@ pub struct TrackerSubscription {
     pub last_count: usize,
     /// 上次更新错误信息（空 = 成功）。
     pub last_error: String,
+    /// 上次成功获取的 tracker 列表。跨订阅源同步的依据：某订阅源
+    /// 遗弃某 tracker 时，若其他启用的订阅源上次仍提供它，则保留
+    /// （等提供方下次刷新重新认领）。旧会话缺失时回退空列表。
+    #[serde(default)]
+    pub last_trackers: Vec<String>,
 }
 
 /// 引擎核心：任务生命周期管理。
@@ -100,6 +214,10 @@ pub struct TaskManager {
     bt_engines: Mutex<HashMap<Gid, Arc<TorrentEngine>>>,
     /// 调度器唤醒信号。
     kick: Notify,
+    /// 订阅源立即刷新信号：新增/启用订阅源时通知后台刷新循环。
+    sub_kick: Notify,
+    /// 待立即刷新的订阅源 id（与 sub_kick 配对使用，唤醒时整体取走）。
+    sub_pending: Mutex<Vec<String>>,
     events: broadcast::Sender<EngineEvent>,
     client: reqwest::Client,
     /// RPC shutdown 触发的整体退出令牌。
@@ -124,11 +242,14 @@ impl TaskManager {
                 download_dir,
                 session: None,
                 global_trackers: Vec::new(),
+                tracker_sources: HashMap::new(),
                 tracker_subscriptions: Vec::new(),
                 auto_update_trackers: true,
             }),
             bt_engines: Mutex::new(HashMap::new()),
             kick: Notify::new(),
+            sub_kick: Notify::new(),
+            sub_pending: Mutex::new(Vec::new()),
             events: tx,
             client: xfer_http::build_client(),
             shutdown_token: CancellationToken::new(),
@@ -150,21 +271,29 @@ impl TaskManager {
                 saver.save_session_now();
             }
         });
-        // Tracker 订阅源每日自动更新（24h 间隔）
+        // Tracker 订阅源自动更新：新增/启用订阅源时立即刷新（sub_kick），
+        // 每小时做一次 TTL 检查（距上次成功更新 ≥24h 的订阅源刷新）。
         let sub_refresher = self.clone();
         tokio::spawn(async move {
-            // 启动后延迟 10s 执行首次刷新（避免与启动争抢资源）
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            // interval 首个 tick 立即触发 = 启动时做一次 TTL 检查
+            // （只刷新 24h 未更新的订阅源，不做无谓的全量拉取）。
+            let mut hour = tokio::time::interval(Duration::from_secs(3600));
+            hour.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                if !sub_refresher.should_auto_refresh() {
-                    // 未启用或无订阅源，等 5min 再检查
-                    tokio::time::sleep(Duration::from_secs(300)).await;
-                    continue;
+                tokio::select! {
+                    biased;
+                    // 新增/启用订阅源：立即拉取（Notify 许可保证
+                    // 刷新进行中到达的请求不丢失，唤醒后整体取走）
+                    _ = sub_refresher.sub_kick.notified() => {
+                        sub_refresher.drain_pending_and_refresh().await;
+                    }
+                    // 周期 TTL 检查（订阅源每日更新）
+                    _ = hour.tick() => {
+                        if sub_refresher.should_auto_refresh() {
+                            let _ = sub_refresher.refresh_expired_subscriptions().await;
+                        }
+                    }
                 }
-                // 刷新所有已启用的订阅源
-                let _ = sub_refresher.refresh_all_subscriptions().await;
-                // 每小时检查一次（24h 内至少刷新一次）
-                tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         });
     }
@@ -260,6 +389,28 @@ impl TaskManager {
                 .collect();
             if !parsed.is_empty() {
                 mgr.inner.lock().unwrap().tracker_subscriptions = parsed;
+            }
+        }
+        // 恢复 tracker 来源标记（订阅同步语义的依据）。
+        // 旧会话缺失此字段：现有 tracker 无来源 → 视同手动（永不
+        // 被订阅同步移除）；各订阅源下次成功刷新时会重新认领。
+        if let Some(sources) = v
+            .as_ref()
+            .and_then(|v| v["settings"]["trackerSources"].as_object())
+        {
+            let parsed: HashMap<String, HashSet<String>> = sources
+                .iter()
+                .filter_map(|(url, ids)| {
+                    let set: HashSet<String> = ids
+                        .as_array()?
+                        .iter()
+                        .filter_map(|id| id.as_str().map(String::from))
+                        .collect();
+                    Some((url.clone(), set))
+                })
+                .collect();
+            if !parsed.is_empty() {
+                mgr.inner.lock().unwrap().tracker_sources = parsed;
             }
         }
         // 恢复自动更新开关
@@ -462,6 +613,7 @@ impl TaskManager {
                 "options": Value::Object(global_opts),
                 "btTrackers": inner.global_trackers.clone(),
                 "trackerSubscriptions": inner.tracker_subscriptions.clone(),
+                "trackerSources": inner.tracker_sources.clone(),
                 "autoUpdateTrackers": inner.auto_update_trackers,
             },
             "stoppedTotal": inner.stopped_total,
@@ -1442,7 +1594,8 @@ impl TaskManager {
     ///
     /// - 等待/暂停/活动状态均可添加，新 tracker 立即参与下一轮 announce。
     /// - 重复 URL 自动去重；非 BT 任务返回错误。
-    /// - 活动任务的引擎实例会实时感知（通过 `task.bt_trackers` 共享引用）。
+    /// - 活动任务的引擎实例经 [`TorrentEngine::add_announce_urls`]
+    ///   实时注入（引擎配置在启动时克隆，运行中必须显式下发）。
     pub fn add_trackers(&self, gid: &Gid, trackers: Vec<String>) -> Result<(), String> {
         let task = self.task_of(gid)?;
         if task.bt_meta.lock().unwrap().is_none() && task.bt_info_hash.lock().unwrap().is_none() {
@@ -1468,6 +1621,10 @@ impl TaskManager {
             added
         };
         if !added.is_empty() {
+            // 运行中引擎实时注入 announce 列表
+            if let Some(engine) = self.bt_engines.lock().unwrap().get(gid) {
+                engine.add_announce_urls(&added);
+            }
             tracing::info!(gid = %gid, count = added.len(), "已添加 tracker");
             self.save_session_now();
         }
@@ -1523,7 +1680,8 @@ impl TaskManager {
         self.inner.lock().unwrap().global_trackers.clone()
     }
 
-    /// 向全局列表添加 tracker（去重），并同步注入到所有活动 BT 任务。
+    /// 向全局列表添加 tracker（去重，标记为手动添加），并同步注入到
+    /// 所有活动 BT 任务与运行中的引擎实例。
     pub fn add_global_tracker(&self, url: &str) -> Result<(), String> {
         let url = url.trim().to_string();
         if url.is_empty() {
@@ -1535,42 +1693,31 @@ impl TaskManager {
                 return Err(format!("tracker 已存在: {url}"));
             }
             inner.global_trackers.push(url.clone());
+            // 来源标记：手动添加（订阅源同步永不移除）
+            inner
+                .tracker_sources
+                .entry(url.clone())
+                .or_default()
+                .insert("manual".into());
             true
         };
         if added {
-            // 同步注入到所有非终态 BT 任务
-            let tasks: Vec<Arc<Task>> = {
-                let inner = self.inner.lock().unwrap();
-                inner
-                    .tasks
-                    .values()
-                    .filter(|t| {
-                        !t.status().is_terminal()
-                            && (t.bt_meta.lock().unwrap().is_some()
-                                || t.bt_info_hash.lock().unwrap().is_some())
-                    })
-                    .cloned()
-                    .collect()
-            };
-            for task in tasks {
-                let mut bt = task.bt_trackers.lock().unwrap();
-                if !bt.iter().any(|t| t == &url) {
-                    bt.push(url.clone());
-                }
-            }
+            self.apply_tracker_delta(std::slice::from_ref(&url), &[]);
             tracing::info!(url, "已添加全局 tracker");
             self.save_session_now();
         }
         Ok(())
     }
 
-    /// 从全局列表移除 tracker，并从所有活动 BT 任务中同步移除。
+    /// 从全局列表移除 tracker（清除来源标记），并从所有活动 BT 任务中
+    /// 同步移除。
     pub fn remove_global_tracker(&self, url: &str) -> Result<(), String> {
         let url = url.trim().to_string();
         let removed = {
             let mut inner = self.inner.lock().unwrap();
             let before = inner.global_trackers.len();
             inner.global_trackers.retain(|t| t != &url);
+            inner.tracker_sources.remove(&url);
             before != inner.global_trackers.len()
         };
         if removed {
@@ -1630,6 +1777,7 @@ impl TaskManager {
             last_updated: 0,
             last_count: 0,
             last_error: String::new(),
+            last_trackers: Vec::new(),
         };
         {
             let mut inner = self.inner.lock().unwrap();
@@ -1639,19 +1787,36 @@ impl TaskManager {
             inner.tracker_subscriptions.push(sub.clone());
         }
         tracing::info!(name = %sub.name, url = %sub.url, "已添加 Tracker 订阅源");
+        // 启用时立即拉取一次：引擎侧统一行为，RPC/TUI 等所有客户端
+        // 添加订阅源后 Tracker 列表同步更新（原先仅 TUI 手动补一次
+        // 刷新，RPC 路径要等后台周期，表现为"只有首次添加才更新"）。
+        if sub.enabled {
+            self.sub_pending.lock().unwrap().push(sub.id.clone());
+            self.sub_kick.notify_one();
+        }
         self.save_session_now();
         Ok(sub)
     }
 
-    /// 移除 Tracker 订阅源。
+    /// 移除 Tracker 订阅源（其贡献的 tracker 一并移除，手动添加的保留）。
     pub fn remove_subscription(&self, id: &str) -> Result<(), String> {
-        let removed = {
+        let (removed, dropped) = {
             let mut inner = self.inner.lock().unwrap();
             let before = inner.tracker_subscriptions.len();
             inner.tracker_subscriptions.retain(|s| s.id != id);
-            before != inner.tracker_subscriptions.len()
+            let removed = before != inner.tracker_subscriptions.len();
+            let dropped = if removed {
+                unclaim_trackers_locked(&mut inner, id)
+            } else {
+                Vec::new()
+            };
+            (removed, dropped)
         };
         if removed {
+            if !dropped.is_empty() {
+                tracing::info!(id, removed = dropped.len(), "已移除订阅源贡献的 tracker");
+                self.apply_tracker_delta(&[], &dropped);
+            }
             tracing::info!(id, "已移除 Tracker 订阅源");
             self.save_session_now();
             Ok(())
@@ -1666,8 +1831,11 @@ impl TaskManager {
     }
 
     /// 切换订阅源的启用状态。
+    ///
+    /// - 禁用：移除该订阅源贡献的 tracker（手动与其他订阅源的保留）
+    /// - 重新启用：立即拉取一次最新列表
     pub fn toggle_subscription(&self, id: &str) -> Result<(), String> {
-        {
+        let now_enabled = {
             let mut inner = self.inner.lock().unwrap();
             let sub = inner
                 .tracker_subscriptions
@@ -1675,6 +1843,20 @@ impl TaskManager {
                 .find(|s| s.id == id)
                 .ok_or_else(|| format!("订阅源不存在: {id}"))?;
             sub.enabled = !sub.enabled;
+            sub.enabled
+        };
+        if now_enabled {
+            self.sub_pending.lock().unwrap().push(id.to_string());
+            self.sub_kick.notify_one();
+        } else {
+            let dropped = {
+                let mut inner = self.inner.lock().unwrap();
+                unclaim_trackers_locked(&mut inner, id)
+            };
+            if !dropped.is_empty() {
+                tracing::info!(id, removed = dropped.len(), "禁用订阅源，移除其贡献的 tracker");
+                self.apply_tracker_delta(&[], &dropped);
+            }
         }
         self.save_session_now();
         Ok(())
@@ -1699,6 +1881,25 @@ impl TaskManager {
             && inner.tracker_subscriptions.iter().any(|s| s.enabled)
     }
 
+    /// 后台刷新循环被 kick 唤醒：取走全部待刷新订阅源并逐一刷新。
+    async fn drain_pending_and_refresh(&self) {
+        let ids: Vec<String> = std::mem::take(&mut *self.sub_pending.lock().unwrap());
+        for id in ids {
+            let url = {
+                let inner = self.inner.lock().unwrap();
+                inner
+                    .tracker_subscriptions
+                    .iter()
+                    .find(|s| s.id == id && s.enabled)
+                    .map(|s| s.url.clone())
+            };
+            if let Some(url) = url {
+                let _ = self.refresh_one_subscription(&id, &url).await;
+            }
+        }
+        self.save_session_now();
+    }
+
     /// 从远程 URL 获取 tracker 列表（纯文本，每行一个 URL）。
     async fn fetch_subscription_trackers(
         client: &reqwest::Client,
@@ -1714,24 +1915,34 @@ impl TaskManager {
             .text()
             .await
             .map_err(|e| format!("读取响应失败: {e}"))?;
-        let trackers: Vec<String> = text
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| {
-                !l.is_empty()
-                    && !l.starts_with('#')
-                    && (l.starts_with("udp://")
-                        || l.starts_with("http://")
-                        || l.starts_with("https://")
-                        || l.starts_with("wss://"))
-            })
-            .collect();
+        let mut trackers: Vec<String> = Vec::new();
+        for line in text.lines() {
+            let l = line.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            if (l.starts_with("udp://")
+                || l.starts_with("http://")
+                || l.starts_with("https://")
+                || l.starts_with("wss://"))
+                && !trackers.iter().any(|t| t == l)
+            {
+                trackers.push(l.to_string());
+            }
+        }
         Ok(trackers)
     }
 
-    /// 刷新单个订阅源：远程获取 tracker 列表并合并到全局列表。
+    /// 刷新单个订阅源：远程获取列表并**同步**到全局 Tracker 列表。
+    ///
+    /// 同步语义（订阅源更新 = 全局列表随之更新，而非只增不减）：
+    /// - 远程新增 → 加入全局列表并标记来源；
+    /// - 远程移除 → 该订阅源曾贡献、现无其他来源（其他订阅源/
+    ///   手动）的从全局列表剔除；
+    /// - 远程返回空列表视为异常：不动本地列表（防误清空）。
+    ///
+    /// 新增项同时注入非终态 BT 任务与运行中的引擎实例（实时生效）。
     pub async fn refresh_subscription(&self, id: &str) -> Result<usize, String> {
-        // 取出订阅信息（避免持锁跨 await）
         let sub_url = {
             let inner = self.inner.lock().unwrap();
             inner
@@ -1741,62 +1952,66 @@ impl TaskManager {
                 .map(|s| s.url.clone())
                 .ok_or_else(|| format!("订阅源不存在: {id}"))?
         };
-
-        let trackers = Self::fetch_subscription_trackers(&self.client, &sub_url).await?;
-
-        // 合并到全局 tracker 列表（去重）
-        let added = {
-            let mut inner = self.inner.lock().unwrap();
-            let mut count = 0;
-            for url in &trackers {
-                if !inner.global_trackers.contains(url) {
-                    inner.global_trackers.push(url.clone());
-                    count += 1;
-                }
-            }
-            count
-        };
-        // 同步注入到活动 BT 任务
-        {
-            let inner = self.inner.lock().unwrap();
-            let tasks: Vec<Arc<Task>> = inner
-                .tasks
-                .values()
-                .filter(|t| {
-                    !t.status().is_terminal()
-                        && (t.bt_meta.lock().unwrap().is_some()
-                            || t.bt_info_hash.lock().unwrap().is_some())
-                })
-                .cloned()
-                .collect();
-            drop(inner);
-            for url in &trackers {
-                for task in &tasks {
-                    let mut bt = task.bt_trackers.lock().unwrap();
-                    if !bt.contains(url) {
-                        bt.push(url.clone());
-                    }
-                }
-            }
-        }
-        // 更新订阅状态
-        {
-            let mut inner = self.inner.lock().unwrap();
-            if let Some(sub) = inner.tracker_subscriptions.iter_mut().find(|s| s.id == id) {
-                sub.last_updated = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                sub.last_count = trackers.len();
-                sub.last_error = String::new();
-            }
-        }
-        tracing::info!(id, total = trackers.len(), added, "订阅源刷新完成");
+        let r = self.refresh_one_subscription(id, &sub_url).await;
         self.save_session_now();
-        Ok(trackers.len())
+        r
     }
 
-    /// 刷新所有已启用的订阅源。
+    /// 刷新单个订阅源的核心逻辑（fetch + 同步 + 注入 + 状态更新）。
+    /// 返回获取到的 tracker 数量；调用方负责持久化会话。
+    async fn refresh_one_subscription(&self, id: &str, url: &str) -> Result<usize, String> {
+        let trackers = Self::fetch_subscription_trackers(&self.client, url).await;
+        match trackers {
+            Ok(list) if !list.is_empty() => {
+                let (added, removed) = {
+                    let mut inner = self.inner.lock().unwrap();
+                    sync_trackers_locked(&mut inner, id, &list)
+                };
+                if !added.is_empty() || !removed.is_empty() {
+                    self.apply_tracker_delta(&added, &removed);
+                }
+                let now = now_unix();
+                let mut inner = self.inner.lock().unwrap();
+                if let Some(sub) = inner.tracker_subscriptions.iter_mut().find(|s| s.id == id) {
+                    sub.last_updated = now;
+                    sub.last_count = list.len();
+                    sub.last_error = String::new();
+                    sub.last_trackers = list.clone();
+                }
+                drop(inner);
+                tracing::info!(
+                    id, url,
+                    total = list.len(),
+                    added = added.len(),
+                    removed = removed.len(),
+                    "订阅源刷新完成"
+                );
+                Ok(list.len())
+            }
+            // 空列表：大概率是 URL 配错/网关劫持，保留现有 tracker 不动
+            Ok(_) => {
+                let msg = "订阅源返回空列表，已保留现有 tracker".to_string();
+                let mut inner = self.inner.lock().unwrap();
+                if let Some(sub) = inner.tracker_subscriptions.iter_mut().find(|s| s.id == id) {
+                    sub.last_error = msg.clone();
+                }
+                drop(inner);
+                tracing::warn!(id, url, "订阅源返回空列表");
+                Err(msg)
+            }
+            Err(e) => {
+                let mut inner = self.inner.lock().unwrap();
+                if let Some(sub) = inner.tracker_subscriptions.iter_mut().find(|s| s.id == id) {
+                    sub.last_error = e.clone();
+                }
+                drop(inner);
+                tracing::warn!(id, url, error = %e, "订阅源刷新失败");
+                Err(e)
+            }
+        }
+    }
+
+    /// 刷新所有已启用的订阅源（手动触发，忽略 TTL）。
     pub async fn refresh_all_subscriptions(&self) -> Result<usize, String> {
         let subs: Vec<(String, String)> = {
             let inner = self.inner.lock().unwrap();
@@ -1812,42 +2027,81 @@ impl TaskManager {
         }
         let mut total = 0;
         for (id, url) in &subs {
-            match Self::fetch_subscription_trackers(&self.client, url).await {
-                Ok(trackers) => {
-                    // 合并到全局
-                    {
-                        let mut inner = self.inner.lock().unwrap();
-                        for t in &trackers {
-                            if !inner.global_trackers.contains(t) {
-                                inner.global_trackers.push(t.clone());
-                            }
-                        }
-                        if let Some(sub) =
-                            inner.tracker_subscriptions.iter_mut().find(|s| s.id == *id)
-                        {
-                            sub.last_updated = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs();
-                            sub.last_count = trackers.len();
-                            sub.last_error = String::new();
-                        }
-                    }
-                    total += trackers.len();
-                    tracing::info!(id, count = trackers.len(), "订阅源刷新成功");
-                }
-                Err(e) => {
-                    let mut inner = self.inner.lock().unwrap();
-                    if let Some(sub) = inner.tracker_subscriptions.iter_mut().find(|s| s.id == *id)
-                    {
-                        sub.last_error = e.clone();
-                    }
-                    tracing::warn!(id, url, error = %e, "订阅源刷新失败");
-                }
+            if let Ok(n) = self.refresh_one_subscription(id, url).await {
+                total += n;
             }
         }
         self.save_session_now();
         Ok(total)
+    }
+
+    /// TTL 过滤刷新（后台每小时调用，也可供外部调度器直接使用）：
+    /// 只刷新从未更新过或距上次成功更新 ≥24h 的订阅源——既保证每日
+    /// 更新，又不对远程服务器做无谓的高频拉取。
+    pub async fn refresh_expired_subscriptions(&self) -> usize {
+        const SUB_TTL_SECS: u64 = 24 * 3600;
+        let now = now_unix();
+        let expired: Vec<(String, String)> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .tracker_subscriptions
+                .iter()
+                .filter(|s| {
+                    s.enabled && (s.last_updated == 0 || now >= s.last_updated + SUB_TTL_SECS)
+                })
+                .map(|s| (s.id.clone(), s.url.clone()))
+                .collect()
+        };
+        if expired.is_empty() {
+            return 0;
+        }
+        let mut refreshed = 0;
+        for (id, url) in &expired {
+            if self.refresh_one_subscription(id, url).await.is_ok() {
+                refreshed += 1;
+            }
+        }
+        if refreshed > 0 {
+            self.save_session_now();
+        }
+        refreshed
+    }
+
+    /// 把 tracker 增量同步到非终态 BT 任务与运行中的引擎实例。
+    ///
+    /// - 新增：写入任务 tracker 列表，并实时注入运行中引擎的
+    ///   announce 列表（下一轮 announce 生效，无需暂停/恢复）。
+    /// - 移除：仅从全局列表剔除（在锁内完成）；任务级列表与运行中
+    ///   引擎保留至任务结束——多一次失效 announce 无害，换取零竞态。
+    fn apply_tracker_delta(&self, added: &[String], _removed: &[String]) {
+        if added.is_empty() {
+            return;
+        }
+        let tasks: Vec<Arc<Task>> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .tasks
+                .values()
+                .filter(|t| {
+                    !t.status().is_terminal()
+                        && (t.bt_meta.lock().unwrap().is_some()
+                            || t.bt_info_hash.lock().unwrap().is_some())
+                })
+                .cloned()
+                .collect()
+        };
+        for task in &tasks {
+            let mut bt = task.bt_trackers.lock().unwrap();
+            for url in added {
+                if !bt.contains(url) {
+                    bt.push(url.clone());
+                }
+            }
+        }
+        // 运行中的引擎：实时注入 announce 列表
+        for engine in self.bt_engines.lock().unwrap().values() {
+            engine.add_announce_urls(added);
+        }
     }
 
     /// 是否为 BT 任务（compat 层据此区分 onBtDownloadComplete / onDownloadComplete）。
@@ -2086,6 +2340,34 @@ async fn drive_bt_download(
     let magnet_ih = *task.bt_info_hash.lock().unwrap();
     let mut announce_urls = Vec::new();
     let mut udp_announce_urls = Vec::new();
+    // 运行时添加的 tracker（详情页 t 键 / addTrackers RPC / 订阅源
+    // 注入）：.torrent 与磁力任务都要带上（原先仅磁力任务读取，
+    // .torrent 任务运行时添加的 tracker 被静默忽略）。
+    {
+        let meta_announces: std::collections::HashSet<String> = task
+            .bt_meta
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|m| {
+                m.announce
+                    .iter()
+                    .chain(m.announce_list.iter().flatten())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        for url in task.bt_trackers.lock().unwrap().iter() {
+            if meta_announces.contains(url) {
+                continue;
+            }
+            if url.starts_with("udp://") {
+                udp_announce_urls.push(url.clone());
+            } else {
+                announce_urls.push(url.clone());
+            }
+        }
+    }
     if let Some(meta) = &meta {
         if let Some(a) = &meta.announce {
             if a.starts_with("udp://") {
@@ -2101,15 +2383,6 @@ async fn drive_bt_download(
                 } else {
                     announce_urls.push(url.clone());
                 }
-            }
-        }
-    } else {
-        // 磁力链接：tracker 来自链接的 tr 参数 + 运行时 add_trackers 添加的
-        for url in task.bt_trackers.lock().unwrap().iter() {
-            if url.starts_with("udp://") {
-                udp_announce_urls.push(url.clone());
-            } else {
-                announce_urls.push(url.clone());
             }
         }
     }
