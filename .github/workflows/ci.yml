@@ -209,22 +209,26 @@ jobs:
           fi
 
           # 说明拼装：固定双语模板 + {{version}} 替换；
-          # 顶部总标题与双语切换锚点由 CI 统一添加，模板文件里只写各语言正文
+          # 各语言段的开头标题与切换锚点由 CI 统一添加，模板文件里只写摘要与正文
           EN_FILE=".github/RELEASE_EN.md"
           ZH_FILE=".github/RELEASE_ZH.md"
           BODY_FILE=""
           if [ -f "$EN_FILE" ] || [ -f "$ZH_FILE" ]; then
             BODY_FILE="release_body.md"
             {
-              echo "# XferRust v${VERSION} 发布说明"
+              echo '<a name="english"></a>'
               echo ""
-              echo '<a name="english"></a> **English** | [简体中文](#简体中文)'
+              echo "# XferRust v${VERSION} Release Notes"
+              echo ""
+              echo '**English** | [简体中文](#简体中文)'
               echo ""
               sed -e "s/{{version}}/v${VERSION}/g" "$EN_FILE" 2>/dev/null || true
               echo ""
               echo "---"
               echo ""
               echo '<a name="简体中文"></a>'
+              echo ""
+              echo "# XferRust v${VERSION} 发布说明"
               echo ""
               echo '**[English](#english)** | 简体中文'
               echo ""
