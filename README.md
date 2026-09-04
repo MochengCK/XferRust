@@ -8,6 +8,8 @@
 
 - **下载 HTTP / HTTPS 文件**，支持断点续传——暂停后继续，已下载的部分不会浪费。
 - **下载 BT 种子与磁力链接**，多 peer 并行加速，rarest-first 选片。
+- **磁力链接按需选文件**：粘贴磁力链接后引擎立即解析元数据，解析完成弹出文件表格
+  （勾选 + 文件大小 + 已选汇总），确认后才开始下载——不必为几个文件下载整个种子。
 - **双轨智能调度**：HTTP 预分配连接数（`split`）与 BT 连接数（`bt-max-peers`）相互独立，
   各自按吞吐边际收益自适应增减连接——有收益就扩张，停滞就换血淘汰慢节点。
 - **完成后自动校验**文件完整性（sha-1 / sha-256 / sha-512 / md5）。
@@ -101,7 +103,7 @@ xfer tui [-d 目录] [-j 并发数]
 
 | 按键 | 动作 |
 |---|---|
-| `a` | 弹出输入框，粘贴 URL 后 `Enter` 添加任务，`ESC` 取消 |
+| `a` | 弹出输入框，粘贴 URL 后 `Enter` 添加任务，`ESC` 取消（磁力链接进入解析与文件选择流程） |
 | `↑` `↓` 或 `k` `j` | 上下选择任务 |
 | `Enter` | 进入任务详情（进度仪表 + 速度走势图） |
 | `r` | 暂停 / 恢复选中任务（切换） |
@@ -111,6 +113,11 @@ xfer tui [-d 目录] [-j 并发数]
 | `Tab` | 任务列表 / 侧栏分类焦点切换 |
 | `1` ~ `5` | 快捷切换分类筛选 |
 | `q` / `Ctrl-C` | 退出 |
+
+**磁力链接流程**（`a` 粘贴 `magnet:` 链接）：先显示解析弹窗（种子名、已连接 peer 数、
+耗时），元数据解析完成后任务自动暂停并弹出文件表格——`↑` `↓` / `PgUp` `PgDn` 移动，
+`Space` 勾选，`a` 全选 / 反选，`Enter` 确认（只下载勾选的文件），`Esc` 取消并移除任务；
+底部实时显示「已选 n/N · 已选大小 / 总大小」。未确认就退出的任务，下次启动会重新弹出表格。
 
 **详情视图**：Gauge 进度仪表（百分比、已下载/总大小、速度、剩余时间、平均速度）
 + 最近 60 秒速度 Sparkline 走势。`ESC` / `Enter` 返回列表，`r` / `x` 同列表；
@@ -433,6 +440,21 @@ let gid = mgr.add_uri(
 )?;
 let mut events = mgr.events().subscribe(); // broadcast 事件流
 // mgr.tell_status_native / pause / unpause / remove / list_native / global_stat_native
+```
+
+磁力任务可按文件下载：添加时传 `bt-file-selection` 选项，解析出元数据后任务自动暂停
+（状态 `awaitingSelection = true`），从 `files[]` 取文件列表与大小让用户勾选，确认后
+传入 0 起算的文件索引并恢复下载：
+
+```rust
+let gid = mgr.add_uri(
+    vec!["magnet:?xt=urn:btih:...".into()],
+    &json!({"bt-file-selection": "true"}),
+    None,
+)?;
+// 解析完成后（任务暂停）：files[].index - 1 即文件索引
+mgr.select_files(&gid, &[0, 2])?; // 只下载第 1、3 个文件
+mgr.unpause(&gid)?;               // 确认后立即开始下载
 ```
 
 ### 8. 集成检查清单

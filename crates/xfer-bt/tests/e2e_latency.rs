@@ -249,6 +249,7 @@ async fn latency_link_throughput_requires_multipiece_window() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
     let start = Instant::now();

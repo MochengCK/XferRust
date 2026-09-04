@@ -281,6 +281,7 @@ async fn magnet_download_end_to_end() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        selected_files: None,
     };
     let engine = TorrentEngine::new_magnet(info_hash, cfg).unwrap();
     let cancel = CancellationToken::new();
@@ -349,6 +350,7 @@ async fn magnet_reuses_connection_after_metadata() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        selected_files: None,
     };
     let engine = TorrentEngine::new_magnet(info_hash, cfg).unwrap();
     let r = engine.clone().run(CancellationToken::new()).await;

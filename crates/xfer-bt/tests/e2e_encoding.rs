@@ -228,6 +228,7 @@ async fn tracker_announce_info_hash_encoding_correct() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
     tokio::time::timeout(
@@ -289,6 +290,7 @@ async fn tracker_url_with_existing_query_params() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
     tokio::time::timeout(

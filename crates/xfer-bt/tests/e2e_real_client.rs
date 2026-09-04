@@ -164,6 +164,7 @@ async fn download_from_real_libtorrent_seeder() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
 
@@ -230,6 +231,7 @@ async fn download_from_real_libtorrent_seeder_over_utp() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
     // 后台记录是否有对端走 uTP（连接可能在完成时已断开并进入快照）。

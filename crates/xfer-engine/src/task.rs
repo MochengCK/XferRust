@@ -145,6 +145,11 @@ pub struct Task {
     pub bt_trackers: Mutex<Vec<String>>,
     /// BT 任务当前连接 peer 列表（getPeers 查询用）。
     pub bt_peers: Mutex<Vec<PeerInfo>>,
+    /// 磁力任务等待文件选择：元数据就绪后自动暂停，等用户在 TUI
+    /// 勾选要下载的文件（`bt-file-selection` 任务选项置位）。
+    pub awaiting_selection: AtomicBool,
+    /// 用户选择的文件索引（None = 全部文件；下载时透传给 BT 引擎）。
+    pub selected_files: Mutex<Option<Vec<usize>>>,
     pub created_at: SystemTime,
     pub shared: Mutex<TaskShared>,
     pub uri_states: Mutex<Vec<UriState>>,
@@ -191,6 +196,8 @@ impl Task {
             bt_info_hash: Mutex::new(None),
             bt_trackers: Mutex::new(Vec::new()),
             bt_peers: Mutex::new(Vec::new()),
+            awaiting_selection: AtomicBool::new(false),
+            selected_files: Mutex::new(None),
             created_at: SystemTime::now(),
             shared: Mutex::new(TaskShared {
                 status: Status::Waiting,
@@ -240,6 +247,8 @@ impl Task {
             bt_info_hash: Mutex::new(None),
             bt_trackers: Mutex::new(Vec::new()),
             bt_peers: Mutex::new(Vec::new()),
+            awaiting_selection: AtomicBool::new(false),
+            selected_files: Mutex::new(None),
             created_at: SystemTime::now(),
             shared: Mutex::new(TaskShared {
                 status: Status::Waiting,
@@ -289,6 +298,8 @@ impl Task {
             bt_info_hash: Mutex::new(Some(info_hash)),
             bt_trackers: Mutex::new(trackers),
             bt_peers: Mutex::new(Vec::new()),
+            awaiting_selection: AtomicBool::new(false),
+            selected_files: Mutex::new(None),
             created_at: SystemTime::now(),
             shared: Mutex::new(TaskShared {
                 status: Status::Waiting,
@@ -422,6 +433,8 @@ pub struct TaskSnapshot {
     pub file_len: u64,
     pub path: String,
     pub dir: String,
+    /// 任务显示名（HTTP 为文件名；磁力为 magnet dn / 种子 name）。
+    pub filename: Option<String>,
     pub error_code: i64,
     pub error_message: String,
     pub uris: Vec<(String, UriState)>,
@@ -455,6 +468,7 @@ pub fn snapshot(task: &Task) -> TaskSnapshot {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default(),
         dir: task.dir.to_string_lossy().to_string(),
+        filename: sh.filename.clone(),
         error_code: sh.error_code,
         error_message: sh.error_message.clone(),
         elapsed_ms: sh.active_ms
@@ -490,6 +504,11 @@ pub fn filter_keys(v: Value, keys: Option<&[String]>) -> Value {
 /// 任务状态 → 前端兼容协议 JSON（数值以字符串承载）。
 pub fn status_json(task: &Task) -> Value {
     let s = snapshot(task);
+    let sel = task.selected_files.lock().unwrap().clone();
+    let is_selected = |i: usize| match &sel {
+        None => true,
+        Some(v) => v.contains(&i),
+    };
     let files = if let Some(meta) = &*task.bt_meta.lock().unwrap() {
         let total_done = s.completed;
         meta.info
@@ -508,7 +527,7 @@ pub fn status_json(task: &Task) -> Value {
                     "path": format!("{}/{}", meta.info.name, f.path.join("/")),
                     "length": f.length.to_string(),
                     "completedLength": frac.to_string(),
-                    "selected": "true",
+                    "selected": is_selected(i).to_string(),
                     "uris": [],
                 })
             })
@@ -630,6 +649,7 @@ pub fn status_json_native(task: &Task) -> Value {
         "status": s.status.as_str(),
         "totalLength": s.total_len.unwrap_or(0),
         "completedLength": s.completed,
+        "filename": s.filename,
         "uploadLength": s.uploaded,
         "downloadSpeed": s.download_speed,
         "uploadSpeed": s.upload_speed,
@@ -644,5 +664,6 @@ pub fn status_json_native(task: &Task) -> Value {
         "seeder": seeder,
         "numPieces": num_pieces,
         "pieceLength": piece_length,
+        "awaitingSelection": task.awaiting_selection.load(Ordering::Relaxed),
     })
 }

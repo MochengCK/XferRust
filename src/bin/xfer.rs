@@ -737,6 +737,8 @@ struct App {
     max_conn_per_server: u64,
     /// 最小分片大小（字节，0 = 引擎默认）。
     min_split_size: u64,
+    /// 磁力链接解析 / 文件选择弹窗（模态）。
+    magnet_dialog: Option<MagnetDialog>,
 }
 
 /// TUI 详情页单行 peer 信息。
@@ -832,6 +834,35 @@ struct SubRow {
     enabled: bool,
     last_count: usize,
     last_error: String,
+}
+
+/// 磁力文件选择表格单行。
+#[derive(Clone)]
+struct MagnetFileRow {
+    /// 文件索引（0 起算，select_files 入参）。
+    index: usize,
+    /// 相对种子根目录的显示路径。
+    path: String,
+    /// 文件大小（字节）。
+    length: u64,
+}
+
+/// 磁力链接解析弹窗状态机：
+/// `Parsing`（引擎从 peer 获取元数据）→ `Selecting`（文件表格勾选）。
+#[derive(Clone)]
+enum MagnetDialog {
+    /// 元数据解析中（gid + 弹窗打开时刻）。
+    Parsing { gid: Gid, started: std::time::Instant },
+    /// 文件选择（元数据就绪、任务自动暂停后）。
+    Selecting {
+        gid: Gid,
+        /// 种子根目录名（单文件任务为文件名）。
+        name: String,
+        files: Vec<MagnetFileRow>,
+        /// 与 files 一一对应的勾选状态。
+        checked: Vec<bool>,
+        cursor: usize,
+    },
 }
 
 /// TUI 模式日志写入器：写入文件，避免日志混入终端渲染。
@@ -1025,8 +1056,23 @@ async fn app_loop(mgr: Arc<TaskManager>) -> i32 {
         bt_adaptive: true,
         max_conn_per_server: 0,
         min_split_size: 0,
+        magnet_dialog: None,
     };
     refresh_app(&mut app);
+    // 启动恢复：上次会话解析完成、等待文件选择的磁力任务重新弹窗
+    if let Some(t) = app
+        .tasks
+        .iter()
+        .rev()
+        .find(|t| {
+            t["awaitingSelection"].as_bool().unwrap_or(false)
+                && t["files"].as_array().is_some_and(|a| !a.is_empty())
+        })
+        .cloned()
+    {
+        let gid = Gid::from(t["gid"].as_str().unwrap_or(""));
+        app.magnet_dialog = Some(magnet_selection_from_status(&t, gid));
+    }
     publish(&hub, &app);
 
     let mut last_render = std::time::Instant::now() - Duration::from_secs(1);
@@ -1071,6 +1117,32 @@ async fn app_loop(mgr: Arc<TaskManager>) -> i32 {
 fn refresh_app(app: &mut App) {
     let arr = app.mgr.list_native("all", 0, -1, None);
     app.tasks = arr.as_array().cloned().unwrap_or_default();
+    // 磁力解析弹窗状态机：元数据就绪（引擎自动暂停等待选择）→ 文件表格
+    if let Some(MagnetDialog::Parsing { gid, .. }) = app.magnet_dialog.clone() {
+        let found = app
+            .tasks
+            .iter()
+            .find(|t| t["gid"].as_str() == Some(gid.0.as_str()))
+            .cloned();
+        match found {
+            None => app.magnet_dialog = None, // 任务被移除
+            Some(t) => {
+                let status = t["status"].as_str().unwrap_or("");
+                let has_files = t["files"].as_array().is_some_and(|a| !a.is_empty());
+                let awaiting = t["awaitingSelection"].as_bool().unwrap_or(false);
+                if status == "error" {
+                    let msg = t["errorMessage"].as_str().unwrap_or("").to_string();
+                    app.message = Some((
+                        format!("{}: {msg}", tr("磁力解析失败", "Magnet parse failed")),
+                        std::time::Instant::now(),
+                    ));
+                    app.magnet_dialog = None;
+                } else if awaiting && has_files {
+                    app.magnet_dialog = Some(magnet_selection_from_status(&t, gid));
+                }
+            }
+        }
+    }
     // 全局设置快照（设置视图显示）
     let opts = app.mgr.get_global_option();
     app.max_concurrent = opts["max-concurrent-downloads"]
@@ -1237,6 +1309,10 @@ fn refresh_app(app: &mut App) {
 /// 处理一次按键。返回 false 表示退出。
 fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
+    // 磁力解析 / 文件选择弹窗（模态，优先处理）
+    if let Some(dialog) = app.magnet_dialog.clone() {
+        return handle_magnet_dialog_key(app, dialog, k);
+    }
     // 输入模式：编辑缓冲（并发数只接受数字）
     if let Some((kind, buf)) = app.input.as_mut() {
         match k.code {
@@ -1682,8 +1758,195 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
     true
 }
 
+/// 从任务状态快照构建文件选择弹窗（元数据就绪、任务自动暂停后调用）。
+///
+/// 多文件任务剥离公共根目录段作为弹窗标题；文件索引取
+/// `files[].index - 1`（0 起算），默认全部勾选。
+fn magnet_selection_from_status(t: &Value, gid: Gid) -> MagnetDialog {
+    let files_arr = t["files"].as_array().cloned().unwrap_or_default();
+    let paths: Vec<String> = files_arr
+        .iter()
+        .filter_map(|f| f["path"].as_str().map(String::from))
+        .collect();
+    let root = paths
+        .first()
+        .and_then(|p| p.split('/').next())
+        .unwrap_or("")
+        .to_string();
+    let multi = !root.is_empty() && paths.iter().all(|p| p.starts_with(&format!("{root}/")));
+    let name = if multi {
+        root.clone()
+    } else {
+        paths.first().cloned().unwrap_or_else(|| gid.0.clone())
+    };
+    let files: Vec<MagnetFileRow> = files_arr
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let path = f["path"].as_str().unwrap_or("").to_string();
+            let display = if multi && path.starts_with(&format!("{root}/")) {
+                path[root.len() + 1..].to_string()
+            } else {
+                path
+            };
+            MagnetFileRow {
+                index: f["index"]
+                    .as_u64()
+                    .map(|n| n as usize)
+                    .unwrap_or(i + 1)
+                    .saturating_sub(1),
+                path: display,
+                length: f["length"].as_u64().unwrap_or(0),
+            }
+        })
+        .collect();
+    let checked = vec![true; files.len()];
+    MagnetDialog::Selecting {
+        gid,
+        name,
+        files,
+        checked,
+        cursor: 0,
+    }
+}
+
+/// 勾选汇总：(已选个数, 总个数, 已选字节, 总字节)。
+fn magnet_selected_summary(files: &[MagnetFileRow], checked: &[bool]) -> (usize, usize, u64, u64) {
+    let total_bytes = files.iter().map(|f| f.length).sum();
+    let mut sel_n = 0usize;
+    let mut sel_bytes = 0u64;
+    for (f, c) in files.iter().zip(checked.iter()) {
+        if *c {
+            sel_n += 1;
+            sel_bytes += f.length;
+        }
+    }
+    (sel_n, files.len(), sel_bytes, total_bytes)
+}
+
+/// 磁力弹窗按键处理。返回 true 继续运行。
+fn handle_magnet_dialog_key(
+    app: &mut App,
+    dialog: MagnetDialog,
+    k: &crossterm::event::KeyEvent,
+) -> bool {
+    use crossterm::event::KeyCode;
+    match dialog {
+        // 解析中：Esc/q 取消（移除任务，不留残骸）
+        MagnetDialog::Parsing { gid, .. } => match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                let _ = app.mgr.remove(&gid);
+                app.magnet_dialog = None;
+                app.message = Some((
+                    tr("已取消解析", "Parsing cancelled").to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
+            _ => {}
+        },
+        MagnetDialog::Selecting {
+            gid,
+            name,
+            files,
+            mut checked,
+            mut cursor,
+        } => {
+            let n = files.len();
+            let mut close = false;
+            match k.code {
+                KeyCode::Up | KeyCode::Char('k') => cursor = cursor.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    cursor = (cursor + 1).min(n.saturating_sub(1));
+                }
+                KeyCode::PageUp => cursor = cursor.saturating_sub(10),
+                KeyCode::PageDown => cursor = (cursor + 10).min(n.saturating_sub(1)),
+                KeyCode::Home => cursor = 0,
+                KeyCode::End => cursor = n.saturating_sub(1),
+                KeyCode::Char(' ') => {
+                    if let Some(c) = checked.get_mut(cursor) {
+                        *c = !*c;
+                    }
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    let all_on = checked.iter().all(|c| *c);
+                    let next = !all_on;
+                    for c in checked.iter_mut() {
+                        *c = next;
+                    }
+                }
+                // 确认：写回文件选择并恢复下载
+                KeyCode::Enter => {
+                    let sel: Vec<usize> = files
+                        .iter()
+                        .zip(checked.iter())
+                        .filter(|(_, c)| **c)
+                        .map(|(f, _)| f.index)
+                        .collect();
+                    if sel.is_empty() {
+                        app.message = Some((
+                            tr("至少选择一个文件", "Select at least one file").to_string(),
+                            std::time::Instant::now(),
+                        ));
+                    } else {
+                        let (sel_n, total_n, sel_bytes, _total) =
+                            magnet_selected_summary(&files, &checked);
+                        match app.mgr.select_files(&gid, &sel) {
+                            Ok(()) => {
+                                // 暂停等待中的任务 → 确认后立即恢复下载
+                                let r = app
+                                    .mgr
+                                    .unpause(&gid)
+                                    .map(|_| tr("开始下载", "downloading").to_string())
+                                    .unwrap_or_else(|e| e);
+                                app.message = Some((
+                                    format!(
+                                        "{} {sel_n}/{total_n} · {} — {r}",
+                                        tr("已选", "Selected"),
+                                        fmt_size(sel_bytes),
+                                    ),
+                                    std::time::Instant::now(),
+                                ));
+                                close = true;
+                            }
+                            Err(e) => {
+                                app.message = Some((
+                                    format!("{}: {e}", tr("设置失败", "Failed to apply")),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                // 取消：移除任务
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    let _ = app.mgr.remove(&gid);
+                    app.message = Some((
+                        tr("已取消下载", "Download cancelled").to_string(),
+                        std::time::Instant::now(),
+                    ));
+                    close = true;
+                }
+                _ => {}
+            }
+            if close {
+                app.magnet_dialog = None;
+            } else {
+                app.magnet_dialog = Some(MagnetDialog::Selecting {
+                    gid,
+                    name,
+                    files,
+                    checked,
+                    cursor,
+                });
+            }
+        }
+    }
+    true
+}
+
 /// 提交输入的下载 URL。
 fn submit_url(app: &mut App, url: String) {
+    let url = url.trim().to_string();
     if url.is_empty() {
         app.message = Some((
             tr("地址为空", "Empty URL").to_string(),
@@ -1691,7 +1954,32 @@ fn submit_url(app: &mut App, url: String) {
         ));
         return;
     }
-    // 本地 .torrent 文件 → BT 任务；否则 URL / 磁力链接（add_uri 自动识别 magnet）
+    // 磁力链接：先解析元数据 → 文件表格勾选 → 确认后开始下载
+    if url.starts_with("magnet:") {
+        match app
+            .mgr
+            .add_uri(vec![url], &json!({"bt-file-selection": "true"}), None)
+        {
+            Ok(gid) => {
+                app.magnet_dialog = Some(MagnetDialog::Parsing {
+                    gid,
+                    started: std::time::Instant::now(),
+                });
+                app.message = Some((
+                    tr("正在解析磁力链接…", "Parsing magnet link…").to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
+            Err(e) => {
+                app.message = Some((
+                    format!("{}: {e}", tr("添加失败", "Add failed")),
+                    std::time::Instant::now(),
+                ));
+            }
+        }
+        return;
+    }
+    // 本地 .torrent 文件 → BT 任务；否则 URL（add_uri 自动识别协议）
     let r = if url.ends_with(".torrent") && std::path::Path::new(&url).is_file() {
         use base64::Engine;
         std::fs::read(&url)
@@ -2197,6 +2485,196 @@ fn draw_app(f: &mut ratatui::Frame, app: &App) {
     }
     if app.confirm_quit {
         draw_confirm_quit_popup(f);
+    }
+    if app.magnet_dialog.is_some() {
+        draw_magnet_dialog(f, app);
+    }
+}
+
+/// 磁力链接解析 / 文件选择弹窗。
+fn draw_magnet_dialog(f: &mut ratatui::Frame, app: &App) {
+    use ratatui::layout::Alignment;
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Clear, Padding, Paragraph};
+
+    let Some(dialog) = &app.magnet_dialog else {
+        return;
+    };
+    let dim = ui_dim();
+    let accent = ui_accent();
+
+    match dialog {
+        MagnetDialog::Parsing { gid, started } => {
+            let t = app
+                .tasks
+                .iter()
+                .find(|t| t["gid"].as_str() == Some(gid.0.as_str()));
+            let name = t
+                .and_then(|t| t["filename"].as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(gid.0.as_str())
+                .to_string();
+            let status = t.map(|t| t["status"].as_str().unwrap_or("")).unwrap_or("");
+            let conns = t
+                .and_then(|t| t["connections"].as_u64())
+                .unwrap_or(0);
+            let state_text = match status {
+                "waiting" => tr("排队等待调度…", "Queued…").to_string(),
+                "active" => format!(
+                    "{}（{} {}）",
+                    tr("正在连接 peer 获取元数据", "Connecting peers for metadata"),
+                    conns,
+                    tr("个连接", "conns")
+                ),
+                _ => tr("准备中…", "Preparing…").to_string(),
+            };
+            let area = centered_rect(56, 7, f.area());
+            f.render_widget(Clear, area);
+            let body = vec![
+                Line::from(vec![Span::styled(name, Style::new().fg(Color::Cyan))]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("⟳ ", accent),
+                    Span::styled(state_text, Style::new()),
+                    Span::styled(format!(" · {}s", started.elapsed().as_secs()), dim),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    tr("Esc 取消解析", "Esc cancel"),
+                    dim,
+                )),
+            ];
+            let popup = Paragraph::new(body)
+                .block(
+                    ui_card_focused()
+                        .title(Span::styled(
+                            format!(" {} ", tr("磁力链接解析中", "Parsing magnet")),
+                            Style::new().fg(Color::Yellow),
+                        ))
+                        .padding(Padding::horizontal(2)),
+                )
+                .alignment(Alignment::Left);
+            f.render_widget(popup, area);
+        }
+        MagnetDialog::Selecting {
+            gid: _,
+            name,
+            files,
+            checked,
+            cursor,
+        } => {
+            let n = files.len();
+            // 表格可见行数（随终端高度伸缩，3..=14 行）
+            let visible = (f.area().height.saturating_sub(9).clamp(3, 14) as usize).min(n);
+            let area_w = f.area().width.saturating_sub(4).clamp(40, 96);
+            let area_h = (visible as u16 + 6).min(f.area().height.saturating_sub(2));
+            let x = (f.area().width.saturating_sub(area_w)) / 2;
+            let y = (f.area().height.saturating_sub(area_h)) / 2;
+            let area = ratatui::layout::Rect {
+                x,
+                y,
+                width: area_w,
+                height: area_h,
+            };
+            f.render_widget(Clear, area);
+
+            // 行窗口跟随光标滚动
+            let start = if n <= visible {
+                0
+            } else {
+                cursor
+                    .saturating_sub(visible / 2)
+                    .min(n.saturating_sub(visible))
+            };
+            let end = (start + visible).min(n);
+
+            // 大小列宽（最长尺寸字符串）
+            let size_w = files
+                .iter()
+                .map(|f| fmt_size(f.length).len())
+                .max()
+                .unwrap_or(5);
+            let inner_w = area_w.saturating_sub(10) as usize; // 边框/内边距/前缀/复选框
+            let name_w = inner_w.saturating_sub(size_w + 2).max(10);
+
+            let (sel_n, total_n, sel_bytes, total_bytes) =
+                magnet_selected_summary(files, checked);
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(vec![
+                Span::styled(name.clone(), Style::new().fg(Color::Cyan)),
+                Span::styled(format!(" · {} {}", n, tr("个文件", "files")), dim),
+            ]));
+            lines.push(Line::from(""));
+            for (i, f) in files.iter().enumerate().take(end).skip(start) {
+                let cur = i == *cursor;
+                let on = checked.get(i).copied().unwrap_or(false);
+                let check = if on { "[x]" } else { "[ ]" };
+                let check_style = Style::new()
+                    .fg(if on { Color::LightGreen } else { Color::Gray })
+                    .add_modifier(Modifier::BOLD);
+                let shown = truncate_to_width(&f.path, name_w);
+                let pad = " ".repeat(name_w.saturating_sub(disp_w(&shown)));
+                let prefix = if cur { "▸ " } else { "  " };
+                let name_style = if cur {
+                    accent.add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, if cur { accent } else { dim }),
+                    Span::styled(format!("{check} "), check_style),
+                    Span::styled(shown, name_style),
+                    Span::raw(pad),
+                    Span::styled(" ", Style::new()),
+                    Span::styled(fmt_size(f.length), dim),
+                ]));
+            }
+            if n > visible {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} {}/{}",
+                        tr("第", "row"),
+                        cursor + 1,
+                        n
+                    ),
+                    dim,
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{} {sel_n}/{total_n} · {} / {}",
+                        tr("已选", "Selected"),
+                        fmt_size(sel_bytes),
+                        fmt_size(total_bytes)
+                    ),
+                    Style::new().fg(Color::Cyan),
+                ),
+            ]));
+            lines.push(hint_line(&[
+                ("↑↓", tr("移动", "move").to_string()),
+                ("Space", tr("勾选", "toggle").to_string()),
+                ("a", tr("全选/反选", "all/none").to_string()),
+                ("Enter", tr("确认下载", "download").to_string()),
+                ("Esc", tr("取消", "cancel").to_string()),
+            ]));
+            let popup = Paragraph::new(lines)
+                .block(
+                    ui_card_focused()
+                        .title(Span::styled(
+                            format!(
+                                " {} ",
+                                tr("选择要下载的文件", "Select files to download")
+                            ),
+                            Style::new().fg(Color::Yellow),
+                        ))
+                        .padding(Padding::horizontal(2)),
+                )
+                .alignment(Alignment::Left);
+            f.render_widget(popup, area);
+        }
     }
 }
 
@@ -3966,6 +4444,7 @@ mod tests {
             bt_adaptive: true,
             max_conn_per_server: 0,
             min_split_size: 0,
+            magnet_dialog: None,
         }
     }
 
@@ -4500,5 +4979,76 @@ mod tests {
             xfer_engine::DEFAULT_MIN_SPLIT_SIZE,
             "显式 0 应继续显示默认值"
         );
+    }
+
+    /// 构造磁力文件选择弹窗用的任务状态快照（多文件）。
+    fn magnet_status_fixture() -> Value {
+        json!({
+            "gid": "gid-magnet-1",
+            "status": "paused",
+            "awaitingSelection": true,
+            "files": [
+                {"index": 1, "path": "UbuntuSuite/ubuntu-24.04.iso", "length": 5u64 * 1024 * 1024 * 1024},
+                {"index": 2, "path": "UbuntuSuite/README.txt", "length": 2048},
+                {"index": 3, "path": "UbuntuSuite/checksums.sha256", "length": 4096},
+            ],
+        })
+    }
+
+    #[test]
+    fn magnet_selection_from_status_strips_root() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let t = magnet_status_fixture();
+        let d = magnet_selection_from_status(&t, Gid::from("gid-magnet-1"));
+        let MagnetDialog::Selecting {
+            name, files, checked, cursor, ..
+        } = d
+        else {
+            panic!("应为 Selecting 状态");
+        };
+        assert_eq!(name, "UbuntuSuite");
+        assert_eq!(files.len(), 3);
+        // 公共根目录段被剥离
+        assert_eq!(files[0].path, "ubuntu-24.04.iso");
+        assert_eq!(files[1].path, "README.txt");
+        assert_eq!(files[2].path, "checksums.sha256");
+        // index 转为 0 起算
+        assert_eq!(files[0].index, 0);
+        assert_eq!(files[2].index, 2);
+        // 默认全选、光标在首行
+        assert!(checked.iter().all(|c| *c));
+        assert_eq!(checked.len(), files.len());
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn magnet_selection_single_file_uses_full_path() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let t = json!({
+            "gid": "gid-magnet-2",
+            "status": "paused",
+            "awaitingSelection": true,
+            "files": [{"index": 1, "path": "movie.mkv", "length": 1024}],
+        });
+        let d = magnet_selection_from_status(&t, Gid::from("gid-magnet-2"));
+        let MagnetDialog::Selecting { name, files, .. } = d else {
+            panic!("应为 Selecting 状态");
+        };
+        assert_eq!(name, "movie.mkv");
+        assert_eq!(files[0].path, "movie.mkv");
+        assert_eq!(files[0].index, 0);
+    }
+
+    #[test]
+    fn magnet_selected_summary_counts() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let files = vec![
+            MagnetFileRow { index: 0, path: "a".into(), length: 100 },
+            MagnetFileRow { index: 1, path: "b".into(), length: 200 },
+            MagnetFileRow { index: 2, path: "c".into(), length: 400 },
+        ];
+        let (n, total, bytes, total_bytes) =
+            magnet_selected_summary(&files, &[true, false, true]);
+        assert_eq!((n, total, bytes, total_bytes), (2, 3, 500, 700));
     }
 }

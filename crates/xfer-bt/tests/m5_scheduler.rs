@@ -222,6 +222,7 @@ async fn pipeline_adaptive_grows_under_fast_peer() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
     tokio::time::timeout(
@@ -285,6 +286,7 @@ async fn slow_peer_does_not_block_download() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
     // 即使有慢速节点，下载也应在合理时间内完成
@@ -349,6 +351,7 @@ async fn rate_limit_caps_download_speed() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
     let start = Instant::now();
@@ -420,6 +423,7 @@ async fn seed_mode_accepts_incoming_connections() {
         upload_limit: 0,
         seed_mode: true,
         seed_duration: 3, // 3 秒后由 cancel 停止
+        selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
     let engine_task = tokio::spawn(engine.clone().run(cancel_clone));
@@ -494,6 +498,7 @@ async fn cold_start_burst_connects_multiple_seeds() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
     tokio::time::timeout(

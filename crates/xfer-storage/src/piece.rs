@@ -180,6 +180,40 @@ impl PieceLayout {
         }
         segs
     }
+
+    /// 文件选择 → 需要下载的片位图。
+    ///
+    /// `selected = None` 表示全部文件（返回 None，调用方按全量语义处理）；
+    /// `Some(索引)` 时返回仅覆盖所选文件的片位图。跨选/未选文件边界的片
+    /// 无法拆分，按需下载（与其余客户端行为一致：边界片整体下载，
+    /// 未选文件一侧的字节落盘但文件保持稀疏）。
+    pub fn wanted_piece_mask(&self, selected: Option<&[usize]>) -> Option<PieceMap> {
+        let sel = selected?;
+        let set: std::collections::HashSet<usize> = sel.iter().copied().collect();
+        let mut m = PieceMap::new(self.piece_count());
+        for idx in 0..self.piece_count() {
+            if self.piece_segments(idx).iter().any(|(fi, _, _)| set.contains(fi)) {
+                m.set(idx);
+            }
+        }
+        Some(m)
+    }
+
+    /// 所选文件的字节总量（None = 全部文件）。
+    pub fn selected_length(&self, selected: Option<&[usize]>) -> u64 {
+        match selected {
+            None => self.total_length(),
+            Some(sel) => {
+                let set: std::collections::HashSet<usize> = sel.iter().copied().collect();
+                self.files
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| set.contains(i))
+                    .map(|(_, f)| f.length)
+                    .sum()
+            }
+        }
+    }
 }
 
 /// piece 存储：打开全部文件句柄，支持随机读写。
@@ -425,6 +459,37 @@ mod tests {
         assert_eq!(l.piece_segments(0), vec![(0, 0, 10)]);
         assert_eq!(l.piece_segments(1), vec![(0, 10, 5), (1, 0, 5)]);
         assert_eq!(l.piece_segments(2), vec![(1, 5, 5), (2, 0, 5)]);
+    }
+
+    #[test]
+    fn wanted_mask_full_selection_is_none() {
+        let l = layout3();
+        // None = 全部文件：无位图，调用方按全量语义处理
+        assert!(l.wanted_piece_mask(None).is_none());
+        assert_eq!(l.selected_length(None), 30);
+    }
+
+    #[test]
+    fn wanted_mask_single_file_includes_boundary_pieces() {
+        let l = layout3();
+        // 只选 b.bin（文件 1）：片 1 跨 a/b、片 2 跨 b/c，均需下载
+        let m = l.wanted_piece_mask(Some(&[1])).unwrap();
+        assert!(m.is_set(1) && m.is_set(2));
+        assert!(!m.is_set(0));
+        assert_eq!(l.selected_length(Some(&[1])), 10);
+    }
+
+    #[test]
+    fn wanted_mask_multiple_files_and_invalid_index() {
+        let l = layout3();
+        // 选 a + c：片 0 全在 a、片 2 含 c；片 1 只触 a 尾(属于 a，边界片已含)
+        let m = l.wanted_piece_mask(Some(&[0, 2])).unwrap();
+        assert!(m.is_set(0) && m.is_set(1) && m.is_set(2));
+        assert_eq!(l.selected_length(Some(&[0, 2])), 20);
+        // 越界索引被忽略
+        let m2 = l.wanted_piece_mask(Some(&[7])).unwrap();
+        assert_eq!(m2.done_count(), 0);
+        assert_eq!(l.selected_length(Some(&[7])), 0);
     }
 
     #[test]

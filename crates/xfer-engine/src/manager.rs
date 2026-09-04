@@ -462,13 +462,18 @@ impl TaskManager {
                 })
                 .unwrap_or_default();
 
-            // 尝试恢复 BT torrent 元数据（.torrent 文件任务）
+            // 尝试恢复 BT torrent 元数据（.torrent 文件任务存完整种子；
+            // 磁力任务存 info 字典 raw_info → 用 parse_info_bytes 解析）
             let bt_meta = t["btTorrentB64"].as_str().and_then(|b64| {
                 use base64::Engine;
                 base64::engine::general_purpose::STANDARD
                     .decode(b64.trim())
                     .ok()
-                    .and_then(|bytes| parse_torrent(&bytes).ok())
+                    .and_then(|bytes| {
+                        parse_torrent(&bytes)
+                            .ok()
+                            .or_else(|| xfer_bencode::parse_info_bytes(&bytes).ok())
+                    })
                     .map(Arc::new)
             });
 
@@ -501,6 +506,19 @@ impl TaskManager {
             if let Some(meta) = bt_meta {
                 *task.bt_meta.lock().unwrap() = Some(meta);
             }
+            // 恢复磁力解析流程状态：等待文件选择 + 用户勾选
+            if t["awaitingSelection"].as_bool().unwrap_or(false) {
+                task.awaiting_selection.store(true, Ordering::SeqCst);
+            }
+            if let Some(arr) = t["selectedFiles"].as_array() {
+                let sel: Vec<usize> = arr
+                    .iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as usize))
+                    .collect();
+                if !sel.is_empty() {
+                    *task.selected_files.lock().unwrap() = Some(sel);
+                }
+            }
             {
                 let mut sh = task.shared.lock().unwrap();
                 sh.completed = t["completedLength"].as_u64().unwrap_or(0);
@@ -521,6 +539,14 @@ impl TaskManager {
                     "error" => sh.status = Status::Error,
                     "removed" => sh.status = Status::Removed,
                     _ => {} // waiting / active → Waiting（active 重启后重新下载）
+                }
+                // 磁力解析流程：等待文件选择且元数据已就绪的任务恢复为
+                // 暂停——直接入队会跳过选择把全部文件下载下来
+                if task.awaiting_selection.load(Ordering::SeqCst)
+                    && task.bt_meta.lock().unwrap().is_some()
+                    && sh.status == Status::Waiting
+                {
+                    sh.status = Status::Paused;
                 }
             }
             let status = task.status();
@@ -592,12 +618,14 @@ impl TaskManager {
                     "btTrackers": t.bt_trackers.lock().unwrap().clone(),
                     "btInfoHash": t.bt_info_hash.lock().unwrap().map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>()),
                     "btTorrentB64": t.bt_meta.lock().unwrap().as_ref().and_then(|m| {
-                        // 保存 .torrent 原始文件的 base64（重启后重新解析恢复 bt_meta）
-                        m.raw_bencode.as_ref().map(|bytes| {
-                            use base64::Engine;
-                            base64::engine::general_purpose::STANDARD.encode(bytes)
-                        })
+                        // 保存原始 bencode（.torrent 用 raw_bencode；磁力元
+                        // 数据只有 info 字典 → 存 raw_info，恢复时按 info 解析）
+                        let bytes = m.raw_bencode.as_ref().or(m.raw_info.as_ref())?;
+                        use base64::Engine;
+                        Some(base64::engine::general_purpose::STANDARD.encode(bytes))
                     }),
+                    "awaitingSelection": t.awaiting_selection.load(Ordering::SeqCst),
+                    "selectedFiles": t.selected_files.lock().unwrap().clone(),
                 })
             })
             .collect();
@@ -930,6 +958,15 @@ impl TaskManager {
             m.display_name,
             collect_task_options(&opts),
         ));
+        // TUI 磁力流程：解析出文件列表后暂停，等用户勾选要下载的文件
+        if opts
+            .get("bt-file-selection")
+            .and_then(Value::as_str)
+            .map(|v| v == "true")
+            .unwrap_or(false)
+        {
+            task.awaiting_selection.store(true, Ordering::SeqCst);
+        }
         {
             let mut inner = self.inner.lock().unwrap();
             inner.tasks.insert(gid.clone(), task);
@@ -973,6 +1010,14 @@ impl TaskManager {
         let task = self.task_of(gid)?;
         if task.status() != Status::Paused {
             return Err("任务未处于暂停状态".into());
+        }
+        // 磁力解析流程：等待文件选择的任务必须先勾选文件
+        // （元数据在重启后丢失时例外——恢复下载会重新解析并再次暂停）
+        if task.awaiting_selection.load(Ordering::SeqCst)
+            && task.selected_files.lock().unwrap().is_none()
+            && task.bt_meta.lock().unwrap().is_some()
+        {
+            return Err("请先选择要下载的文件".into());
         }
         // 令牌不可复用：替换为新令牌并重置意图，再入队等待调度
         *task.cancel.write().unwrap() = CancellationToken::new();
@@ -1588,6 +1633,49 @@ impl TaskManager {
             })
             .collect();
         Ok(Value::Array(arr))
+    }
+
+    /// 设置 BT 任务的文件选择（磁力解析流程：用户勾选要下载的文件）。
+    ///
+    /// - 仅接受已就绪文件列表的 BT 任务；索引越界自动过滤，去重排序；
+    /// - 运行中引擎实时热生效（重算所需片位图与总量）；
+    /// - 暂停/等待中的任务在下次启动（unpause/调度）时生效。
+    ///
+    /// 索引为 `files[].index - 1`（0 起算的文件序号）。
+    pub fn select_files(&self, gid: &Gid, indices: &[usize]) -> Result<(), String> {
+        let task = self.task_of(gid)?;
+        let count = task
+            .bt_meta
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|m| m.info.files.len())
+            .ok_or_else(|| "文件列表未就绪（磁力元数据解析中或非 BT 任务）".to_string())?;
+        let mut sel: Vec<usize> = indices
+            .iter()
+            .copied()
+            .filter(|i| *i < count)
+            .collect();
+        sel.sort_unstable();
+        sel.dedup();
+        if sel.is_empty() {
+            return Err("至少选择一个文件".into());
+        }
+        *task.selected_files.lock().unwrap() = Some(sel.clone());
+        // 运行中引擎热生效；暂停任务由下次启动的 TorrentConfig 带上
+        if let Some(engine) = self.bt_engines.lock().unwrap().get(gid) {
+            engine.set_selected_files(Some(sel.clone()));
+        }
+        tracing::info!(gid = %gid, files = sel.len(), "已设置文件选择");
+        self.save_session_now();
+        Ok(())
+    }
+
+    /// 查询任务的文件选择（None = 全部文件）。
+    pub fn get_selected_files(&self, gid: &Gid) -> Result<Option<Vec<usize>>, String> {
+        let task = self.task_of(gid)?;
+        let sel = task.selected_files.lock().unwrap().clone();
+        Ok(sel)
     }
 
     /// 向 BT 任务动态添加 tracker URL。
@@ -2424,6 +2512,8 @@ async fn drive_bt_download(
         upload_limit: ul_limit,
         seed_mode: false,
         seed_duration: 0,
+        // 磁力解析后用户勾选的文件（None = 全部）
+        selected_files: task.selected_files.lock().unwrap().clone(),
     };
     let engine = match (&meta, magnet_ih) {
         (Some(m), _) => TorrentEngine::new((**m).clone(), cfg).map_err(TaskFailure::Bt)?,
@@ -2447,6 +2537,7 @@ async fn drive_bt_download(
     let prog_task = tokio::spawn({
         let engine = engine.clone();
         let task = task.clone();
+        let cancel = cancel.clone();
         async move {
             let mut iv = tokio::time::interval(Duration::from_secs(1));
             iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2467,6 +2558,27 @@ async fn drive_bt_download(
                 task.connections_atomic.store(conn_count as u64, Ordering::Relaxed);
                 task.uploaded_atomic.store(engine.uploaded(), Ordering::Relaxed);
                 *task.bt_peers.lock().unwrap() = peers;
+                // 磁力任务：元数据就绪即回填 bt_meta（文件列表/详情页立即可见）
+                if task.bt_meta.lock().unwrap().is_none() {
+                    if let Some(m) = engine.meta() {
+                        *task.bt_meta.lock().unwrap() = Some(Arc::new(m));
+                        tracing::info!(gid = %task.gid, "磁力元数据就绪");
+                    }
+                }
+                // 磁力解析流程：元数据到手后暂停任务，等用户在 TUI 勾选文件。
+                // 借用 pause 语义（intent=Pause + cancel）复用现有状态机。
+                if task.awaiting_selection.load(Ordering::SeqCst)
+                    && task.bt_meta.lock().unwrap().is_some()
+                {
+                    let mut intent = task.intent.lock().unwrap();
+                    if matches!(*intent, Intent::None) {
+                        tracing::info!(gid = %task.gid, "等待文件选择，自动暂停");
+                        *intent = Intent::Pause;
+                        drop(intent);
+                        cancel.cancel();
+                        break;
+                    }
+                }
                 if p.done >= p.total && p.total > 0 {
                     // 完成后也同步一次再退出
                     break;

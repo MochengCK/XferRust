@@ -437,6 +437,9 @@ pub struct TorrentConfig {
     pub seed_mode: bool,
     /// seed 模式持续时间（秒，0 = 永久）。
     pub seed_duration: u64,
+    /// 文件选择（None = 全部文件；Some = 仅下载这些文件索引）。
+    /// 磁力链接解析出文件列表后由用户勾选，未选文件的片不请求。
+    pub selected_files: Option<Vec<usize>>,
 }
 
 impl Default for TorrentConfig {
@@ -459,6 +462,7 @@ impl Default for TorrentConfig {
             upload_limit: 0,
             seed_mode: false,
             seed_duration: 0,
+            selected_files: None,
         }
     }
 }
@@ -800,6 +804,13 @@ pub struct TorrentEngine {
     /// 列表被克隆进配置快照，若无此机制，新增 tracker 只能等
     /// 暂停/恢复重建引擎后才生效。
     dynamic_announces: Mutex<DynamicAnnounces>,
+    /// 运行时文件选择（None = 全部文件；Some = 仅下载这些文件索引）。
+    /// 初始值来自 [`TorrentConfig::selected_files`]，可经
+    /// [`Self::set_selected_files`] 热更新。
+    selected_files: Mutex<Option<Vec<usize>>>,
+    /// 由 `selected_files` 推导的所需片位图（None = 全量）。
+    /// 元数据就绪 / 文件选择变更时重算。
+    wanted: Mutex<Option<PieceMap>>,
 }
 
 /// 动态 announce 列表：按协议分流（http / udp）。
@@ -855,6 +866,7 @@ impl TorrentEngine {
         let peer_id = config.peer_id;
         let download_limit = config.download_limit;
         let upload_limit = config.upload_limit;
+        let selected_files_init = config.selected_files.clone();
         let info_hash = meta.info_hash;
         let sched_cfg = scheduler_config(&config);
         let encryption_code = config.encryption.code();
@@ -898,8 +910,11 @@ impl TorrentEngine {
             encryption_mode: std::sync::atomic::AtomicU8::new(encryption_code),
             bt_protocol_mode: std::sync::atomic::AtomicU8::new(protocol_code),
             dynamic_announces: Mutex::new(DynamicAnnounces::default()),
+            selected_files: Mutex::new(selected_files_init),
+            wanted: Mutex::new(None),
         });
         engine.refresh_done_bytes();
+        engine.apply_selection();
         Ok(engine)
     }
 
@@ -909,6 +924,7 @@ impl TorrentEngine {
         let peer_id = config.peer_id;
         let download_limit = config.download_limit;
         let upload_limit = config.upload_limit;
+        let selected_files_init = config.selected_files.clone();
         let sched_cfg = scheduler_config(&config);
         let encryption_code = config.encryption.code();
         let protocol_code = config.bt_protocol.code();
@@ -951,6 +967,8 @@ impl TorrentEngine {
             encryption_mode: std::sync::atomic::AtomicU8::new(encryption_code),
             bt_protocol_mode: std::sync::atomic::AtomicU8::new(protocol_code),
             dynamic_announces: Mutex::new(DynamicAnnounces::default()),
+            selected_files: Mutex::new(selected_files_init),
+            wanted: Mutex::new(None),
         });
         Ok(engine)
     }
@@ -1015,8 +1033,71 @@ impl TorrentEngine {
         // 否则这些 peer 的片集合仍为空 → 选片失败 → "有节点无速度"。
         self.apply_pending_peer_bitfields();
         self.refresh_done_bytes();
+        // 文件选择（磁力解析后勾选）：就绪后立即生效
+        self.apply_selection();
         tracing::info!(total_bytes, "磁力元数据就绪，进入正常下载");
         Ok(())
+    }
+
+    /// 按当前 `selected_files` 重算所需片位图、总量与已完成字节数。
+    ///
+    /// None（全量）时位图保持 None、总量为全部文件长度；有选择时总量
+    /// 收缩为所选文件长度，未覆盖文件的片不参与选片/完成判定。
+    fn apply_selection(&self) {
+        let sel = self.selected_files.lock().unwrap().clone();
+        let mask = {
+            let guard = self.store.lock().unwrap();
+            match guard.as_ref() {
+                Some(store) => store.layout().wanted_piece_mask(sel.as_deref()),
+                None => return,
+            }
+        };
+        let total = {
+            let guard = self.store.lock().unwrap();
+            guard
+                .as_ref()
+                .map(|s| s.layout().selected_length(sel.as_deref()))
+                .unwrap_or(0)
+        };
+        *self.wanted.lock().unwrap() = mask;
+        self.total_bytes.store(total, Ordering::Relaxed);
+        self.refresh_done_bytes();
+    }
+
+    /// 某片是否需要下载（无选择 = 全部需要）。
+    fn piece_wanted(&self, idx: u32) -> bool {
+        match self.wanted.lock().unwrap().as_ref() {
+            None => true,
+            Some(m) => m.is_set(idx),
+        }
+    }
+
+    /// 所需片是否全部完成（文件选择下的完成判定）。
+    fn all_wanted_done(&self) -> bool {
+        let guard = self.store.lock().unwrap();
+        let Some(store) = guard.as_ref() else {
+            return false;
+        };
+        self.all_wanted_done_with(store)
+    }
+
+    /// [`Self::all_wanted_done`] 的无 store 加锁版本：调用方已持 store 锁时
+    /// 使用（std Mutex 不可重入，重复加锁自死锁）。
+    fn all_wanted_done_with(&self, store: &PieceStore) -> bool {
+        let wanted = self.wanted.lock().unwrap();
+        match wanted.as_ref() {
+            None => store.map().all_done(),
+            Some(m) => (0..m.count()).all(|i| !m.is_set(i) || store.map().is_set(i)),
+        }
+    }
+
+    /// 运行时更新文件选择（None = 全部文件）。
+    ///
+    /// 立即重算位图/总量/已完成字节数；已在途的未选片请求会自然完成
+    /// 落盘（幂等无害），后续选片不再分配未选文件的片。
+    pub fn set_selected_files(&self, files: Option<Vec<usize>>) {
+        *self.selected_files.lock().unwrap() = files;
+        self.apply_selection();
     }
 
     /// 启动监听（端口 0 = 系统自动分配，避免多任务冲突）。
@@ -1952,11 +2033,7 @@ impl TorrentEngine {
     }
 
     pub fn is_done(&self) -> bool {
-        self.store
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|s| s.map().all_done())
+        self.all_wanted_done()
     }
 
     fn finish(&self) {
@@ -2104,15 +2181,18 @@ impl TorrentEngine {
         self.meta.read().unwrap().clone()
     }
 
-    /// 重新统计 done_bytes（启动/续传后）。
+    /// 重新统计 done_bytes（启动/续传后/文件选择变更）。
+    /// 有文件选择时只统计所需片的字节（总量同口径收缩）。
     fn refresh_done_bytes(&self) {
         let guard = self.store.lock().unwrap();
         let Some(store) = guard.as_ref() else {
             return;
         };
+        let wanted = self.wanted.lock().unwrap().clone();
         let mut n = 0u64;
         for i in 0..store.piece_count() {
-            if store.have_piece(i) {
+            let wanted_i = wanted.as_ref().is_none_or(|m| m.is_set(i));
+            if wanted_i && store.have_piece(i) {
                 n += store.piece_len(i);
             }
         }
@@ -4188,10 +4268,11 @@ impl TorrentEngine {
             let guard = self.store.lock().unwrap();
             let store = guard.as_ref().unwrap();
             let count = store.piece_count();
-            let want = !store.map().all_done();
+            let want = !self.all_wanted_done_with(store);
             let mut st = cell.state.lock().unwrap();
-            // 对端拥有的片中，存在我们尚未下载的片
-            let has = (0..count).any(|p| st.have.is_set(p) && !store.have_piece(p));
+            // 对端拥有的片中，存在我们尚未下载且需要下载的片
+            let has = (0..count)
+                .any(|p| st.have.is_set(p) && !store.have_piece(p) && self.piece_wanted(p));
             let already = st.we_interested;
             if want && has && !already {
                 st.we_interested = true;
@@ -4448,7 +4529,7 @@ impl TorrentEngine {
         // (稀有度, 片号)，按稀有度升序
         let mut candidates: Vec<(u32, u32)> = Vec::new();
         for idx in 0..count {
-            if !peer_have.is_set(idx) || store_have.is_set(idx) {
+            if !peer_have.is_set(idx) || store_have.is_set(idx) || !self.piece_wanted(idx) {
                 continue;
             }
             let rarity = peer_haves.iter().filter(|h| h.is_set(idx)).count() as u32;
@@ -4905,6 +4986,91 @@ mod tests {
         let meta = engine.meta().unwrap();
         assert_eq!(meta.info.name, "magnet-test.bin");
         assert_eq!(meta.info_hash, info_hash);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 构造多文件 info 字典原始字节（测试用）：name=multi-test，
+    /// 每个文件 `<根>/f<i>.bin`，长度取 sizes。
+    fn make_multi_file_info_bytes(sizes: &[u64]) -> Vec<u8> {
+        let piece_length = 16_384u64;
+        let total: u64 = sizes.iter().sum();
+        let pieces_count = total.div_ceil(piece_length).max(1) as usize;
+        let files: Vec<Value> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| {
+                let mut fd = BTreeMap::new();
+                fd.insert(
+                    b"path".to_vec(),
+                    Value::List(vec![bytes(format!("f{i}.bin").as_bytes())]),
+                );
+                fd.insert(b"length".to_vec(), int(len as i64));
+                Value::Dict(fd)
+            })
+            .collect();
+        let mut d = BTreeMap::new();
+        d.insert(b"name".to_vec(), bytes(b"multi-test"));
+        d.insert(b"piece length".to_vec(), int(piece_length as i64));
+        d.insert(b"files".to_vec(), Value::List(files));
+        d.insert(b"pieces".to_vec(), bytes(vec![0u8; pieces_count * 20]));
+        encode(&Value::Dict(d))
+    }
+
+    #[test]
+    fn file_selection_limits_pieces_and_totals() {
+        use xfer_bencode::parse_info_bytes;
+
+        let dir = std::env::temp_dir().join(format!("xfer-sel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 3 文件 × 40_000，片长 16_384 → 8 片；片 2、5 为跨文件边界片
+        let info = make_multi_file_info_bytes(&[40_000, 40_000, 40_000]);
+        let meta = parse_info_bytes(&info).unwrap();
+        assert_eq!(meta.info.piece_count(), 8);
+
+        let cfg = TorrentConfig {
+            dir: dir.clone(),
+            selected_files: Some(vec![1]),
+            ..Default::default()
+        };
+        let engine = TorrentEngine::new(meta, cfg).unwrap();
+        // 总量收缩为所选文件，完成判定为假（所选片未下载）
+        assert_eq!(engine.progress().total, 40_000);
+        assert!(!engine.is_done());
+
+        // 模拟一个全量 seed：assign_piece 只应分配覆盖文件 1 的片
+        // 片布局：0-1→f0；2=f0+f1 边界；3→f1；4=f1+f2 边界；5-7→f2
+        let cell = engine
+            .register_peer("127.0.0.1:59001".parse().unwrap(), PeerSource::Dht);
+        {
+            let mut st = cell.state.lock().unwrap();
+            st.have.set_all();
+        }
+        let mut got = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let p = engine.assign_piece(&cell).expect("应能分配到所需片");
+            assert!((2..=4).contains(&p), "只应分配所选文件的片，实际 {p}");
+            assert!(got.insert(p), "片 {p} 不应重复分配");
+        }
+        // 3 个所需片全部分配完毕后无片可分
+        assert!(engine.assign_piece(&cell).is_none());
+        for p in &got {
+            engine.release_piece(&cell, *p);
+        }
+
+        // 热切换：改为选文件 0+2 → 分配范围随之变化，总量回升
+        engine.set_selected_files(Some(vec![0, 2]));
+        assert_eq!(engine.progress().total, 80_000);
+        // 可分配片 = 0,1,2,4,5,6,7（片 3 只属于文件 1，不分配）
+        let mut got2 = std::collections::HashSet::new();
+        for _ in 0..7 {
+            let p = engine.assign_piece(&cell).expect("应能分配到所需片");
+            assert_ne!(p, 3, "文件 1 独占片不应再分配");
+            assert!(got2.insert(p));
+        }
+        assert!(engine.assign_piece(&cell).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
