@@ -2,8 +2,8 @@ name: CI
 
 # 触发：push 到 main、PR、手动。
 # 每次 push 到 main 都会构建+测试；release 作业随后按代码版本号自动管理 Release（默认草稿，不直接发布）：
-# 无对应版本 → 自动创建草稿（说明拼装自 .github/RELEASE_EN.md 与 .github/RELEASE_ZH.md 双语说明文件）；
-# 版本未变 → 仅覆盖草稿产物、保留原说明。
+# 无对应版本 → 自动创建草稿；草稿已存在 → 每次构建覆盖产物并按最新双语模板
+# （.github/RELEASE_EN.md / .github/RELEASE_ZH.md）重新生成说明；已发布 → 不覆盖。
 # 确认无误后手动在 Releases 页发布。
 on:
   push:
@@ -164,12 +164,13 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # 发布：构建+测试全绿后，按代码版本号自动管理 Release（默认草稿，不直接发布）。
-  # - 无 v<版本> Release → 首次创建为草稿，说明由固定双语模板拼装：
-  #   .github/RELEASE_EN.md（英文）+ .github/RELEASE_ZH.md（中文），每次发布前
-  #   只需更新模板里各节内容；顶部切换锚点由 CI 统一添加，{{version}} 占位符
-  #   自动替换为实际版本号。
-  # - v<版本> 是草稿     → 仅覆盖草稿产物（--clobber），说明与草稿状态保持不变
+  # - 无 v<版本> Release → 首次创建为草稿
+  # - v<版本> 是草稿     → 每次构建覆盖产物，并按最新双语模板重新生成说明（一直覆盖，
+  #                        注意：GitHub 草稿页的手工说明编辑会被模板内容替换）
   # - v<版本> 已发布     → 不覆盖（跳过，保持已发布版本不动）
+  # 说明模板：.github/RELEASE_EN.md（英文，默认显示）+ .github/RELEASE_ZH.md（中文），
+  # 每次发布前更新模板内容即可；顶部总标题与双语切换锚点由 CI 统一添加，
+  # {{version}} 占位符自动替换为实际版本号。
   # 确认无误后，在 GitHub Releases 页手动点 "Publish release" 发布。
   # ---------------------------------------------------------------------------
   release:
@@ -188,7 +189,7 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
-      - name: "Create or update release draft (说明仅首次生成, 产物只覆盖草稿)"
+      - name: "Create or update release draft (产物与说明每次按模板覆盖)"
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -199,26 +200,21 @@ jobs:
           TAG="v${VERSION}"
           echo "当前代码版本: ${TAG}"
           ls -1 artifacts/*.tar.gz
-          if gh release view "$TAG" --json isDraft --jq .isDraft >/dev/null 2>&1; then
-            IS_DRAFT="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
-            if [ "$IS_DRAFT" = "true" ]; then
-              echo ">>> 草稿 ${TAG} 已存在 → 仅覆盖产物，保留原说明与草稿状态"
-              gh release upload "$TAG" artifacts/*.tar.gz --clobber
-            else
-              echo ">>> ${TAG} 已发布 → 不覆盖已发布版本，跳过产物更新"
-            fi
-          else
-            EN_FILE=".github/RELEASE_EN.md"
-            ZH_FILE=".github/RELEASE_ZH.md"
-            if [ ! -f "$EN_FILE" ] && [ ! -f "$ZH_FILE" ]; then
-              echo ">>> 未找到 RELEASE_EN/RELEASE_ZH 模板文件 → 回退 GitHub 自动生成"
-              gh release create "$TAG" artifacts/*.tar.gz \
-                --title "v${VERSION}" --draft --generate-notes
-              exit 0
-            fi
-            echo ">>> 无 ${TAG} Release → 首次创建为草稿（固定双语模板 + {{version}} 替换）"
-            # 固定模板中的 {{version}} 占位符替换为实际版本号；
-            # 正文最上方为总标题，双语切换锚点由工作流统一添加，模板文件里只写各语言正文
+
+          # 已发布版本不动（CI 只自动管理草稿）
+          IS_DRAFT="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [ "$IS_DRAFT" = "false" ]; then
+            echo ">>> ${TAG} 已发布 → 不覆盖已发布版本，跳过"
+            exit 0
+          fi
+
+          # 说明拼装：固定双语模板 + {{version}} 替换；
+          # 顶部总标题与双语切换锚点由 CI 统一添加，模板文件里只写各语言正文
+          EN_FILE=".github/RELEASE_EN.md"
+          ZH_FILE=".github/RELEASE_ZH.md"
+          BODY_FILE=""
+          if [ -f "$EN_FILE" ] || [ -f "$ZH_FILE" ]; then
+            BODY_FILE="release_body.md"
             {
               echo "# XferRust v${VERSION} 发布说明"
               echo ""
@@ -233,7 +229,22 @@ jobs:
               echo '**[English](#english)** | 简体中文'
               echo ""
               sed -e "s/{{version}}/v${VERSION}/g" "$ZH_FILE" 2>/dev/null || true
-            } > release_body.md
-            gh release create "$TAG" artifacts/*.tar.gz \
-              --title "v${VERSION}" --draft --notes-file release_body.md
+            } > "$BODY_FILE"
+          else
+            echo ">>> 未找到 RELEASE_EN/RELEASE_ZH 模板文件，说明不做更新"
+          fi
+
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo ">>> 草稿 ${TAG} 已存在 → 覆盖产物，说明按最新模板重新生成（一直覆盖）"
+            gh release upload "$TAG" artifacts/*.tar.gz --clobber
+            [ -z "$BODY_FILE" ] || gh release edit "$TAG" --title "v${VERSION}" --notes-file "$BODY_FILE"
+          else
+            echo ">>> 无 ${TAG} Release → 首次创建为草稿"
+            if [ -n "$BODY_FILE" ]; then
+              gh release create "$TAG" artifacts/*.tar.gz \
+                --title "v${VERSION}" --draft --notes-file "$BODY_FILE"
+            else
+              gh release create "$TAG" artifacts/*.tar.gz \
+                --title "v${VERSION}" --draft --generate-notes
+            fi
           fi
