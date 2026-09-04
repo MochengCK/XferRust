@@ -1662,9 +1662,23 @@ impl TaskManager {
             return Err("至少选择一个文件".into());
         }
         *task.selected_files.lock().unwrap() = Some(sel.clone());
-        // 运行中引擎热生效；暂停任务由下次启动的 TorrentConfig 带上
+        // 选择完成：解除磁力解析流程的等待标记。该标记只在"元数据就绪
+        // 但用户尚未勾选"期间应保持置位；若不清除，下次运行的 1Hz
+        // ticker 会再次触发"等待文件选择"自动暂停——任务开始后数秒即
+        // 暂停、永远无法进入下载（速度恒为 0）。
+        task.awaiting_selection.store(false, Ordering::SeqCst);
+        // 运行中引擎热生效——但仅当引擎已打开所选文件的句柄时。
+        // 磁力等待勾选阶段的占位引擎（空选择启动）没有文件句柄，直接
+        // 热切换会造成"片标记完成但数据未落盘"的静默损坏；此时按暂停
+        // 语义重启引擎，下次启动带真实选择打开句柄。
         if let Some(engine) = self.bt_engines.lock().unwrap().get(gid) {
-            engine.set_selected_files(Some(sel.clone()));
+            if engine.store_files_cover(&sel) {
+                engine.set_selected_files(Some(sel.clone()));
+            } else {
+                tracing::info!(gid = %gid, "存储未覆盖新选择，暂停任务待重启生效");
+                *task.intent.lock().unwrap() = Intent::Pause;
+                task.cancel.read().unwrap().cancel();
+            }
         }
         tracing::info!(gid = %gid, files = sel.len(), "已设置文件选择");
         self.save_session_now();
@@ -2494,6 +2508,13 @@ async fn drive_bt_download(
     let (max_peers, adaptive) = _mgr.bt_options(task);
     let (dl_limit, ul_limit) = _mgr.rate_limits();
     let (encryption, bt_protocol) = _mgr.bt_modes(task);
+    // 磁力解析流程：用户尚未勾选时以"空选择"占位启动——仅获取元数据，
+    // 不创建任何数据文件/目录，也不请求任何片；勾选完成后的下次启动
+    // 才带真实选择（只创建被选中文件的目录）
+    let mut selected_files = task.selected_files.lock().unwrap().clone();
+    if selected_files.is_none() && task.awaiting_selection.load(Ordering::SeqCst) {
+        selected_files = Some(Vec::new());
+    }
     let cfg = TorrentConfig {
         dir: task.dir.clone(),
         peer_id: PeerId::azureus_prefix(&rand12),
@@ -2512,8 +2533,8 @@ async fn drive_bt_download(
         upload_limit: ul_limit,
         seed_mode: false,
         seed_duration: 0,
-        // 磁力解析后用户勾选的文件（None = 全部）
-        selected_files: task.selected_files.lock().unwrap().clone(),
+        // 磁力解析后用户勾选的文件（None = 全部；等待勾选时为 Some(空) 占位）
+        selected_files,
     };
     let engine = match (&meta, magnet_ih) {
         (Some(m), _) => TorrentEngine::new((**m).clone(), cfg).map_err(TaskFailure::Bt)?,

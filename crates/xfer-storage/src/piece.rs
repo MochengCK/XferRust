@@ -216,11 +216,18 @@ impl PieceLayout {
     }
 }
 
-/// piece 存储：打开全部文件句柄，支持随机读写。
+/// piece 存储：按需打开文件句柄，支持随机读写。
+///
+/// `wanted` 语义（[`Self::open`] 的 `wanted` 参数）：
+/// - `None` = 全部文件：所有目录与文件立即创建（全量下载）；
+/// - `Some(索引)` = 仅创建所选文件的目录与句柄，未选文件不落盘——
+///   跨选/未选边界的片在写入时跳过未选文件一侧（校验仍针对完整片
+///   数据，完整性不受影响）；
+/// - `Some(空)` = 什么都不创建（磁力解析流程等待用户勾选的占位）。
 pub struct PieceStore {
     root: PathBuf,
     layout: PieceLayout,
-    files: Vec<OpenFile>,
+    files: Vec<Option<OpenFile>>,
     map: PieceMap,
 }
 
@@ -235,23 +242,48 @@ impl PieceStore {
     /// - 单文件种子：`root/name`；
     /// - 多文件种子：`root/name/…`（按 path 分段建目录）。
     ///
-    /// 已有文件不截断（支持续传保留已落盘数据）。
-    pub fn open(root: &Path, name: &str, layout: PieceLayout) -> std::io::Result<Self> {
+    /// `wanted`：`None` 创建全部文件；`Some(索引)` 只创建所选文件的
+    /// 目录与句柄（未选文件不落盘）；`Some(空)` 连种子根目录都不建
+    /// （磁力等待勾选阶段）。已有文件不截断（支持续传保留已落盘数据）。
+    pub fn open(
+        root: &Path,
+        name: &str,
+        layout: PieceLayout,
+        wanted: Option<&[usize]>,
+    ) -> std::io::Result<Self> {
+        let wanted_set: Option<std::collections::HashSet<usize>> =
+            wanted.map(|w| w.iter().copied().collect());
+        let create_all = wanted_set.is_none();
+        let any_wanted = create_all
+            || wanted_set
+                .as_ref()
+                .is_some_and(|s| !s.is_empty());
         let single = layout.files.len() == 1 && layout.files[0].path.len() == 1;
         let base = if single {
             root.join(name)
         } else {
             let d = root.join(name);
-            std::fs::create_dir_all(&d)?;
+            if any_wanted {
+                std::fs::create_dir_all(&d)?;
+            }
             d
         };
         let mut files = Vec::with_capacity(layout.files.len());
-        for f in &layout.files {
+        for (fi, f) in layout.files.iter().enumerate() {
             let path = if single {
                 base.clone()
             } else {
                 base.join(f.path.iter().collect::<PathBuf>())
             };
+            let is_wanted = create_all
+                || wanted_set
+                    .as_ref()
+                    .is_some_and(|s| s.contains(&fi));
+            if !is_wanted {
+                // 未选文件：不创建目录、不打开句柄（写入/读取按缺席处理）
+                files.push(None);
+                continue;
+            }
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -261,10 +293,10 @@ impl PieceStore {
                 .write(true)
                 .truncate(false)
                 .open(&path)?;
-            files.push(OpenFile {
+            files.push(Some(OpenFile {
                 file,
                 path: path.clone(),
-            });
+            }));
         }
         let count = layout.piece_count();
         Ok(Self {
@@ -350,23 +382,33 @@ impl PieceStore {
     }
 
     /// 无条件写入一片（测试/seed 场景）。
+    ///
+    /// 未选文件一侧的分段被跳过（句柄缺席即不落盘、不创建文件）；
+    /// 片校验在调用方针对完整片数据完成，跳过不影响完整性判定。
     pub fn write_piece(&mut self, index: u32, data: &[u8]) -> std::io::Result<()> {
         let segs = self.layout.piece_segments(index);
         let mut written = 0usize;
         for (fi, off, len) in segs {
-            let f = &mut self.files[fi];
-            f.file.seek(SeekFrom::Start(off))?;
-            f.file.write_all(&data[written..written + len as usize])?;
+            let seg = &data[written..written + len as usize];
             written += len as usize;
+            if let Some(f) = self.files[fi].as_mut() {
+                f.file.seek(SeekFrom::Start(off))?;
+                f.file.write_all(seg)?;
+            }
         }
         Ok(())
     }
 
     /// 读取一片（跨文件拼接）。
+    ///
+    /// 未选文件一侧的分段按缺席跳过：返回的数据短于片长（仅 seed
+    /// 场景可能触及，调用方按短读容忍处理）。
     pub fn read_piece(&mut self, index: u32) -> std::io::Result<Vec<u8>> {
         let mut out = Vec::new();
         for (fi, off, len) in self.layout.piece_segments(index) {
-            let f = &mut self.files[fi];
+            let Some(f) = self.files[fi].as_mut() else {
+                continue;
+            };
             f.file.seek(SeekFrom::Start(off))?;
             // 直接读进出缓冲，避免每段一次临时缓冲拷贝
             let pos = out.len();
@@ -386,16 +428,20 @@ impl PieceStore {
         let block_end = block_start + length as u64;
 
         let mut out = Vec::with_capacity(length as usize);
-        for (fi, f) in self.layout.files.iter().enumerate() {
-            let f_start = f.offset;
-            let f_end = f.offset + f.length;
+        for (fi, f_layout) in self.layout.files.iter().enumerate() {
+            let f_start = f_layout.offset;
+            let f_end = f_layout.offset + f_layout.length;
             if block_end <= f_start || block_start >= f_end {
                 continue;
             }
             let seg_start = block_start.max(f_start) - f_start;
             let seg_end = block_end.min(f_end) - f_start;
             let seg_len = (seg_end - seg_start) as usize;
-            let file = &mut self.files[fi].file;
+            // 未选文件一侧按缺席跳过（返回短块，对端容忍截断）
+            let Some(file) = self.files[fi].as_mut() else {
+                continue;
+            };
+            let file = &mut file.file;
             file.seek(SeekFrom::Start(seg_start))?;
             // 直接读进出缓冲（上传热路径：每供一块省一次 16KiB 拷贝）
             let pos = out.len();
@@ -411,18 +457,32 @@ impl PieceStore {
         self.map.to_bitfield()
     }
 
-    /// 刷盘全部文件。
+    /// 刷盘全部已打开文件。
     pub fn flush_all(&mut self) -> std::io::Result<()> {
-        for f in &mut self.files {
+        for f in self.files.iter_mut().flatten() {
             f.file.flush()?;
             f.file.sync_all()?;
         }
         Ok(())
     }
 
-    /// 各文件路径（调试/展示用）。
+    /// 已打开文件的路径（调试/展示用；未创建的文件不在列）。
     pub fn file_paths(&self) -> Vec<PathBuf> {
-        self.files.iter().map(|f| f.path.clone()).collect()
+        self.files
+            .iter()
+            .flatten()
+            .map(|f| f.path.clone())
+            .collect()
+    }
+
+    /// 已打开句柄的文件索引（升序；未创建的文件不在列）。
+    pub fn opened_indices(&self) -> Vec<usize> {
+        self.files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.is_some())
+            .map(|(i, _)| i)
+            .collect()
     }
 }
 
@@ -529,7 +589,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xfer-piece-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let mut store = PieceStore::open(&dir, "dl", layout3()).unwrap();
+        let mut store = PieceStore::open(&dir, "dl", layout3(), None).unwrap();
         // 片 1 跨 a.bin(尾 5) 与 b.bin(头 5)
         let piece1: Vec<u8> = (0..10).map(|i| i as u8).collect();
         store.write_piece(1, &piece1).unwrap();
@@ -556,7 +616,7 @@ mod tests {
     fn accept_piece_verifies_hash() {
         let dir = std::env::temp_dir().join(format!("xfer-piece2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let mut store = PieceStore::open(&dir, "dl", layout3()).unwrap();
+        let mut store = PieceStore::open(&dir, "dl", layout3(), None).unwrap();
 
         let data: Vec<u8> = (0..10).map(|i| i as u8).collect();
         let good = {
@@ -575,6 +635,41 @@ mod tests {
         assert!(!store.have_piece(1));
         assert_eq!(store.done_bytes(), 10);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_respects_wanted_files() {
+        let dir = std::env::temp_dir().join(format!("xfer-piece-sel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 空选择（等待勾选占位）：什么都不创建
+        PieceStore::open(&dir, "dl", layout3(), Some(&[])).unwrap();
+        assert!(!dir.join("dl").exists());
+
+        // 只选文件 1（b.bin）：根目录与 b.bin 存在，a/c 不存在
+        let mut store = PieceStore::open(&dir, "dl", layout3(), Some(&[1])).unwrap();
+        assert!(dir.join("dl").join("b.bin").exists());
+        assert!(!dir.join("dl").join("a.bin").exists());
+        assert!(!dir.join("dl").join("c.bin").exists());
+        assert_eq!(store.file_paths(), vec![dir.join("dl").join("b.bin")]);
+
+        // 边界片 1 跨 a/b：写入只落 b 侧，a 仍不创建
+        let piece1: Vec<u8> = (0..10).map(|i| i as u8).collect();
+        store.write_piece(1, &piece1).unwrap();
+        assert!(!dir.join("dl").join("a.bin").exists());
+        let b = std::fs::read(dir.join("dl").join("b.bin")).unwrap();
+        assert_eq!(&b[..5], &piece1[5..]);
+
+        // None = 全量：三个文件都创建
+        drop(store);
+        let dir2 = std::env::temp_dir().join(format!("xfer-piece-sel2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir2);
+        PieceStore::open(&dir2, "dl", layout3(), None).unwrap();
+        assert!(dir2.join("dl").join("a.bin").exists());
+        assert!(dir2.join("dl").join("b.bin").exists());
+        assert!(dir2.join("dl").join("c.bin").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]

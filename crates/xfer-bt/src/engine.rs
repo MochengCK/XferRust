@@ -831,8 +831,15 @@ impl TorrentEngine {
             .collect();
         let layout = PieceLayout::new(meta.info.piece_length, files);
         let total_bytes = layout.total_length();
-        let mut store = PieceStore::open(&config.dir, &meta.info.name, layout)
-            .map_err(|e| format!("打开 piece 存储失败: {e}"))?;
+        // 按文件选择建库：None 全量；Some(索引) 只建所选文件；
+        // Some(空) = 磁力等待勾选占位，不创建任何数据文件
+        let mut store = PieceStore::open(
+            &config.dir,
+            &meta.info.name,
+            layout,
+            config.selected_files.as_deref(),
+        )
+        .map_err(|e| format!("打开 piece 存储失败: {e}"))?;
 
         // 续传：优先从续传控制文件恢复已校验片位图（暂停/重启续传）；
         // 无控制文件但文件已全部完整（手动拷贝/旧任务）→ 按长度全部标记完成。
@@ -992,8 +999,13 @@ impl TorrentEngine {
             .collect();
         let layout = PieceLayout::new(meta.info.piece_length, files);
         let total_bytes = layout.total_length();
-        let mut store = PieceStore::open(&self.config.dir, &meta.info.name, layout)
-            .map_err(|e| format!("打开 piece 存储失败: {e}"))?;
+        // 按文件选择建库（与 TorrentEngine::new 同语义）：
+        // 磁力等待勾选期间 selected_files=Some(空) → 不创建任何数据文件，
+        // 目录与文件等用户勾选完成、下次启动带真实选择时才创建
+        let wanted_files = self.selected_files.lock().unwrap().clone();
+        let mut store =
+            PieceStore::open(&self.config.dir, &meta.info.name, layout, wanted_files.as_deref())
+                .map_err(|e| format!("打开 piece 存储失败: {e}"))?;
 
         // 续传：优先从续传控制文件恢复已校验片位图；
         // 无控制文件但文件已全部完整 → 按长度全部标记完成。
@@ -1087,7 +1099,14 @@ impl TorrentEngine {
         let wanted = self.wanted.lock().unwrap();
         match wanted.as_ref() {
             None => store.map().all_done(),
-            Some(m) => (0..m.count()).all(|i| !m.is_set(i) || store.map().is_set(i)),
+            Some(m) => {
+                // 空所需片集合（磁力等待勾选的占位选择）≠ 下载完成：
+                // 否则任务一启动就被判完成、以 0 字节收尾
+                if m.done_count() == 0 {
+                    return false;
+                }
+                (0..m.count()).all(|i| !m.is_set(i) || store.map().is_set(i))
+            }
         }
     }
 
@@ -1098,6 +1117,25 @@ impl TorrentEngine {
     pub fn set_selected_files(&self, files: Option<Vec<usize>>) {
         *self.selected_files.lock().unwrap() = files;
         self.apply_selection();
+    }
+
+    /// 存储句柄是否覆盖给定文件选择（热切换可行性检查）。
+    ///
+    /// 引擎按创建时的选择打开文件句柄（磁力等待勾选阶段为占位空选择，
+    /// 未打开任何句柄）。若运行时切换到创建时未打开的文件，写入会静默
+    /// 跳过 → 片被标记完成但数据未落盘。调用方必须先经此检查，
+    /// 未覆盖时走"暂停→重启引擎"路径（下次启动带真实选择打开句柄）。
+    pub fn store_files_cover(&self, sel: &[usize]) -> bool {
+        let guard = self.store.lock().unwrap();
+        let Some(store) = guard.as_ref() else {
+            return false;
+        };
+        let opened = store.opened_indices();
+        if opened.len() == store.layout().files.len() {
+            return true; // 全量打开（创建时无选择）
+        }
+        let set: std::collections::HashSet<usize> = opened.into_iter().collect();
+        sel.iter().all(|i| set.contains(i))
     }
 
     /// 启动监听（端口 0 = 系统自动分配，避免多任务冲突）。

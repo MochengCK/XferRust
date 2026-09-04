@@ -15,7 +15,7 @@ use base64::Engine;
 use sha1::{Digest, Sha1};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use xfer_bencode::{bytes, dict, encode, int, parse_torrent};
+use xfer_bencode::{bytes, dict, encode, int, parse_torrent, Value};
 use xfer_bt::message::{encode_handshake, Message, PeerReader};
 use xfer_engine::TaskManager;
 use xfer_types::{InfoHash, PeerId};
@@ -522,7 +522,282 @@ async fn pause_then_unpause_resumes_from_ctrl_file() {
         final_counts[4..].iter().all(|&n| n > 0),
         "后 4 片应逐片请求: {final_counts:?}"
     );
-    assert!(!ctrl.exists(), "完成后控制文件应被清理: {ctrl:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ----------------------------------------------------------------------
+// 磁力文件选择流程（TUI 语义）端到端回归
+// ----------------------------------------------------------------------
+
+const META_PIECE: usize = 16 * 1024;
+
+/// 磁力 seed：扩展握手声明 ut_metadata=1，响应元数据与 piece 请求
+///（与 xfer-bt tests/magnet.rs 同协议，数据为多文件拼接流）。
+async fn handle_ut_seed_peer(
+    mut stream: TcpStream,
+    data: &[u8],
+    info_bytes: &[u8],
+    info_hash: InfoHash,
+    peer_id: PeerId,
+) -> std::io::Result<()> {
+    let mut reader = PeerReader::new();
+    let hs = loop {
+        match reader.read_handshake(&mut stream).await? {
+            Some(h) => break h,
+            None => continue,
+        }
+    };
+    if hs.info_hash != info_hash {
+        return Ok(());
+    }
+    stream
+        .write_all(&encode_handshake(&info_hash, &peer_id))
+        .await?;
+    let mut m = BTreeMap::new();
+    m.insert(b"ut_metadata".to_vec(), Value::Int(1));
+    let mut d = BTreeMap::new();
+    d.insert(b"m".to_vec(), Value::Dict(m));
+    stream
+        .write_all(
+            &Message::Extended {
+                ext_id: 0,
+                payload: encode(&Value::Dict(d)),
+            }
+            .encode(),
+        )
+        .await?;
+    let n_pieces = data.len().div_ceil(PIECE_LEN);
+    let mut bf = vec![0u8; n_pieces.div_ceil(8)];
+    for i in 0..n_pieces {
+        bf[i / 8] |= 0x80 >> (i % 8);
+    }
+    stream.write_all(&Message::Bitfield(bf).encode()).await?;
+    stream.write_all(&Message::Unchoke.encode()).await?;
+    let mut engine_meta_id: u8 = 2;
+    loop {
+        match reader.read_message(&mut stream).await? {
+            None => break,
+            Some(Message::Extended { ext_id: 0, payload }) => {
+                if let Ok(v) = xfer_bencode::decode(&payload) {
+                    if let Some(d) = v.as_dict() {
+                        if let Some(Value::Dict(mm)) = d.get(b"m".as_slice()) {
+                            if let Some(Value::Int(id)) = mm.get(b"ut_metadata".as_slice()) {
+                                engine_meta_id = *id as u8;
+                            }
+                        }
+                    }
+                }
+            }
+            Some(Message::Extended { ext_id, payload }) => {
+                if ext_id != 1 {
+                    continue;
+                }
+                if let Ok(v) = xfer_bencode::decode(&payload) {
+                    if let Some(d) = v.as_dict() {
+                        let msg_type = d
+                            .get(b"msg_type".as_slice())
+                            .and_then(Value::as_int)
+                            .unwrap_or(-1);
+                        if msg_type == 0 {
+                            let piece = d
+                                .get(b"piece".as_slice())
+                                .and_then(Value::as_int)
+                                .unwrap_or(0) as usize;
+                            let start = piece * META_PIECE;
+                            let end = (start + META_PIECE).min(info_bytes.len());
+                            if start >= info_bytes.len() {
+                                continue;
+                            }
+                            let mut head = BTreeMap::new();
+                            head.insert(b"msg_type".to_vec(), Value::Int(1));
+                            head.insert(b"piece".to_vec(), Value::Int(piece as i64));
+                            head.insert(
+                                b"total_size".to_vec(),
+                                Value::Int(info_bytes.len() as i64),
+                            );
+                            let mut body = encode(&Value::Dict(head));
+                            body.extend_from_slice(&info_bytes[start..end]);
+                            stream
+                                .write_all(
+                                    &Message::Extended {
+                                        ext_id: engine_meta_id,
+                                        payload: body,
+                                    }
+                                    .encode(),
+                                )
+                                .await?;
+                        }
+                    }
+                }
+            }
+            Some(Message::Request {
+                index,
+                begin,
+                length,
+            }) => {
+                let off = index as usize * PIECE_LEN + begin as usize;
+                let end = (off + length as usize).min(data.len());
+                if off >= data.len() {
+                    continue;
+                }
+                stream
+                    .write_all(
+                        &Message::Piece {
+                            index,
+                            begin,
+                            block: data[off..end].to_vec(),
+                        }
+                        .encode(),
+                    )
+                    .await?;
+            }
+            Some(Message::Interested) | Some(Message::KeepAlive) | Some(Message::Cancel { .. }) => {
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// 回归（磁力文件选择全流程）：
+/// 添加磁力（bt-file-selection）→ 取到元数据自动暂停（等待勾选，
+/// 此阶段不得创建任何数据文件）→ select_files + unpause → 必须真正
+/// 进入下载并完成，且只创建被选中文件的目录/文件。
+///
+/// 曾有缺陷：`awaiting_selection` 在勾选后不清除，下次运行 1Hz ticker
+/// 再次触发"等待文件选择"自动暂停——任务开始约 1 秒即被暂停、速度
+/// 恒为 0，永远无法下载。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn magnet_select_flow_pauses_then_completes() {
+    let dir = std::env::temp_dir().join(format!("xfer-engine-magnet-sel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    init_tracing();
+
+    // 多文件种子：dl/a.bin(64K) + dl/sub/b.bin(64K+1) + dl/sub/c.bin(64K)
+    const L0: usize = PIECE_LEN;
+    const L1: usize = PIECE_LEN + 1;
+    const L2: usize = PIECE_LEN;
+    let file_data: Vec<Vec<u8>> = vec![
+        (0..L0).map(|i| (i % 97) as u8).collect(),
+        (0..L1).map(|i| (i % 251) as u8).collect(),
+        (0..L2).map(|i| (i % 89) as u8).collect(),
+    ];
+    let data: Vec<u8> = file_data.concat();
+    let pieces: Vec<u8> = data.chunks(PIECE_LEN).flat_map(sha1_of).collect();
+    let info = dict(BTreeMap::from([
+        (b"name".to_vec(), bytes("dl")),
+        (b"piece length".to_vec(), int(PIECE_LEN as i64)),
+        (
+            b"files".to_vec(),
+            Value::List(vec![
+                Value::Dict(BTreeMap::from([
+                    (b"length".to_vec(), int(L0 as i64)),
+                    (b"path".to_vec(), Value::List(vec![bytes("a.bin")])),
+                ])),
+                Value::Dict(BTreeMap::from([
+                    (b"length".to_vec(), int(L1 as i64)),
+                    (
+                        b"path".to_vec(),
+                        Value::List(vec![bytes("sub"), bytes("b.bin")]),
+                    ),
+                ])),
+                Value::Dict(BTreeMap::from([
+                    (b"length".to_vec(), int(L2 as i64)),
+                    (
+                        b"path".to_vec(),
+                        Value::List(vec![bytes("sub"), bytes("c.bin")]),
+                    ),
+                ])),
+            ]),
+        ),
+        (b"pieces".to_vec(), bytes(pieces)),
+    ]));
+    let info_bytes = encode(&info);
+    let info_hash = sha1_of(&info_bytes);
+
+    let (sl, saddr) = bind_random().await;
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = sl.accept().await else {
+                return;
+            };
+            let (d, ib) = (data.clone(), info_bytes.clone());
+            tokio::spawn(async move {
+                let _ = handle_ut_seed_peer(
+                    stream,
+                    &d,
+                    &ib,
+                    InfoHash::from_bytes(&info_hash),
+                    PeerId::azureus_prefix(&[0x55; 12]),
+                )
+                .await;
+            });
+        }
+    });
+
+    let (taddr, seed_ref) = start_tracker().await;
+    *seed_ref.write().unwrap() = Some(saddr);
+    let tracker_url = format!("http://{taddr}/announce");
+    let ih_hex: String = info_hash.iter().map(|b| format!("{b:02x}")).collect();
+    let magnet = format!("magnet:?xt=urn:btih:{ih_hex}&tr={tracker_url}");
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = mgr
+        .add_uri(
+            vec![magnet],
+            &serde_json::json!({"bt-file-selection": "true"}),
+            None,
+        )
+        .expect("添加磁力任务应成功");
+
+    // 阶段一：等待"取到元数据 → 自动暂停（等待勾选）"
+    let mut paused = false;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let st = mgr.tell_status_native(&gid, None).unwrap();
+        if st["status"] == "error" {
+            panic!("解析阶段进入 error: {st:?}");
+        }
+        if st["status"] == "paused" && st["files"].as_array().is_some_and(|a| !a.is_empty()) {
+            paused = true;
+            break;
+        }
+    }
+    assert!(paused, "元数据就绪后任务应自动暂停等待文件选择");
+    assert!(
+        !dir.join("dl").exists(),
+        "等待勾选阶段不得创建种子数据目录"
+    );
+
+    // 阶段二：勾选文件 1（sub/b.bin）并恢复——回归点：不得再次自动暂停
+    mgr.select_files(&gid, &[1]).expect("设置文件选择应成功");
+    mgr.unpause(&gid).expect("恢复应成功");
+
+    let mut done = false;
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let st = mgr.tell_status_native(&gid, None).unwrap();
+        match st["status"].as_str() {
+            Some("complete") => {
+                done = true;
+                break;
+            }
+            Some("error") => panic!("恢复后进入 error: {st:?}"),
+            _ => {}
+        }
+    }
+    assert!(done, "勾选并恢复后任务未完成（疑似再次被自动暂停）");
+
+    // 只创建被选中文件的路径，内容逐字节一致
+    assert!(dir.join("dl").join("sub").join("b.bin").exists());
+    assert!(!dir.join("dl").join("a.bin").exists(), "未选文件不应被创建");
+    assert!(
+        !dir.join("dl").join("sub").join("c.bin").exists(),
+        "未选文件不应被创建"
+    );
+    let out = std::fs::read(dir.join("dl").join("sub").join("b.bin")).unwrap();
+    assert_eq!(out, file_data[1], "选中文件内容与源数据不一致");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

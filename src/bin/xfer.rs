@@ -582,9 +582,10 @@ fn ui_card_focused() -> ratatui::widgets::Block<'static> {
         .border_style(ratatui::style::Style::new().fg(ratatui::style::Color::Yellow))
 }
 
-/// 主区边框：直角、无标题，右侧上下连成圆角。
-/// 上下横线横跨整个任务区（左端缩 1 列与 logo 位置对齐），右端以 ╮/╯
-/// 与右竖线连成圆角；左竖线在侧栏与内容区之间（side_x）。
+/// 主区边框：无标题，左右两侧上下均连成圆角，把侧栏与任务表格包裹在内。
+/// 上下横线左端以 ╭/╰、右端以 ╮/╯ 与竖线连成圆角（左右各缩 1 列，
+/// 与 logo/顶栏对齐）；左竖线贴左缘，侧栏分隔竖线在 side_x，
+/// 右竖线贴右缘缩 1 列。
 fn draw_main_borders(f: &mut ratatui::Frame, area: ratatui::layout::Rect, side_x: u16) {
     use ratatui::style::Style;
     use ratatui::text::{Line, Span};
@@ -594,12 +595,11 @@ fn draw_main_borders(f: &mut ratatui::Frame, area: ratatui::layout::Rect, side_x
         return;
     }
     let style = Style::new().fg(ratatui::style::Color::DarkGray);
-    // 上下横线：左端缩 1 列与 logo 对齐，右端圆角（╮/╯）与右竖线相连，
-    // 右缘整体缩 1 列（与左端对称）
-    let h_len = area.width.saturating_sub(3) as usize; // 圆角字符前的 ─ 数量
+    // 上下横线：左右两端均为圆角（╭╮/╰╯），左端与 logo 对齐、右端缩 1 列
+    let h_len = area.width.saturating_sub(4) as usize; // 两侧圆角之间的 ─ 数量
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!("{}╮", "─".repeat(h_len)),
+            format!("╭{}╮", "─".repeat(h_len)),
             style,
         ))),
         ratatui::layout::Rect {
@@ -611,7 +611,7 @@ fn draw_main_borders(f: &mut ratatui::Frame, area: ratatui::layout::Rect, side_x
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            format!("{}╯", "─".repeat(h_len)),
+            format!("╰{}╯", "─".repeat(h_len)),
             style,
         ))),
         ratatui::layout::Rect {
@@ -621,13 +621,19 @@ fn draw_main_borders(f: &mut ratatui::Frame, area: ratatui::layout::Rect, side_x
             height: 1,
         },
     );
-    // 左竖线（与横线相接）+ 右竖线（缩进 1 列，上下连入圆角）
+    // 左竖线（连入圆角）+ 侧栏分隔竖线 + 右竖线（连入圆角）
     let v_len = area.height.saturating_sub(2) as usize;
     let vline: Vec<Line> = (0..v_len)
         .map(|_| Line::from(Span::styled("│", style)))
         .collect();
+    let left_x = area.x + 1;
     let right_x = area.right().saturating_sub(2);
-    for x in [side_x.min(right_x), right_x] {
+    let mut xs = vec![left_x];
+    if side_x > left_x && side_x < right_x {
+        xs.push(side_x);
+    }
+    xs.push(right_x);
+    for x in xs {
         f.render_widget(
             Paragraph::new(vline.clone()),
             ratatui::layout::Rect {
@@ -3167,7 +3173,7 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
 
     draw_top_bar(f, app, rows[0]);
 
-    // 任务区域：左侧无边框分类栏 + 右侧直角任务卡片（四角留缺口）
+    // 任务区域：左侧分类栏 + 右侧任务卡片（外框左右均为圆角，侧栏包裹在内）
     // 侧栏宽度随语言自适应（英文分类名更长）
     let sidebar_w: u16 = if lang() == Lang::En { 22 } else { 16 };
     let cols = Layout::horizontal([
@@ -3176,36 +3182,70 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
     ])
     .split(rows[1]);
 
-    // 侧边栏：分类（选中项默认背景高亮、焦点态反色，不用指针）
+    // 侧边栏：分类（每行整条背景，选中项加亮、焦点态反色，不用指针）。
+    // 背景条与左右竖线各留 1 格间距（对称）；文字再右移 1 格与竖线拉开。
     let inner_w = (sidebar_w as usize).saturating_sub(2); // 左右各 1 列内边距
+    let bar_bg = Color::Rgb(38, 38, 38); // 未选中项整行背景条
     let mut cat_items = vec![Line::from("")];
-    for c in CATEGORIES.iter() {
+    let mut bar_rows: Vec<(u16, Color)> = Vec::new(); // (分类行 y, 背景色)
+    for (i, c) in CATEGORIES.iter().enumerate() {
         let count = app.tasks.iter().filter(|t| c.matches(t)).count();
         let active = *c == app.category;
         let count_s = format!("({count})");
         let pad = inner_w
-            .saturating_sub(1 + disp_w(c.label().as_str()) + disp_w(&count_s))
+            .saturating_sub(2 + disp_w(c.label().as_str()) + disp_w(&count_s))
             .max(1);
-        let text = format!(" {}{}{}", c.label(), " ".repeat(pad), count_s);
-        let style = if active {
+        let bg = if active {
             if app.sidebar_focus {
-                Style::new().fg(Color::Black).bg(Color::Cyan)
+                Color::Cyan
             } else {
                 // 默认选中项：背景高亮
-                Style::new().bg(Color::DarkGray)
+                Color::DarkGray
             }
         } else {
-            dim
+            bar_bg
         };
-        cat_items.push(Line::from(Span::styled(text, style)));
+        let style = if active && app.sidebar_focus {
+            Style::new().fg(Color::Black).bg(bg)
+        } else {
+            dim.bg(bg)
+        };
+        // 首格（x=1）留在背景条外：与左竖线留 1 格间距，和右侧对称
+        cat_items.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(format!(" {}{}{}", c.label(), " ".repeat(pad), count_s), style),
+        ]));
+        bar_rows.push((rows[1].y + 1 + i as u16, bg));
     }
     let sidebar =
         List::new(cat_items).block(Block::default().padding(Padding::horizontal(1)));
     f.render_widget(sidebar, cols[0]);
 
-    // 任务列表（按当前分类过滤）：直角边框（横线横跨全宽、四角留缺口）+ 列对齐表格
+    // 任务列表（按当前分类过滤）：圆角边框（横线横跨全宽、左右均圆角）+ 列对齐表格
     let shown = filtered_indices(app);
     draw_main_borders(f, rows[1], cols[1].x);
+    // 背景条补全：CJK 宽字符的续格会被 ratatui reset 掉背景（条裂成数段），
+    // 逐格 set_bg 补齐（只改背景、保留字符与前景色）。
+    // 条范围 x=2..=sidebar_w-2：与左右竖线各留 1 格，不触碰边框。
+    let bar_last = rows[1].bottom().saturating_sub(1); // 底边框行不含
+    let bar_x0 = cols[0].x + 2;
+    let bar_x1 = cols[0].x + sidebar_w - 2;
+    for (y, bg) in &bar_rows {
+        if *y >= bar_last {
+            break;
+        }
+        #[allow(unused_imports)]
+        use std::io::Write as _;
+        eprintln!(
+            "[dbg] fill y={y} x={}..={}",
+            bar_x0, bar_x1
+        );
+        for x in bar_x0..=bar_x1 {
+            if let Some(cell) = f.buffer_mut().cell_mut((x, *y)) {
+                cell.set_bg(*bg);
+            }
+        }
+    }
     let content_block = Block::default().padding(Padding::new(2, 2, 1, 1));
     if shown.is_empty() {
         // 空状态：文字在任务框内垂直 + 水平居中
@@ -4943,7 +4983,7 @@ mod tests {
         }
         // 选中分类默认有背景高亮，不再用 ▸ 指针
         // （侧栏区 x<16 内找 DarkGray 背景块；任务表的高亮行在 x>=18，不会混入）
-        let hl_cells: Vec<(u16, u16)> = (1..16)
+        let hl_cells: Vec<(u16, u16)> = (2..15)
             .flat_map(|x| (1..17).map(move |y| (x, y)))
             .filter(|&(x, y)| buf[(x, y)].bg == ratatui::style::Color::DarkGray)
             .collect();
@@ -4951,11 +4991,54 @@ mod tests {
             !hl_cells.is_empty(),
             "默认选中分类应有背景高亮:\n{text}"
         );
-        // 背景块应从侧栏内容左缘（x=1）开始，且所在行是「完成」分类
+        // 所在行应是选中的「完成」分类
         let hl_y = hl_cells[0].1;
-        assert!(
-            hl_cells.iter().any(|&(x, _)| x == 1),
-            "选中分类背景应从内容左缘开始:\n{text}"
+        // 选中条应连续覆盖 x=2..=14（含「完成」等 CJK 宽字符的续格，无断口）
+        for x in 2..=14u16 {
+            assert_eq!(
+                buf[(x, hl_y)].bg,
+                ratatui::style::Color::DarkGray,
+                "选中条在 x={x} 应连续:\n{text}"
+            );
+        }
+        // 与左右竖线各留 1 格间距（对称）；边框外 x=0 保持默认
+        assert_eq!(
+            buf[(1, hl_y)].bg,
+            ratatui::style::Color::Reset,
+            "背景条与左竖线应留 1 格间距:\n{text}"
+        );
+        assert_eq!(buf[(1, hl_y)].symbol(), "│", "左竖线字符应保留");
+        assert_eq!(
+            buf[(15, hl_y)].bg,
+            ratatui::style::Color::Reset,
+            "背景条与分隔竖线应留 1 格间距:\n{text}"
+        );
+        assert_eq!(
+            buf[(0, hl_y)].bg,
+            ratatui::style::Color::Reset,
+            "背景不应越过边框到 x=0:\n{text}"
+        );
+        // 未选中项也是整条连续暗色背景；标签右移后从 x=3 起
+        let all_y = (1..17)
+            .find(|&y| buf[(3, y)].symbol() == "全")
+            .expect("全部分类标签应在 x=3");
+        for x in 2..=14u16 {
+            assert_eq!(
+                buf[(x, all_y)].bg,
+                ratatui::style::Color::Rgb(38, 38, 38),
+                "未选中条在 x={x} 应连续:\n{text}"
+            );
+        }
+        assert_eq!(buf[(1, all_y)].symbol(), "│", "未选中行左竖线应保留");
+        assert_eq!(
+            buf[(1, all_y)].bg,
+            ratatui::style::Color::Reset,
+            "未选中条与左竖线应留 1 格间距:\n{text}"
+        );
+        assert_eq!(
+            buf[(0, all_y)].bg,
+            ratatui::style::Color::Reset,
+            "未选中条不应越过边框:\n{text}"
         );
         let row_compact: String = (0..100)
             .map(|x| buf[(x, hl_y)].symbol().to_string())
@@ -5200,6 +5283,37 @@ mod tests {
         );
     }
 
+    /// [临时调试] dump 侧栏区域每格的符号/前景/背景，验证后删除。
+    #[test]
+    fn debug_dump_sidebar_cells() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+        app.tasks = vec![
+            sample_task("aaa", "active", 10, 100),
+            sample_task("ccc", "complete", 100, 100),
+        ];
+        app.category = Category::Complete;
+        let backend = TestBackend::new(100, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_list(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        for y in 1..8u16 {
+            let mut row = format!("y={y}: ");
+            for x in 0..18u16 {
+                let c = &buf[(x, y)];
+                let sym = c.symbol().chars().next().unwrap_or(' ');
+                row.push(match c.bg {
+                    ratatui::style::Color::Reset => sym,
+                    ratatui::style::Color::DarkGray => '▓',
+                    ratatui::style::Color::Rgb(r, _, _) if r == 38 => '░',
+                    ratatui::style::Color::Cyan => '█',
+                    _ => '?',
+                });
+            }
+            println!("{row}");
+        }
+    }
+
     fn render_list(app: &App, w: u16, h: u16) -> Vec<String> {
         let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
@@ -5237,10 +5351,10 @@ mod tests {
         );
     }
 
-    /// 主区边框：直角，上下横线横跨全宽（左右各缩 1 列、与 logo 对齐），
-    /// 竖线在侧栏与内容区之间、贴右缘。
+    /// 主区边框：左右两侧均圆角，上下横线横跨全宽（左右各缩 1 列、与 logo 对齐），
+    /// 左竖线贴左缘（侧栏包裹在内）、侧栏分隔竖线、右竖线贴右缘。
     #[test]
-    fn main_borders_span_full_width_with_open_corners() {
+    fn main_borders_fully_rounded_enclosing_sidebar() {
         let _g = LANG_LOCK.lock().unwrap();
         let app = app_with_peers(vec![]);
         let rows = render_list(&app, 60, 12);
@@ -5253,9 +5367,10 @@ mod tests {
         assert_eq!(rows[0].chars().nth(59), Some(' '), "顶栏右端应留 1 格间距");
         // 速率与任务计数之间的分隔竖线只在内容行
         assert!(rows[0].contains('│'), "速率与计数之间应有分隔竖线");
-        // 顶横线：x=1..=57 主体，x=58 圆角与右竖线相连，穿过侧栏区
+        // 顶横线：x=1 左圆角、x=2..=57 主体（穿过侧栏区）、x=58 右圆角
         assert_eq!(rows[1].chars().nth(0), Some(' '), "顶横线左端应留缺口");
-        assert_eq!(rows[1].chars().nth(1), Some('─'), "顶横线应与 logo 对齐");
+        assert_eq!(rows[1].chars().nth(1), Some('╭'), "顶横线左端应为圆角");
+        assert_eq!(rows[1].chars().nth(2), Some('─'), "圆角后应接横线");
         assert_eq!(rows[1].chars().nth(side), Some('─'), "顶横线应横跨侧栏区");
         assert_eq!(rows[1].chars().nth(58), Some('╮'), "顶横线右端应为圆角");
         assert_eq!(rows[1].chars().nth(59), Some(' '), "圆角右侧应留缺口");
@@ -5263,21 +5378,17 @@ mod tests {
         assert_eq!(rows[2].chars().nth(58), Some('│'), "右竖线应连入顶圆角");
         assert_eq!(rows[8].chars().nth(58), Some('│'), "右竖线应连入底圆角");
         assert_eq!(rows[2].chars().nth(59), Some(' '), "右缘应留缺口");
-        // 左竖线：与横线相接
-        assert_eq!(rows[2].chars().nth(side), Some('│'), "左侧竖线");
-        assert_eq!(rows[8].chars().nth(side), Some('│'), "左侧竖线底端");
-        // 底横线与顶横线对称，右端圆角
-        assert_eq!(rows[9].chars().nth(1), Some('─'), "底横线应与顶横线对齐");
+        // 左竖线：贴左缘缩进 1 列，上下连入圆角，将侧栏包裹在内；最左缘留空
+        assert_eq!(rows[2].chars().nth(0), Some(' '), "左缘应留缺口");
+        assert_eq!(rows[2].chars().nth(1), Some('│'), "左竖线应连入顶圆角");
+        assert_eq!(rows[8].chars().nth(1), Some('│'), "左竖线应连入底圆角");
+        // 侧栏分隔竖线：与横线相接
+        assert_eq!(rows[2].chars().nth(side), Some('│'), "侧栏分隔竖线");
+        assert_eq!(rows[8].chars().nth(side), Some('│'), "侧栏分隔竖线底端");
+        // 底横线与顶横线对称，左右两端均为圆角
+        assert_eq!(rows[9].chars().nth(1), Some('╰'), "底横线左端应为圆角");
         assert_eq!(rows[9].chars().nth(58), Some('╯'), "底横线右端应为圆角");
         assert_eq!(rows[9].chars().nth(59), Some(' '), "圆角右侧应留缺口");
-        // 左侧不应出现圆角（右侧圆角已单独断言）
-        let joined = rows.join("\n");
-        for round in ['╭', '╰'] {
-            assert!(
-                !joined.contains(round),
-                "任务区左侧不应出现圆角 {round}:\n{joined}"
-            );
-        }
     }
 
     #[test]

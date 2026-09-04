@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
@@ -292,6 +293,152 @@ async fn magnet_download_end_to_end() {
     assert!(engine.has_metadata());
     let out = std::fs::read(dir.join("data.bin")).unwrap();
     assert_eq!(out, data);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 回归测试（磁力文件选择流程）：
+/// 1. 等待勾选阶段（占位空选择）不得创建任何数据文件/目录；
+/// 2. 勾选后重启引擎只创建被选中文件的目录与文件；
+/// 3. 空选择（无所需片）不得被误判为"下载完成"。
+#[tokio::test]
+async fn magnet_selection_creates_only_selected_files() {
+    // 多文件种子：dl/a.bin(64K) + dl/sub/b.bin(64K+1) + dl/sub/c.bin(64K)
+    // 文件 0 与 1 相邻、1 与 2 相邻 → 边界片必然存在
+    const L0: usize = PIECE_LEN;
+    const L1: usize = PIECE_LEN + 1;
+    const L2: usize = PIECE_LEN;
+    let file_data: Vec<Vec<u8>> = vec![
+        (0..L0).map(|i| (i % 97) as u8).collect(),
+        (0..L1).map(|i| (i % 251) as u8).collect(),
+        (0..L2).map(|i| (i % 89) as u8).collect(),
+    ];
+    let data: Vec<u8> = file_data.concat();
+    let pieces: Vec<u8> = data.chunks(PIECE_LEN).flat_map(sha1_of).collect();
+    let info = dict(BTreeMap::from([
+        (b"name".to_vec(), bytes("dl")),
+        (b"piece length".to_vec(), int(PIECE_LEN as i64)),
+        (
+            b"files".to_vec(),
+            Value::List(vec![
+                Value::Dict(BTreeMap::from([
+                    (b"length".to_vec(), int(L0 as i64)),
+                    (b"path".to_vec(), Value::List(vec![bytes("a.bin")])),
+                ])),
+                Value::Dict(BTreeMap::from([
+                    (b"length".to_vec(), int(L1 as i64)),
+                    (
+                        b"path".to_vec(),
+                        Value::List(vec![bytes("sub"), bytes("b.bin")]),
+                    ),
+                ])),
+                Value::Dict(BTreeMap::from([
+                    (b"length".to_vec(), int(L2 as i64)),
+                    (
+                        b"path".to_vec(),
+                        Value::List(vec![bytes("sub"), bytes("c.bin")]),
+                    ),
+                ])),
+            ]),
+        ),
+        (b"pieces".to_vec(), bytes(pieces)),
+    ]));
+    let info_bytes = encode(&info);
+    let info_hash = sha1_of(&info_bytes);
+
+    let (sl, saddr) = bind_random().await;
+    let conns = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(serve_magnet_seed(
+        sl,
+        Arc::new(data.clone()),
+        Arc::new(info_bytes.clone()),
+        InfoHash::from_bytes(&info_hash),
+        PeerId::azureus_prefix(&[0x31; 12]),
+        conns.clone(),
+    ));
+
+    let (taddr, seed_ref) = start_tracker().await;
+    *seed_ref.write().unwrap() = Some(saddr);
+
+    let dir = std::env::temp_dir().join(format!("magnet-sel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let tracker_url = format!("http://{taddr}/announce");
+
+    // ---- 阶段一：占位空选择（磁力等待勾选）----
+    // 只取元数据：不创建任何文件/目录，不得误判完成
+    let cfg = TorrentConfig {
+        dir: dir.clone(),
+        peer_id: PeerId::azureus_prefix(&[0x32; 12]),
+        announce_urls: vec![tracker_url.clone()],
+        enable_dht: false,
+        encryption: xfer_bt::EncryptionMode::PlaintextOnly,
+        bt_protocol: xfer_bt::BtProtocol::TcpOnly,
+        selected_files: Some(Vec::new()), // 占位空选择
+        ..TorrentConfig::default()
+    };
+    let engine = TorrentEngine::new_magnet(info_hash, cfg).unwrap();
+    let cancel = CancellationToken::new();
+    let run_engine = engine.clone();
+    let run_cancel = cancel.clone();
+    let runner =
+        tokio::spawn(async move { run_engine.run(run_cancel).await });
+
+    // 等元数据就绪（ut_metadata）
+    let mut ready = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if engine.has_metadata() {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "占位阶段元数据未就绪");
+    // 给 ticker/主循环一点时间：若误判完成或误建文件都能暴露
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !dir.join("dl").exists(),
+        "等待勾选阶段不得创建种子数据目录"
+    );
+    assert!(
+        !engine.is_done(),
+        "空选择（无所需片）不得被误判为下载完成"
+    );
+    cancel.cancel();
+    let _ = runner.await;
+
+    // ---- 阶段二：勾选文件 1（sub/b.bin）后重启引擎 ----
+    let meta = xfer_bencode::parse_torrent(&encode(&dict(BTreeMap::from([
+        (b"announce".to_vec(), bytes(tracker_url.as_str())),
+        (b"info".to_vec(), xfer_bencode::decode(&info_bytes).unwrap()),
+    ]))))
+    .unwrap();
+    let cfg2 = TorrentConfig {
+        dir: dir.clone(),
+        peer_id: PeerId::azureus_prefix(&[0x33; 12]),
+        announce_urls: vec![tracker_url],
+        enable_dht: false,
+        encryption: xfer_bt::EncryptionMode::PlaintextOnly,
+        bt_protocol: xfer_bt::BtProtocol::TcpOnly,
+        selected_files: Some(vec![1]), // 只选 b.bin
+        ..TorrentConfig::default()
+    };
+    let engine2 = TorrentEngine::new(meta, cfg2).unwrap();
+    let r = engine2.clone().run(CancellationToken::new()).await;
+    assert!(r.is_ok(), "勾选后磁力下载失败: {r:?}");
+
+    // 只创建被选中文件的路径；未选文件不落盘
+    assert!(dir.join("dl").exists(), "种子根目录应存在");
+    assert!(dir.join("dl").join("sub").join("b.bin").exists());
+    assert!(
+        !dir.join("dl").join("a.bin").exists(),
+        "未选文件 a.bin 不应被创建"
+    );
+    assert!(
+        !dir.join("dl").join("sub").join("c.bin").exists(),
+        "未选文件 c.bin 不应被创建"
+    );
+    let out = std::fs::read(dir.join("dl").join("sub").join("b.bin")).unwrap();
+    assert_eq!(out, file_data[1], "选中文件内容与源数据不一致");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
