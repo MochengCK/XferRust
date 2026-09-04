@@ -2,7 +2,8 @@ name: CI
 
 # 触发：push 到 main、PR、手动。
 # 每次 push 到 main 都会构建+测试；release 作业随后按代码版本号自动管理 Release（默认草稿，不直接发布）：
-# 无对应版本 → 自动创建草稿（首次自动生成说明）；版本未变 → 仅覆盖草稿产物、保留原说明。
+# 无对应版本 → 自动创建草稿（说明拼装自 .github/RELEASE_EN.md 与 .github/RELEASE_ZH.md 双语说明文件）；
+# 版本未变 → 仅覆盖草稿产物、保留原说明。
 # 确认无误后手动在 Releases 页发布。
 on:
   push:
@@ -163,7 +164,10 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # 发布：构建+测试全绿后，按代码版本号自动管理 Release（默认草稿，不直接发布）。
-  # - 无 v<版本> Release → 首次创建为草稿（自动生成说明，标题仅版本号）
+  # - 无 v<版本> Release → 首次创建为草稿，说明由固定双语模板拼装：
+  #   .github/RELEASE_EN.md（英文）+ .github/RELEASE_ZH.md（中文），每次发布前
+  #   只需更新模板里各节内容；顶部切换锚点由 CI 统一添加，{{version}} 占位符
+  #   自动替换为实际版本号。
   # - v<版本> 是草稿     → 仅覆盖草稿产物（--clobber），说明与草稿状态保持不变
   # - v<版本> 已发布     → 不覆盖（跳过，保持已发布版本不动）
   # 确认无误后，在 GitHub Releases 页手动点 "Publish release" 发布。
@@ -204,7 +208,32 @@ jobs:
               echo ">>> ${TAG} 已发布 → 不覆盖已发布版本，跳过产物更新"
             fi
           else
-            echo ">>> 无 ${TAG} Release → 首次创建为草稿（自动生成说明）"
+            EN_FILE=".github/RELEASE_EN.md"
+            ZH_FILE=".github/RELEASE_ZH.md"
+            if [ ! -f "$EN_FILE" ] && [ ! -f "$ZH_FILE" ]; then
+              echo ">>> 未找到 RELEASE_EN/RELEASE_ZH 模板文件 → 回退 GitHub 自动生成"
+              gh release create "$TAG" artifacts/*.tar.gz \
+                --title "v${VERSION}" --draft --generate-notes
+              exit 0
+            fi
+            echo ">>> 无 ${TAG} Release → 首次创建为草稿（固定双语模板 + {{version}} 替换）"
+            # 固定模板中的 {{version}} 占位符替换为实际版本号；
+            # 正文最上方为总标题，双语切换锚点由工作流统一添加，模板文件里只写各语言正文
+            {
+              echo "# XferRust v${VERSION} 发布说明"
+              echo ""
+              echo '<a name="english"></a> **English** | [简体中文](#简体中文)'
+              echo ""
+              sed -e "s/{{version}}/v${VERSION}/g" "$EN_FILE" 2>/dev/null || true
+              echo ""
+              echo "---"
+              echo ""
+              echo '<a name="简体中文"></a>'
+              echo ""
+              echo '**[English](#english)** | 简体中文'
+              echo ""
+              sed -e "s/{{version}}/v${VERSION}/g" "$ZH_FILE" 2>/dev/null || true
+            } > release_body.md
             gh release create "$TAG" artifacts/*.tar.gz \
-              --title "v${VERSION}" --draft --generate-notes
+              --title "v${VERSION}" --draft --notes-file release_body.md
           fi
