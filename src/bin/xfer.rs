@@ -582,6 +582,71 @@ fn ui_card_focused() -> ratatui::widgets::Block<'static> {
         .border_style(ratatui::style::Style::new().fg(ratatui::style::Color::Yellow))
 }
 
+/// 主区边框：直角、无标题，右侧上下连成圆角。
+/// 上下横线横跨整个任务区（左端缩 1 列与 logo 位置对齐），右端以 ╮/╯
+/// 与右竖线连成圆角；左竖线在侧栏与内容区之间（side_x）。
+fn draw_main_borders(f: &mut ratatui::Frame, area: ratatui::layout::Rect, side_x: u16) {
+    use ratatui::style::Style;
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    let style = Style::new().fg(ratatui::style::Color::DarkGray);
+    // 上下横线：左端缩 1 列与 logo 对齐，右端圆角（╮/╯）与右竖线相连，
+    // 右缘整体缩 1 列（与左端对称）
+    let h_len = area.width.saturating_sub(3) as usize; // 圆角字符前的 ─ 数量
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{}╮", "─".repeat(h_len)),
+            style,
+        ))),
+        ratatui::layout::Rect {
+            x: area.x + 1,
+            y: area.y,
+            width: area.width - 2,
+            height: 1,
+        },
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{}╯", "─".repeat(h_len)),
+            style,
+        ))),
+        ratatui::layout::Rect {
+            x: area.x + 1,
+            y: area.bottom().saturating_sub(1),
+            width: area.width - 2,
+            height: 1,
+        },
+    );
+    // 左竖线（与横线相接）+ 右竖线（缩进 1 列，上下连入圆角）
+    let v_len = area.height.saturating_sub(2) as usize;
+    let vline: Vec<Line> = (0..v_len)
+        .map(|_| Line::from(Span::styled("│", style)))
+        .collect();
+    let right_x = area.right().saturating_sub(2);
+    for x in [side_x.min(right_x), right_x] {
+        f.render_widget(
+            Paragraph::new(vline.clone()),
+            ratatui::layout::Rect {
+                x,
+                y: area.y + 1,
+                width: 1,
+                height: area.height - 2,
+            },
+        );
+    }
+}
+
+/// 排空当前积压的终端按键事件（系统选择框打开期间产生）。
+fn drain_pending_events() {
+    while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        let _ = crossterm::event::read();
+    }
+}
+
 /// 快捷键提示行：按键加亮 + 说明弱化，中点分隔（替代旧的一整串灰字）。
 fn hint_line(pairs: &[(&'static str, String)]) -> ratatui::text::Line<'static> {
     let dim = ui_dim();
@@ -653,8 +718,6 @@ enum SettingKey {
 /// 输入弹窗类型。
 #[derive(Clone)]
 enum InputKind {
-    /// 添加下载 URL。
-    AddUrl,
     /// 修改设置项取值。
     EditSetting(SettingKey),
     /// 向 BT 任务添加 tracker。
@@ -737,8 +800,8 @@ struct App {
     max_conn_per_server: u64,
     /// 最小分片大小（字节，0 = 引擎默认）。
     min_split_size: u64,
-    /// 磁力链接解析 / 文件选择弹窗（模态）。
-    magnet_dialog: Option<MagnetDialog>,
+    /// 新建任务弹窗（地址 + 目录 / 磁力解析 / 文件选择，模态）。
+    add_task: Option<AddTaskDialog>,
 }
 
 /// TUI 详情页单行 peer 信息。
@@ -837,7 +900,7 @@ struct SubRow {
 }
 
 /// 磁力文件选择表格单行。
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct MagnetFileRow {
     /// 文件索引（0 起算，select_files 入参）。
     index: usize,
@@ -847,13 +910,23 @@ struct MagnetFileRow {
     length: u64,
 }
 
-/// 磁力链接解析弹窗状态机：
-/// `Parsing`（引擎从 peer 获取元数据）→ `Selecting`（文件表格勾选）。
-#[derive(Clone)]
-enum MagnetDialog {
-    /// 元数据解析中（gid + 弹窗打开时刻）。
+/// 新建任务弹窗焦点字段。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AddField {
+    /// 下载地址（URL / 磁力链接 / .torrent 路径）。
+    Url,
+    /// 目录（空 = 使用全局下载目录，仅对本任务生效）。
+    Dir,
+}
+
+/// 新建任务弹窗阶段：输入 →（磁力）解析中 → 向下扩展文件选择。
+#[derive(Clone, Debug)]
+enum AddStage {
+    /// 地址 / 目录输入。
+    Input,
+    /// 磁力元数据解析中（用户输入后直接解析，弹窗保持打开）。
     Parsing { gid: Gid, started: std::time::Instant },
-    /// 文件选择（元数据就绪、任务自动暂停后）。
+    /// 解析完成：弹窗向下扩展，显示文件选择表。
     Selecting {
         gid: Gid,
         /// 种子根目录名（单文件任务为文件名）。
@@ -863,6 +936,20 @@ enum MagnetDialog {
         checked: Vec<bool>,
         cursor: usize,
     },
+}
+
+/// 新建任务弹窗（模态）：地址 + 目录两字段；
+/// 磁力链接解析与文件选择在同一弹窗内完成（解析后向下扩展文件表格）。
+#[derive(Clone, Debug)]
+struct AddTaskDialog {
+    /// 下载地址。
+    url: String,
+    /// 目录（空 = 使用全局下载目录）。
+    dir: String,
+    /// 当前焦点字段（Tab / ↑↓ 切换）。
+    field: AddField,
+    /// 当前阶段。
+    stage: AddStage,
 }
 
 /// TUI 模式日志写入器：写入文件，避免日志混入终端渲染。
@@ -1056,7 +1143,7 @@ async fn app_loop(mgr: Arc<TaskManager>) -> i32 {
         bt_adaptive: true,
         max_conn_per_server: 0,
         min_split_size: 0,
-        magnet_dialog: None,
+        add_task: None,
     };
     refresh_app(&mut app);
     // 启动恢复：上次会话解析完成、等待文件选择的磁力任务重新弹窗
@@ -1071,7 +1158,7 @@ async fn app_loop(mgr: Arc<TaskManager>) -> i32 {
         .cloned()
     {
         let gid = Gid::from(t["gid"].as_str().unwrap_or(""));
-        app.magnet_dialog = Some(magnet_selection_from_status(&t, gid));
+        app.add_task = Some(add_task_dialog_selecting(&t, gid));
     }
     publish(&hub, &app);
 
@@ -1117,28 +1204,30 @@ async fn app_loop(mgr: Arc<TaskManager>) -> i32 {
 fn refresh_app(app: &mut App) {
     let arr = app.mgr.list_native("all", 0, -1, None);
     app.tasks = arr.as_array().cloned().unwrap_or_default();
-    // 磁力解析弹窗状态机：元数据就绪（引擎自动暂停等待选择）→ 文件表格
-    if let Some(MagnetDialog::Parsing { gid, .. }) = app.magnet_dialog.clone() {
-        let found = app
-            .tasks
-            .iter()
-            .find(|t| t["gid"].as_str() == Some(gid.0.as_str()))
-            .cloned();
-        match found {
-            None => app.magnet_dialog = None, // 任务被移除
-            Some(t) => {
-                let status = t["status"].as_str().unwrap_or("");
-                let has_files = t["files"].as_array().is_some_and(|a| !a.is_empty());
-                let awaiting = t["awaitingSelection"].as_bool().unwrap_or(false);
-                if status == "error" {
-                    let msg = t["errorMessage"].as_str().unwrap_or("").to_string();
-                    app.message = Some((
-                        format!("{}: {msg}", tr("磁力解析失败", "Magnet parse failed")),
-                        std::time::Instant::now(),
-                    ));
-                    app.magnet_dialog = None;
-                } else if awaiting && has_files {
-                    app.magnet_dialog = Some(magnet_selection_from_status(&t, gid));
+    // 新建任务弹窗状态机：磁力元数据就绪（引擎自动暂停等待选择）→ 向下扩展文件表格
+    if let Some(d) = app.add_task.clone() {
+        if let AddStage::Parsing { gid, .. } = d.stage {
+            let found = app
+                .tasks
+                .iter()
+                .find(|t| t["gid"].as_str() == Some(gid.0.as_str()))
+                .cloned();
+            match found {
+                None => app.add_task = None, // 任务被移除
+                Some(t) => {
+                    let status = t["status"].as_str().unwrap_or("");
+                    let has_files = t["files"].as_array().is_some_and(|a| !a.is_empty());
+                    let awaiting = t["awaitingSelection"].as_bool().unwrap_or(false);
+                    if status == "error" {
+                        let msg = t["errorMessage"].as_str().unwrap_or("").to_string();
+                        app.message = Some((
+                            format!("{}: {msg}", tr("磁力解析失败", "Magnet parse failed")),
+                            std::time::Instant::now(),
+                        ));
+                        app.add_task = None;
+                    } else if awaiting && has_files {
+                        app.add_task = Some(add_task_dialog_selecting(&t, gid));
+                    }
                 }
             }
         }
@@ -1309,9 +1398,9 @@ fn refresh_app(app: &mut App) {
 /// 处理一次按键。返回 false 表示退出。
 fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
-    // 磁力解析 / 文件选择弹窗（模态，优先处理）
-    if let Some(dialog) = app.magnet_dialog.clone() {
-        return handle_magnet_dialog_key(app, dialog, k);
+    // 新建任务弹窗（模态，优先处理）
+    if let Some(d) = app.add_task.clone() {
+        return handle_add_task_key(app, d, k);
     }
     // 输入模式：编辑缓冲（并发数只接受数字）
     if let Some((kind, buf)) = app.input.as_mut() {
@@ -1337,7 +1426,6 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                 let val = buf.trim().to_string();
                 app.input = None;
                 match kind {
-                    InputKind::AddUrl => submit_url(app, val),
                     InputKind::EditSetting(key) => submit_setting(app, key, &val),
                     InputKind::AddTracker(gid) => submit_tracker(app, gid, &val),
                     InputKind::AddGlobalTracker => submit_global_tracker(app, &val),
@@ -1463,7 +1551,15 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                     app.selected = 0;
                 }
             }
-            KeyCode::Char('a') => app.input = Some((InputKind::AddUrl, String::new())),
+            KeyCode::Char('a') => {
+                app.add_task = Some(AddTaskDialog {
+                    // 目录预填全局下载目录（可改，仅对本任务生效）
+                    url: String::new(),
+                    dir: app.download_dir.clone(),
+                    field: AddField::Url,
+                    stage: AddStage::Input,
+                });
+            }
             KeyCode::Char('s') => app.view = MainView::Settings,
             KeyCode::Char('r') => app_action(app, "toggle"),
             KeyCode::Char('x') => {
@@ -1607,7 +1703,7 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                             Lang::ZhTw => 1,
                             Lang::En => 2,
                         });
-                    } else if !matches!(app.settings_sel, 6 | 7 | 8) {
+                    } else if !matches!(app.settings_sel, 5 | 6 | 7 | 8) {
                         let (kind, init) = match app.settings_sel {
                             0 => (
                                 InputKind::EditSetting(SettingKey::MaxConcurrent),
@@ -1629,10 +1725,6 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                                 InputKind::EditSetting(SettingKey::MaxUploadLimit),
                                 app.ul_limit_kbs.to_string(),
                             ),
-                            5 => (
-                                InputKind::EditSetting(SettingKey::DownloadDir),
-                                app.download_dir.clone(),
-                            ),
                             9 => (
                                 InputKind::EditSetting(SettingKey::MaxConnPerServer),
                                 app.max_conn_per_server.to_string(),
@@ -1641,8 +1733,15 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                                 InputKind::EditSetting(SettingKey::MinSplitSize),
                                 app.min_split_size.to_string(),
                             ),
-                    };
+                        };
                         app.input = Some((kind, init));
+                    } else if app.settings_sel == 5 {
+                        // 下载目录：直接调用系统目录选择框
+                        let picked = pick_directory_via_os();
+                        drain_pending_events();
+                        if let Some(p) = picked {
+                            submit_setting(app, SettingKey::DownloadDir, &p);
+                        }
                     }
                 }
             }
@@ -1758,11 +1857,11 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
     true
 }
 
-/// 从任务状态快照构建文件选择弹窗（元数据就绪、任务自动暂停后调用）。
+/// 从任务状态快照构建文件选择阶段（元数据就绪、任务自动暂停后调用）。
 ///
 /// 多文件任务剥离公共根目录段作为弹窗标题；文件索引取
 /// `files[].index - 1`（0 起算），默认全部勾选。
-fn magnet_selection_from_status(t: &Value, gid: Gid) -> MagnetDialog {
+fn magnet_selection_from_status(t: &Value, gid: Gid) -> AddStage {
     let files_arr = t["files"].as_array().cloned().unwrap_or_default();
     let paths: Vec<String> = files_arr
         .iter()
@@ -1801,12 +1900,22 @@ fn magnet_selection_from_status(t: &Value, gid: Gid) -> MagnetDialog {
         })
         .collect();
     let checked = vec![true; files.len()];
-    MagnetDialog::Selecting {
+    AddStage::Selecting {
         gid,
         name,
         files,
         checked,
         cursor: 0,
+    }
+}
+
+/// 构建处于文件选择阶段的新建任务弹窗（启动恢复用；目录取任务快照）。
+fn add_task_dialog_selecting(t: &Value, gid: Gid) -> AddTaskDialog {
+    AddTaskDialog {
+        url: String::new(),
+        dir: t["dir"].as_str().unwrap_or("").to_string(),
+        field: AddField::Url,
+        stage: magnet_selection_from_status(t, gid),
     }
 }
 
@@ -1824,19 +1933,135 @@ fn magnet_selected_summary(files: &[MagnetFileRow], checked: &[bool]) -> (usize,
     (sel_n, files.len(), sel_bytes, total_bytes)
 }
 
-/// 磁力弹窗按键处理。返回 true 继续运行。
-fn handle_magnet_dialog_key(
+/// 调用系统目录选择框（阻塞至用户选择或取消）。
+/// macOS 用 osascript `choose folder`；Windows 用 PowerShell
+/// FolderBrowserDialog（-STA）；Linux 依次尝试 zenity / kdialog。
+/// 返回所选目录绝对路径；取消或无可用组件时返回 None。
+#[cfg(target_os = "macos")]
+fn pick_directory_via_os() -> Option<String> {
+    let title = tr("选择下载目录", "Choose download folder");
+    let script = format!(
+        "POSIX path of (choose folder with prompt \"{}\")",
+        title.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let out = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if out.status.success() && !path.is_empty() {
+        let trimmed = path.trim_end_matches('/');
+        Some(if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() })
+    } else {
+        None
+    }
+}
+
+/// Windows：FolderBrowserDialog 需要 STA 线程；UTF-8 输出避免中文路径乱码。
+#[cfg(windows)]
+fn pick_directory_via_os() -> Option<String> {
+    let title = tr("选择下载目录", "Choose download folder").replace('\'', "''");
+    let ps = format!(
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
+         Add-Type -AssemblyName System.Windows.Forms | Out-Null; \
+         $f = New-Object System.Windows.Forms.FolderBrowserDialog; \
+         $f.Description = '{title}'; \
+         if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{ $f.SelectedPath }}"
+    );
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-STA", "-Command", &ps])
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if out.status.success() && !path.is_empty() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Linux：优先 zenity（GTK 桌面），其次 kdialog（KDE 桌面）。
+#[cfg(all(unix, not(target_os = "macos")))]
+fn pick_directory_via_os() -> Option<String> {
+    let title = tr("选择下载目录", "Choose download folder");
+    let candidates: [(&str, Vec<&str>); 2] = [
+        (
+            "zenity",
+            vec!["--file-selection", "--directory", "--title", &title],
+        ),
+        (
+            "kdialog",
+            vec!["--getexistingdirectory", ".", "--title", &title],
+        ),
+    ];
+    for (prog, args) in candidates {
+        if let Ok(out) = std::process::Command::new(prog).args(args).output() {
+            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if out.status.success() && !path.is_empty() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// 新建任务弹窗按键处理。返回 true 继续运行。
+fn handle_add_task_key(
     app: &mut App,
-    dialog: MagnetDialog,
+    mut d: AddTaskDialog,
     k: &crossterm::event::KeyEvent,
 ) -> bool {
     use crossterm::event::KeyCode;
-    match dialog {
+    match d.stage.clone() {
+        // 输入阶段：编辑地址 / 目录两字段
+        AddStage::Input => match k.code {
+            KeyCode::Tab | KeyCode::Up | KeyCode::Down => {
+                d.field = if d.field == AddField::Url {
+                    AddField::Dir
+                } else {
+                    AddField::Url
+                };
+                app.add_task = Some(d);
+            }
+            KeyCode::Backspace => {
+                if d.field == AddField::Url {
+                    d.url.pop();
+                } else {
+                    d.dir.pop();
+                }
+                app.add_task = Some(d);
+            }
+            KeyCode::Char(c) => {
+                if d.field == AddField::Url {
+                    d.url.push(c);
+                } else {
+                    d.dir.push(c);
+                }
+                app.add_task = Some(d);
+            }
+            KeyCode::Enter => {
+                // 目录字段：Enter 打开系统目录选择框；地址字段：Enter 提交
+                if d.field == AddField::Dir {
+                    let picked = pick_directory_via_os();
+                    // 排空选择框打开期间积压的终端按键，避免误触弹窗
+                    drain_pending_events();
+                    if let Some(p) = picked {
+                        d.dir = p;
+                    }
+                    app.add_task = Some(d);
+                } else {
+                    submit_add_task(app, &d);
+                }
+            }
+            KeyCode::Esc => app.add_task = None,
+            _ => app.add_task = Some(d),
+        },
         // 解析中：Esc/q 取消（移除任务，不留残骸）
-        MagnetDialog::Parsing { gid, .. } => match k.code {
+        AddStage::Parsing { gid, .. } => match k.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 let _ = app.mgr.remove(&gid);
-                app.magnet_dialog = None;
+                app.add_task = None;
                 app.message = Some((
                     tr("已取消解析", "Parsing cancelled").to_string(),
                     std::time::Instant::now(),
@@ -1844,7 +2069,7 @@ fn handle_magnet_dialog_key(
             }
             _ => {}
         },
-        MagnetDialog::Selecting {
+        AddStage::Selecting {
             gid,
             name,
             files,
@@ -1929,24 +2154,26 @@ fn handle_magnet_dialog_key(
                 _ => {}
             }
             if close {
-                app.magnet_dialog = None;
+                app.add_task = None;
             } else {
-                app.magnet_dialog = Some(MagnetDialog::Selecting {
+                d.stage = AddStage::Selecting {
                     gid,
                     name,
                     files,
                     checked,
                     cursor,
-                });
+                };
+                app.add_task = Some(d);
             }
         }
     }
     true
 }
 
-/// 提交输入的下载 URL。
-fn submit_url(app: &mut App, url: String) {
-    let url = url.trim().to_string();
+/// 提交新建任务：磁力链接输入后直接解析（弹窗保持打开并进入解析态）；
+/// URL / .torrent 添加成功后关闭弹窗。目录非空时作为任务级目录。
+fn submit_add_task(app: &mut App, d: &AddTaskDialog) {
+    let url = d.url.trim().to_string();
     if url.is_empty() {
         app.message = Some((
             tr("地址为空", "Empty URL").to_string(),
@@ -1954,16 +2181,23 @@ fn submit_url(app: &mut App, url: String) {
         ));
         return;
     }
-    // 磁力链接：先解析元数据 → 文件表格勾选 → 确认后开始下载
+    // 目录：仅对本任务生效，不修改全局下载目录
+    let dir = d.dir.trim().to_string();
+    let mut opts = serde_json::Map::new();
+    if !dir.is_empty() {
+        opts.insert("dir".into(), json!(dir));
+    }
+    // 磁力链接：用户输入后直接解析 → 文件表格勾选 → 确认后开始下载
     if url.starts_with("magnet:") {
-        match app
-            .mgr
-            .add_uri(vec![url], &json!({"bt-file-selection": "true"}), None)
-        {
+        opts.insert("bt-file-selection".into(), json!("true"));
+        match app.mgr.add_uri(vec![url], &Value::Object(opts), None) {
             Ok(gid) => {
-                app.magnet_dialog = Some(MagnetDialog::Parsing {
-                    gid,
-                    started: std::time::Instant::now(),
+                app.add_task = Some(AddTaskDialog {
+                    stage: AddStage::Parsing {
+                        gid,
+                        started: std::time::Instant::now(),
+                    },
+                    ..d.clone()
                 });
                 app.message = Some((
                     tr("正在解析磁力链接…", "Parsing magnet link…").to_string(),
@@ -1993,7 +2227,7 @@ fn submit_url(app: &mut App, url: String) {
                 app.mgr
                     .add_torrent(
                         &base64::engine::general_purpose::STANDARD.encode(b),
-                        &json!({}),
+                        &Value::Object(opts),
                         None,
                     )
                     .map(|g| format!("{} {}", tr("已添加任务", "Task added"), g.0))
@@ -2001,11 +2235,19 @@ fn submit_url(app: &mut App, url: String) {
             })
     } else {
         app.mgr
-            .add_uri(vec![url], &json!({}), None)
+            .add_uri(vec![url], &Value::Object(opts), None)
             .map(|g| format!("{} {}", tr("已添加任务", "Task added"), g.0))
             .map_err(|e| format!("{}: {e}", tr("添加失败", "Add failed")))
     };
-    app.message = Some((r.unwrap_or_else(|e| e), std::time::Instant::now()));
+    match r {
+        Ok(msg) => {
+            app.add_task = None;
+            app.message = Some((msg, std::time::Instant::now()));
+        }
+        Err(e) => {
+            app.message = Some((e, std::time::Instant::now()));
+        }
+    }
 }
 
 /// 提交输入的 tracker URL，添加到 BT 任务。
@@ -2486,39 +2728,135 @@ fn draw_app(f: &mut ratatui::Frame, app: &App) {
     if app.confirm_quit {
         draw_confirm_quit_popup(f);
     }
-    if app.magnet_dialog.is_some() {
-        draw_magnet_dialog(f, app);
+    if app.add_task.is_some() {
+        draw_add_task_dialog(f, app);
     }
 }
 
-/// 磁力链接解析 / 文件选择弹窗。
-fn draw_magnet_dialog(f: &mut ratatui::Frame, app: &App) {
+/// 新建任务弹窗：地址 + 目录输入 →（磁力）解析中 → 向下扩展文件选择。
+///
+/// 弹窗顶边固定（输入态以 6 行高度垂直居中定位），磁力解析完成后
+/// 底部向下扩展出文件选择表格，顶边不再移动。
+fn draw_add_task_dialog(f: &mut ratatui::Frame, app: &App) {
     use ratatui::layout::Alignment;
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
     use ratatui::widgets::{Clear, Padding, Paragraph};
 
-    let Some(dialog) = &app.magnet_dialog else {
+    let Some(d) = &app.add_task else {
         return;
     };
     let dim = ui_dim();
     let accent = ui_accent();
+    let area_all = f.area();
 
-    match dialog {
-        MagnetDialog::Parsing { gid, started } => {
+    // 顶边固定：输入态高度（4 行内容 + 2 行边框）的垂直居中位置
+    const BASE_H: u16 = 6;
+    let y0 = area_all.height.saturating_sub(BASE_H) / 2;
+
+    let mut lines: Vec<Line> = Vec::new();
+    let title: String;
+    let focused_card: bool;
+    let mut area_w: u16 = (area_all.width * 7 / 10).clamp(44, 96);
+
+    match &d.stage {
+        AddStage::Input => {
+            title = format!(" {} ", tr("新建任务", "New task"));
+            focused_card = false;
+            let url_label = tr("地址", "URL");
+            let dir_label = tr("目录", "Dir");
+            let label_w = disp_w(&url_label).max(disp_w(&dir_label));
+            let value_w =
+                area_w.saturating_sub(6) as usize - label_w - 2; // 边框+内边距+冒号+空格
+            // 地址行（焦点态带光标）
+            let url_focus = d.field == AddField::Url;
+            let shown_url = truncate_head(&d.url, value_w);
+            let mut url_spans = vec![Span::styled(
+                format!("{}:{}", url_label, " ".repeat(label_w - disp_w(&url_label) + 1)),
+                if url_focus { accent } else { dim },
+            )];
+            if url_focus {
+                url_spans.push(Span::raw(shown_url));
+                url_spans.push(Span::styled("▌", accent));
+            } else {
+                url_spans.push(Span::styled(shown_url, Style::new()));
+            }
+            lines.push(Line::from(url_spans));
+            // 目录行（空值显示占位说明）
+            let dir_focus = d.field == AddField::Dir;
+            let dir_pad = " ".repeat(label_w - disp_w(&dir_label) + 1);
+            let mut dir_spans = vec![Span::styled(
+                format!("{dir_label}:{dir_pad}"),
+                if dir_focus { accent } else { dim },
+            )];
+            if d.dir.is_empty() {
+                dir_spans.push(Span::styled(
+                    tr("（空 = 使用默认下载目录）", "(empty = default download dir)"),
+                    dim,
+                ));
+            } else {
+                dir_spans.push(Span::styled(truncate_head(&d.dir, value_w), Style::new()));
+            }
+            if dir_focus {
+                dir_spans.push(Span::styled("▌", accent));
+            }
+            lines.push(Line::from(dir_spans));
+            lines.push(Line::from(""));
+            let action = if d.field == AddField::Dir {
+                tr("选择目录", "choose folder")
+            } else if d.url.trim_start().starts_with("magnet:") {
+                tr("解析", "parse")
+            } else {
+                tr("添加", "add")
+            };
+            lines.push(hint_line(&[
+                ("Enter", action),
+                (
+                    "Tab/↑↓",
+                    tr("切换字段", "switch field"),
+                ),
+                ("Esc", tr("取消", "cancel").to_string()),
+            ]));
+        }
+        AddStage::Parsing { gid, started } => {
+            title = format!(
+                " {} ",
+                tr("新建任务 · 解析中", "New task · parsing")
+            );
+            focused_card = true;
+            // 两字段灰显回显
+            let url_label = tr("地址", "URL");
+            let dir_label = tr("目录", "Dir");
+            let label_w = disp_w(&url_label).max(disp_w(&dir_label));
+            let value_w = area_w.saturating_sub(6) as usize - label_w - 2;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}:{}", url_label, " ".repeat(label_w - disp_w(&url_label) + 1)),
+                    dim,
+                ),
+                Span::styled(truncate_head(&d.url, value_w), dim),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{dir_label}:{}", " ".repeat(label_w - disp_w(&dir_label) + 1)),
+                    dim,
+                ),
+                Span::styled(
+                    if d.dir.is_empty() {
+                        tr("（默认下载目录）", "(default download dir)").to_string()
+                    } else {
+                        truncate_head(&d.dir, value_w)
+                    },
+                    dim,
+                ),
+            ]));
+            // 解析状态行
             let t = app
                 .tasks
                 .iter()
                 .find(|t| t["gid"].as_str() == Some(gid.0.as_str()));
-            let name = t
-                .and_then(|t| t["filename"].as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or(gid.0.as_str())
-                .to_string();
             let status = t.map(|t| t["status"].as_str().unwrap_or("")).unwrap_or("");
-            let conns = t
-                .and_then(|t| t["connections"].as_u64())
-                .unwrap_or(0);
+            let conns = t.and_then(|t| t["connections"].as_u64()).unwrap_or(0);
             let state_text = match status {
                 "waiting" => tr("排队等待调度…", "Queued…").to_string(),
                 "active" => format!(
@@ -2529,65 +2867,57 @@ fn draw_magnet_dialog(f: &mut ratatui::Frame, app: &App) {
                 ),
                 _ => tr("准备中…", "Preparing…").to_string(),
             };
-            let area = centered_rect(56, 7, f.area());
-            f.render_widget(Clear, area);
-            let body = vec![
-                Line::from(vec![Span::styled(name, Style::new().fg(Color::Cyan))]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("⟳ ", accent),
-                    Span::styled(state_text, Style::new()),
-                    Span::styled(format!(" · {}s", started.elapsed().as_secs()), dim),
-                ]),
-                Line::from(""),
-                Line::from(Span::styled(
-                    tr("Esc 取消解析", "Esc cancel"),
-                    dim,
-                )),
-            ];
-            let popup = Paragraph::new(body)
-                .block(
-                    ui_card_focused()
-                        .title(Span::styled(
-                            format!(" {} ", tr("磁力链接解析中", "Parsing magnet")),
-                            Style::new().fg(Color::Yellow),
-                        ))
-                        .padding(Padding::horizontal(2)),
-                )
-                .alignment(Alignment::Left);
-            f.render_widget(popup, area);
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("⟳ ", accent),
+                Span::styled(state_text, Style::new()),
+                Span::styled(format!(" · {}s", started.elapsed().as_secs()), dim),
+            ]));
+            lines.push(hint_line(&[("Esc", tr("取消解析", "cancel parse").to_string())]));
         }
-        MagnetDialog::Selecting {
+        AddStage::Selecting {
             gid: _,
             name,
             files,
             checked,
             cursor,
         } => {
+            title = format!(" {} ", tr("选择要下载的文件", "Select files to download"));
+            focused_card = true;
+            area_w = area_all.width.saturating_sub(4).clamp(40, 96);
             let n = files.len();
-            // 表格可见行数（随终端高度伸缩，3..=14 行）
-            let visible = (f.area().height.saturating_sub(9).clamp(3, 14) as usize).min(n);
-            let area_w = f.area().width.saturating_sub(4).clamp(40, 96);
-            let area_h = (visible as u16 + 6).min(f.area().height.saturating_sub(2));
-            let x = (f.area().width.saturating_sub(area_w)) / 2;
-            let y = (f.area().height.saturating_sub(area_h)) / 2;
-            let area = ratatui::layout::Rect {
-                x,
-                y,
-                width: area_w,
-                height: area_h,
-            };
-            f.render_widget(Clear, area);
-
+            // 内容固定行：名称 + 目录 + 空行 + 空行 + 汇总 + 提示 = 6，边框 2，
+            // 滚动指示行预留 1 → 共 9；可见行数随剩余高度伸缩（1..=14），
+            // 弹窗整体向下扩展不超屏
+            let visible = (area_all.height.saturating_sub(y0 + 9) as usize)
+                .clamp(1, 14)
+                .min(n);
             // 行窗口跟随光标滚动
             let start = if n <= visible {
                 0
             } else {
                 cursor
                     .saturating_sub(visible / 2)
-                    .min(n.saturating_sub(visible))
+                    .min(n - visible)
             };
             let end = (start + visible).min(n);
+
+            lines.push(Line::from(vec![
+                Span::styled(name.clone(), Style::new().fg(Color::Cyan)),
+                Span::styled(format!(" · {} {}", n, tr("个文件", "files")), dim),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}: ", tr("目录", "Dir")), dim),
+                Span::styled(
+                    if d.dir.is_empty() {
+                        tr("默认下载目录", "default download dir").to_string()
+                    } else {
+                        truncate_head(&d.dir, (area_w.saturating_sub(8)) as usize)
+                    },
+                    dim,
+                ),
+            ]));
+            lines.push(Line::from(""));
 
             // 大小列宽（最长尺寸字符串）
             let size_w = files
@@ -2598,14 +2928,6 @@ fn draw_magnet_dialog(f: &mut ratatui::Frame, app: &App) {
             let inner_w = area_w.saturating_sub(10) as usize; // 边框/内边距/前缀/复选框
             let name_w = inner_w.saturating_sub(size_w + 2).max(10);
 
-            let (sel_n, total_n, sel_bytes, total_bytes) =
-                magnet_selected_summary(files, checked);
-            let mut lines: Vec<Line> = Vec::new();
-            lines.push(Line::from(vec![
-                Span::styled(name.clone(), Style::new().fg(Color::Cyan)),
-                Span::styled(format!(" · {} {}", n, tr("个文件", "files")), dim),
-            ]));
-            lines.push(Line::from(""));
             for (i, f) in files.iter().enumerate().take(end).skip(start) {
                 let cur = i == *cursor;
                 let on = checked.get(i).copied().unwrap_or(false);
@@ -2632,27 +2954,22 @@ fn draw_magnet_dialog(f: &mut ratatui::Frame, app: &App) {
             }
             if n > visible {
                 lines.push(Line::from(Span::styled(
-                    format!(
-                        "{} {}/{}",
-                        tr("第", "row"),
-                        cursor + 1,
-                        n
-                    ),
+                    format!("{} {}/{}", tr("第", "row"), cursor + 1, n),
                     dim,
                 )));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{} {sel_n}/{total_n} · {} / {}",
-                        tr("已选", "Selected"),
-                        fmt_size(sel_bytes),
-                        fmt_size(total_bytes)
-                    ),
-                    Style::new().fg(Color::Cyan),
+            let (sel_n, total_n, sel_bytes, total_bytes) =
+                magnet_selected_summary(files, checked);
+            lines.push(Line::from(vec![Span::styled(
+                format!(
+                    "{} {sel_n}/{total_n} · {} / {}",
+                    tr("已选", "Selected"),
+                    fmt_size(sel_bytes),
+                    fmt_size(total_bytes)
                 ),
-            ]));
+                Style::new().fg(Color::Cyan),
+            )]));
             lines.push(hint_line(&[
                 ("↑↓", tr("移动", "move").to_string()),
                 ("Space", tr("勾选", "toggle").to_string()),
@@ -2660,22 +2977,41 @@ fn draw_magnet_dialog(f: &mut ratatui::Frame, app: &App) {
                 ("Enter", tr("确认下载", "download").to_string()),
                 ("Esc", tr("取消", "cancel").to_string()),
             ]));
-            let popup = Paragraph::new(lines)
-                .block(
-                    ui_card_focused()
-                        .title(Span::styled(
-                            format!(
-                                " {} ",
-                                tr("选择要下载的文件", "Select files to download")
-                            ),
-                            Style::new().fg(Color::Yellow),
-                        ))
-                        .padding(Padding::horizontal(2)),
-                )
-                .alignment(Alignment::Left);
-            f.render_widget(popup, area);
         }
     }
+
+    // 高度 = 内容行 + 边框；顶边固定，底部向下扩展
+    let content_h = lines.len() as u16;
+    let area_h = content_h + 2;
+    let area_h = area_h.min(area_all.height.saturating_sub(y0));
+    let x = (area_all.width.saturating_sub(area_w)) / 2;
+    let area = ratatui::layout::Rect {
+        x,
+        y: y0,
+        width: area_w,
+        height: area_h,
+    };
+    f.render_widget(Clear, area);
+    let block = if focused_card {
+        ui_card_focused()
+    } else {
+        ui_card()
+    };
+    let popup = Paragraph::new(lines)
+        .block(
+            block
+                .title(Span::styled(
+                    title,
+                    if focused_card {
+                        Style::new().fg(Color::Yellow)
+                    } else {
+                        accent
+                    },
+                ))
+                .padding(Padding::horizontal(2)),
+        )
+        .alignment(Alignment::Left);
+    f.render_widget(popup, area);
 }
 
 /// 语言选择弹窗：简体中文 / 繁體中文 / English 三个选项全部摆出，
@@ -2746,32 +3082,22 @@ fn message_line(app: &App) -> ratatui::text::Line<'static> {
     }
 }
 
-/// 列表视图（现代下载器布局）：
-/// 无边框顶栏（品牌 + 全局速率/计数，融入背景）/ 分类侧栏 + 任务表格 /
-/// 消息行 / 快捷键底栏（按键加亮）。
-fn draw_list(f: &mut ratatui::Frame, app: &App) {
-    use ratatui::layout::{Alignment, Constraint, Layout};
+/// 顶部全局信息栏：左 = 品牌 logo；右 = ↓/↑ 全局速率 │ 任务计数。
+/// 列表页与详情页共用（详情页不隐藏全局信息）。
+fn draw_top_bar(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    use ratatui::layout::{Constraint, Layout};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::{Line, Span};
-    use ratatui::widgets::{Block, List, ListState, Padding, Paragraph};
+    use ratatui::widgets::Paragraph;
 
     let dim = ui_dim();
     let accent = ui_accent();
-
     let stat = app.mgr.global_stat_native();
-    let rows = Layout::vertical([
-        Constraint::Length(1), // 顶栏（无边框）
-        Constraint::Min(5),    // 任务区域
-        Constraint::Length(1), // 消息行
-        Constraint::Length(1), // 底栏
-    ])
-    .split(f.area());
 
-    // 顶栏：左 = 品牌；右 = ↓/↑ 全局速率 + 任务计数
+    // 顶栏：左 = 品牌；右 = ↓/↑ 全局速率 │ 任务计数
     let dl = stat["downloadSpeed"].as_u64().unwrap_or(0);
     let ul = stat["uploadSpeed"].as_u64().unwrap_or(0);
-    let mut right_spans: Vec<Span> = Vec::new();
-    right_spans.extend([
+    let rate_spans: Vec<Span> = vec![
         Span::styled("↓ ", Style::new().fg(Color::LightGreen)),
         Span::styled(
             format!("{}/s", fmt_size(dl)),
@@ -2784,33 +3110,64 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
             format!("{}/s", fmt_size(ul)),
             Style::new().fg(Color::LightMagenta).add_modifier(Modifier::BOLD),
         ),
-    ]);
-    right_spans.extend([
-        Span::raw("    "),
+    ];
+    let stat_spans: Vec<Span> = vec![
         Span::styled(tr("活动", "Active"), dim),
         Span::raw(format!(" {}   ", stat["numActive"])),
         Span::styled(tr("等待", "Waiting"), dim),
         Span::raw(format!(" {}   ", stat["numWaiting"])),
         Span::styled(tr("停止", "Stopped"), dim),
         Span::raw(format!(" {}", stat["numStopped"])),
-    ]);
-    let right_w: usize = right_spans
-        .iter()
-        .map(|s| disp_w(s.content.as_ref()))
-        .sum();
+        // 右端留 1 列间距
+        Span::raw(" "),
+    ];
+    let rate_w: usize = rate_spans.iter().map(|s| disp_w(s.content.as_ref())).sum();
+    let stat_w: usize = stat_spans.iter().map(|s| disp_w(s.content.as_ref())).sum();
     let top = Layout::horizontal([
         Constraint::Fill(1),
-        Constraint::Length(right_w as u16),
+        Constraint::Length(rate_w as u16),
+        Constraint::Length(2), // 分隔竖线（右侧 1 列空隙）
+        Constraint::Length(stat_w as u16),
     ])
-    .split(rows[0]);
+    .split(area);
     let brand = Paragraph::new(Line::from(vec![
+        // 与顶/底横线左端对齐（logo 右移一点）
+        Span::raw(" "),
         Span::styled(ENGINE_NAME.to_string(), accent.add_modifier(Modifier::BOLD)),
         Span::styled(format!(" v{ENGINE_VERSION}"), dim),
     ]));
     f.render_widget(brand, top[0]);
-    f.render_widget(Paragraph::new(Line::from(right_spans)), top[1]);
+    f.render_widget(Paragraph::new(Line::from(rate_spans)), top[1]);
+    // 速率与任务计数之间的分隔竖线（紧贴速率区，右侧 1 列空隙）
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled("│ ", dim))),
+        top[2],
+    );
+    f.render_widget(Paragraph::new(Line::from(stat_spans)), top[3]);
+}
 
-    // 任务区域：左侧无边框分类栏 + 右侧圆角任务卡片
+/// 列表视图（现代下载器布局）：
+/// 无边框顶栏（品牌 + 全局速率/计数，融入背景）/ 分类侧栏 + 任务表格 /
+/// 消息行 / 快捷键底栏（按键加亮）。
+fn draw_list(f: &mut ratatui::Frame, app: &App) {
+    use ratatui::layout::{Alignment, Constraint, Layout};
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, List, ListState, Padding, Paragraph};
+
+    let dim = ui_dim();
+
+    let rows = Layout::vertical([
+        Constraint::Length(1), // 顶栏（无边框，内容行 y=0）
+        Constraint::Min(5),    // 任务区域
+        Constraint::Length(1), // 消息行
+        Constraint::Length(1), // 底栏
+    ])
+    .split(f.area());
+
+    draw_top_bar(f, app, rows[0]);
+
+    // 任务区域：左侧无边框分类栏 + 右侧直角任务卡片（四角留缺口）
     // 侧栏宽度随语言自适应（英文分类名更长）
     let sidebar_w: u16 = if lang() == Lang::En { 22 } else { 16 };
     let cols = Layout::horizontal([
@@ -2819,26 +3176,23 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
     ])
     .split(rows[1]);
 
-    // 侧边栏：标题 + 分类（当前项 ▸ 指示 + 右对齐计数，焦点态反色）
+    // 侧边栏：分类（选中项默认背景高亮、焦点态反色，不用指针）
     let inner_w = (sidebar_w as usize).saturating_sub(2); // 左右各 1 列内边距
-    let mut cat_items = vec![
-        Line::from(Span::styled(tr("分类", "Filter"), dim)),
-        Line::from(""),
-    ];
+    let mut cat_items = vec![Line::from("")];
     for c in CATEGORIES.iter() {
         let count = app.tasks.iter().filter(|t| c.matches(t)).count();
         let active = *c == app.category;
-        let marker = if active { "▸ " } else { "  " };
         let count_s = format!("({count})");
         let pad = inner_w
-            .saturating_sub(2 + disp_w(c.label().as_str()) + disp_w(&count_s))
+            .saturating_sub(1 + disp_w(c.label().as_str()) + disp_w(&count_s))
             .max(1);
-        let text = format!("{marker}{}{}{}", c.label(), " ".repeat(pad), count_s);
+        let text = format!(" {}{}{}", c.label(), " ".repeat(pad), count_s);
         let style = if active {
             if app.sidebar_focus {
                 Style::new().fg(Color::Black).bg(Color::Cyan)
             } else {
-                accent
+                // 默认选中项：背景高亮
+                Style::new().bg(Color::DarkGray)
             }
         } else {
             dim
@@ -2849,23 +3203,13 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
         List::new(cat_items).block(Block::default().padding(Padding::horizontal(1)));
     f.render_widget(sidebar, cols[0]);
 
-    // 任务列表（按当前分类过滤）：圆角卡片 + 列对齐表格
+    // 任务列表（按当前分类过滤）：直角边框（横线横跨全宽、四角留缺口）+ 列对齐表格
     let shown = filtered_indices(app);
-    let list_block = ui_card()
-        .title(Span::styled(
-            format!(
-                " {}（{}/{}） ",
-                tr("任务", "Tasks"),
-                shown.len(),
-                app.tasks.len()
-            ),
-            accent,
-        ))
-        .padding(Padding::horizontal(1));
+    draw_main_borders(f, rows[1], cols[1].x);
+    let content_block = Block::default().padding(Padding::new(2, 2, 1, 1));
     if shown.is_empty() {
         // 空状态：文字在任务框内垂直 + 水平居中
-        let inner = list_block.inner(cols[1]);
-        f.render_widget(list_block, cols[1]);
+        let inner = content_block.inner(cols[1]);
         let mid = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(1),
@@ -2884,13 +3228,15 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
         // 列宽：状态 / 进度(条+百分比) / 文件名(吃剩余宽度) / 大小 / 速度。
         // 全部经 pad_str 按显示宽度对齐（CJK 名不再把后续列顶歪），
         // 表头与数据行同宽 → 列严格对上。
-        let inner_w = (cols[1].width as usize).saturating_sub(4); // 边框 2 + 水平内边距 2
+        // 行宽 = inner 再左右各缩 1 格 → 与左右竖线间距一致（对称）
+        let inner_w = (cols[1].width as usize).saturating_sub(4); // 左右内边距 2+2
+        let row_w = inner_w.saturating_sub(1);
         const ST_W: usize = 8; // 状态
         const BAR_W: usize = 12; // 进度条
         const PCT_W: usize = 6; // 百分比
         const SIZE_W: usize = 23; // 大小（"999.9 GiB / 999.9 GiB"）
-        const SPD_W: usize = 11; // 速度
-        let name_w = inner_w
+        const SPD_W: usize = 10; // 速度（"999.9MiB/s"）
+        let name_w = row_w
             .saturating_sub(ST_W + 1 + BAR_W + 1 + PCT_W + 1 + SIZE_W + 1 + SPD_W)
             .max(10);
 
@@ -2934,7 +3280,7 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
                     "--".to_string()
                 };
                 let size_s = format!(
-                    "{:>11} / {:<9}",
+                    "{} / {}",
                     fmt_size(completed),
                     if total > 0 {
                         fmt_size(total)
@@ -2957,14 +3303,18 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
             })
             .collect();
 
-        // 表头作为首行渲染（选中索引 +1 跳过表头）
-        let mut items = vec![header_line];
+        // 表头 + 分隔横线（与表头/数据行同宽，左右各距竖线 1 格）+ 数据行
+        let sep_line = Line::from(Span::styled(
+            "─".repeat(row_w),
+            Style::new().fg(Color::DarkGray),
+        ));
+        let mut items = vec![header_line, sep_line];
         items.extend(item_lines);
         let list = List::new(items)
-            .block(list_block)
+            .block(content_block)
             .highlight_style(Style::new().bg(Color::DarkGray));
         let mut ls = ListState::default();
-        ls.select(Some(app.selected + 1));
+        ls.select(Some(app.selected + 2));
         f.render_stateful_widget(list, cols[1], &mut ls);
     }
 
@@ -3014,12 +3364,21 @@ fn draw_detail(f: &mut ratatui::Frame, app: &App, gid: &Gid) {
 
     let is_bt = app.mgr.is_bt_task(gid);
     if !is_bt {
-        draw(f, &st, gid, &footer);
+        // 非 BT 详情：顶部全局信息栏（1 行）+ 原全屏视图（区域整体下移 1 行）
+        let areas = Layout::vertical([Constraint::Length(1), Constraint::Min(5)]).split(f.area());
+        draw_top_bar(f, app, areas[0]);
+        let sub = ratatui::layout::Rect {
+            y: f.area().y + 1,
+            height: f.area().height.saturating_sub(1),
+            ..f.area()
+        };
+        draw_in_area(f, &st, gid, &footer, sub, true);
         return;
     }
 
-    // BT 任务：上方主视图 + 中间 tracker 列表 + 下方 peer 列表 + 底栏
+    // BT 任务：顶部全局信息栏 + 上方主视图 + 中间 tracker 列表 + 下方 peer 列表 + 底栏
     let areas = Layout::vertical([
+        Constraint::Length(1), // 顶栏：全局信息（品牌 + 速率/计数）
         Constraint::Min(18),   // 上方：任务信息 + 进度 + 速度图
         Constraint::Min(4),    // 中间：tracker 列表
         Constraint::Min(6),    // 下方：peer 列表
@@ -3027,9 +3386,10 @@ fn draw_detail(f: &mut ratatui::Frame, app: &App, gid: &Gid) {
     ])
     .split(f.area());
 
-    draw_in_area(f, &st, gid, &footer, areas[0], false);
-    draw_detail_trackers(f, app, areas[1]);
-    draw_detail_peers(f, app, areas[2]);
+    draw_top_bar(f, app, areas[0]);
+    draw_in_area(f, &st, gid, &footer, areas[1], false);
+    draw_detail_trackers(f, app, areas[2]);
+    draw_detail_peers(f, app, areas[3]);
 
     // 底栏：按键加亮 + 说明弱化
     let foot = Paragraph::new(hint_line(&[
@@ -3043,7 +3403,7 @@ fn draw_detail(f: &mut ratatui::Frame, app: &App, gid: &Gid) {
         ("q", tr("退出", "quit")),
     ]))
     .alignment(Alignment::Center);
-    f.render_widget(foot, areas[3]);
+    f.render_widget(foot, areas[4]);
 }
 
 /// 详情视图 tracker 列表区块（支持上下/横向滚动，聚焦卡片亮边框标记）。
@@ -3736,10 +4096,6 @@ fn draw_input_popup(f: &mut ratatui::Frame, app: &App) {
         return;
     };
     let title = match kind {
-        InputKind::AddUrl => tr(
-            " 添加下载（URL / 磁力链接 / .torrent 路径） ",
-            " Add download (URL / magnet / .torrent path) ",
-        ),
         InputKind::EditSetting(SettingKey::MaxConcurrent) => {
             tr(" 最大并发下载数（1-32） ", " Max concurrent downloads (1-32) ")
         }
@@ -4444,7 +4800,7 @@ mod tests {
             bt_adaptive: true,
             max_conn_per_server: 0,
             min_split_size: 0,
-            magnet_dialog: None,
+            add_task: None,
         }
     }
 
@@ -4581,10 +4937,46 @@ mod tests {
             .join("\n");
         let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
 
-        assert!(compact.contains("分类"), "应渲染侧边栏标题:\n{text}");
+        // 侧边栏不再渲染标题（直接从分类行开始）
+        for row in text.lines().filter(|l| l.contains("全部")) {
+            assert!(!row.contains("分类"), "侧边栏不应渲染标题:\n{text}");
+        }
+        // 选中分类默认有背景高亮，不再用 ▸ 指针
+        // （侧栏区 x<16 内找 DarkGray 背景块；任务表的高亮行在 x>=18，不会混入）
+        let hl_cells: Vec<(u16, u16)> = (1..16)
+            .flat_map(|x| (1..17).map(move |y| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].bg == ratatui::style::Color::DarkGray)
+            .collect();
+        assert!(
+            !hl_cells.is_empty(),
+            "默认选中分类应有背景高亮:\n{text}"
+        );
+        // 背景块应从侧栏内容左缘（x=1）开始，且所在行是「完成」分类
+        let hl_y = hl_cells[0].1;
+        assert!(
+            hl_cells.iter().any(|&(x, _)| x == 1),
+            "选中分类背景应从内容左缘开始:\n{text}"
+        );
+        let row_compact: String = (0..100)
+            .map(|x| buf[(x, hl_y)].symbol().to_string())
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            row_compact.contains("完成(1)"),
+            "背景高亮行应是选中的完成分类:\n{text}"
+        );
+        assert!(
+            !compact.contains('▸'),
+            "侧边栏不应再用指针指示选中项:\n{text}"
+        );
         assert!(compact.contains("全部(2)"), "侧边栏应显示全部分类计数:\n{text}");
         assert!(compact.contains("完成(1)"), "侧边栏应显示完成分类计数:\n{text}");
-        assert!(compact.contains("任务（1/2）"), "列表标题应显示过滤后/总数:\n{text}");
+        assert!(
+            !compact.contains("任务（"),
+            "任务卡片不应再渲染标题:\n{text}"
+        );
         assert!(compact.contains("ccc.bin"), "完成分类应显示已完成任务:\n{text}");
         assert!(!compact.contains("aaa.bin"), "完成分类不应显示下载中任务:\n{text}");
     }
@@ -4823,6 +5215,71 @@ mod tests {
             .collect()
     }
 
+    /// 详情页顶部应保留全局信息栏（logo + 速率/计数），且不被任务详情内容覆盖。
+    #[test]
+    fn detail_view_shows_global_top_bar() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+        app.tasks = vec![sample_task("aaa", "active", 10, 100)];
+        let backend = TestBackend::new(120, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_detail(f, &app, &Gid("aaa".to_string()))).unwrap();
+        let buf = term.backend().buffer().clone();
+        let top: String = (0..120u16)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(top.contains('X'), "详情页顶部应显示品牌 logo:\n{top}");
+        assert!(top.contains('│'), "详情页顶部应显示速率/计数分隔竖线:\n{top}");
+        // 顶栏行不应出现任务详情内容（曾因区域 y 未偏移被详情卡片覆盖）
+        assert!(
+            !top.contains("/tmp/aaa.bin"),
+            "顶栏行不应被任务详情内容占据:\n{top}"
+        );
+    }
+
+    /// 主区边框：直角，上下横线横跨全宽（左右各缩 1 列、与 logo 对齐），
+    /// 竖线在侧栏与内容区之间、贴右缘。
+    #[test]
+    fn main_borders_span_full_width_with_open_corners() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let app = app_with_peers(vec![]);
+        let rows = render_list(&app, 60, 12);
+        let side = 16; // 中文侧栏宽度 → 竖线 x=16，任务区行 1..=9
+        // 顶栏 1 行（y=0）：logo 左间距 1 格
+        assert_eq!(rows[0].chars().nth(0), Some(' '), "logo 左侧应留间距");
+        assert_eq!(rows[0].chars().nth(1), Some('X'), "logo 应从 x=1 开始");
+        // 顶栏右侧信息右间距 1 格
+        assert_eq!(rows[0].chars().nth(58), Some('0'), "计数末字符应在 x=58");
+        assert_eq!(rows[0].chars().nth(59), Some(' '), "顶栏右端应留 1 格间距");
+        // 速率与任务计数之间的分隔竖线只在内容行
+        assert!(rows[0].contains('│'), "速率与计数之间应有分隔竖线");
+        // 顶横线：x=1..=57 主体，x=58 圆角与右竖线相连，穿过侧栏区
+        assert_eq!(rows[1].chars().nth(0), Some(' '), "顶横线左端应留缺口");
+        assert_eq!(rows[1].chars().nth(1), Some('─'), "顶横线应与 logo 对齐");
+        assert_eq!(rows[1].chars().nth(side), Some('─'), "顶横线应横跨侧栏区");
+        assert_eq!(rows[1].chars().nth(58), Some('╮'), "顶横线右端应为圆角");
+        assert_eq!(rows[1].chars().nth(59), Some(' '), "圆角右侧应留缺口");
+        // 右竖线：缩进 1 列，上下连入圆角；右缘留空
+        assert_eq!(rows[2].chars().nth(58), Some('│'), "右竖线应连入顶圆角");
+        assert_eq!(rows[8].chars().nth(58), Some('│'), "右竖线应连入底圆角");
+        assert_eq!(rows[2].chars().nth(59), Some(' '), "右缘应留缺口");
+        // 左竖线：与横线相接
+        assert_eq!(rows[2].chars().nth(side), Some('│'), "左侧竖线");
+        assert_eq!(rows[8].chars().nth(side), Some('│'), "左侧竖线底端");
+        // 底横线与顶横线对称，右端圆角
+        assert_eq!(rows[9].chars().nth(1), Some('─'), "底横线应与顶横线对齐");
+        assert_eq!(rows[9].chars().nth(58), Some('╯'), "底横线右端应为圆角");
+        assert_eq!(rows[9].chars().nth(59), Some(' '), "圆角右侧应留缺口");
+        // 左侧不应出现圆角（右侧圆角已单独断言）
+        let joined = rows.join("\n");
+        for round in ['╭', '╰'] {
+            assert!(
+                !joined.contains(round),
+                "任务区左侧不应出现圆角 {round}:\n{joined}"
+            );
+        }
+    }
+
     #[test]
     fn task_list_header_aligns_with_cjk_name_rows() {
         let _g = LANG_LOCK.lock().unwrap();
@@ -4878,6 +5335,40 @@ mod tests {
             .expect("数据行应有「文」")
             .0;
         assert_eq!(hx, rx, "文件名列起始 x 应与表头对齐（x={hx} vs {rx}）");
+
+        // 分隔横线紧贴表头且紧贴数据行（无空行），数据行在表头下 2 行
+        assert_eq!(dy, hy + 2, "数据行应在表头下方 2 行");
+        let sep_y = hy + 1;
+        let sep_chars: Vec<u16> = (0..120u16)
+            .filter(|&x| buf[(x, sep_y)].symbol() == "─")
+            .collect();
+        assert!(!sep_chars.is_empty(), "表头下方应有分隔横线");
+        assert_eq!(
+            sep_chars[0], sx,
+            "分隔横线左端应与表头对齐（x={} vs {sx}）",
+            sep_chars[0]
+        );
+        // 分隔横线样式应与边框一致（DarkGray）
+        assert_eq!(
+            buf[(sep_chars[0], sep_y)].fg,
+            ratatui::style::Color::DarkGray,
+            "分隔横线样式应与边框一致"
+        );
+
+        // 大小列：表头「大」与数据行已完成数值首字符左对齐
+        let da = find("大");
+        assert_eq!(da.len(), 1, "「大」应只出现在表头");
+        let szx = da[0].0;
+        let slashes: Vec<u16> = (0..120u16)
+            .filter(|&x| buf[(x, dy)].symbol() == "/")
+            .collect();
+        assert!(!slashes.is_empty(), "数据行大小列应有 / 分隔");
+        // 紧凑格式 "10B / 100B" → '/' 距数值起点 5 列
+        let size_start = slashes[0] - 5;
+        assert_eq!(
+            szx, size_start,
+            "大小列数值应与表头左对齐（x={szx} vs {size_start}）"
+        );
     }
 
     #[test]
@@ -4889,10 +5380,13 @@ mod tests {
 
         let lines = render_list(&app, 120, 20);
         let compact: String = lines.join("\n").chars().filter(|c| !c.is_whitespace()).collect();
-        for needle in ["Status", "Progress", "Name", "Size", "Speed", "Filter", "Tasks"] {
+        for needle in ["Status", "Progress", "Name", "Size", "Speed"] {
             assert!(compact.contains(needle), "英文模式缺少 `{needle}`:\n{compact}");
         }
         assert!(compact.contains("All(1)"), "英文侧边栏应显示 All 分类:\n{compact}");
+        // 侧栏标题与任务卡片标题已删除
+        assert!(!compact.contains("Filter"), "英文侧边栏不应渲染标题:\n{compact}");
+        assert!(!compact.contains("Tasks（"), "英文任务卡片不应渲染标题:\n{compact}");
         assert!(!compact.contains("状态"), "英文模式不应出现中文表头:\n{compact}");
     }
 
@@ -5000,7 +5494,7 @@ mod tests {
         let _g = LANG_LOCK.lock().unwrap();
         let t = magnet_status_fixture();
         let d = magnet_selection_from_status(&t, Gid::from("gid-magnet-1"));
-        let MagnetDialog::Selecting {
+        let AddStage::Selecting {
             name, files, checked, cursor, ..
         } = d
         else {
@@ -5031,7 +5525,7 @@ mod tests {
             "files": [{"index": 1, "path": "movie.mkv", "length": 1024}],
         });
         let d = magnet_selection_from_status(&t, Gid::from("gid-magnet-2"));
-        let MagnetDialog::Selecting { name, files, .. } = d else {
+        let AddStage::Selecting { name, files, .. } = d else {
             panic!("应为 Selecting 状态");
         };
         assert_eq!(name, "movie.mkv");
@@ -5050,5 +5544,107 @@ mod tests {
         let (n, total, bytes, total_bytes) =
             magnet_selected_summary(&files, &[true, false, true]);
         assert_eq!((n, total, bytes, total_bytes), (2, 3, 500, 700));
+    }
+
+    /// 新建任务弹窗（输入态）应渲染地址 + 目录两字段与占位说明。
+    #[test]
+    fn add_task_dialog_renders_url_and_dir_fields() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let app = app_with_peers(vec![]);
+        let app = App {
+            add_task: Some(AddTaskDialog {
+                url: "magnet:?xt=urn:btih:abcdef".into(),
+                dir: String::new(),
+                field: AddField::Url,
+                stage: AddStage::Input,
+            }),
+            ..app
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_app(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..24)
+            .map(|y| {
+                (0..80)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        for needle in ["新建任务", "地址:", "目录:", "magnet:?xt=urn:btih:abcdef"] {
+            assert!(compact.contains(needle), "弹窗缺少 `{needle}`:\n{text}");
+        }
+        // 空目录应显示占位说明
+        assert!(
+            compact.contains("目录:（空=使用默认下载目录）"),
+            "空目录应有占位说明:\n{text}"
+        );
+    }
+
+    /// 磁力链接提交后直接解析：弹窗保持打开进入解析态，任务带目录。
+    #[test]
+    fn submit_magnet_starts_parsing_and_keeps_dialog() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+        let tmp = std::env::temp_dir().join(format!("xfer-tui-test-{}", std::process::id()));
+        let dir = tmp.to_string_lossy().to_string();
+        app.add_task = Some(AddTaskDialog {
+            url: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+            dir: dir.clone(),
+            field: AddField::Url,
+            stage: AddStage::Input,
+        });
+        let d = app.add_task.clone().unwrap();
+        submit_add_task(&mut app, &d);
+        // 弹窗保持打开，进入解析态（用户输入后直接解析）
+        match &app.add_task {
+            Some(AddTaskDialog {
+                stage: AddStage::Parsing { .. },
+                dir: d2,
+                ..
+            }) => assert_eq!(d2, &dir, "解析态应保留目录"),
+            other => panic!("提交磁力后应为 Parsing 态，实际 {other:?}"),
+        }
+        // 任务已创建且目录为设置的目录
+        let tasks = app.mgr.list_native("all", 0, -1, None);
+        let t = tasks
+            .as_array()
+            .and_then(|a| a.first())
+            .expect("磁力任务应已创建");
+        assert_eq!(t["dir"].as_str(), Some(dir.as_str()));
+        assert_eq!(
+            t["awaitingSelection"].as_bool(),
+            Some(true),
+            "磁力任务应等待文件选择"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 普通 URL 提交后弹窗关闭，任务使用设置的目录而非全局目录。
+    #[test]
+    fn submit_url_adds_with_dir_and_closes_dialog() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+        let tmp = std::env::temp_dir().join(format!("xfer-tui-test-url-{}", std::process::id()));
+        let dir = tmp.to_string_lossy().to_string();
+        app.add_task = Some(AddTaskDialog {
+            url: "http://example.com/file.bin".into(),
+            dir: dir.clone(),
+            field: AddField::Dir,
+            stage: AddStage::Input,
+        });
+        let d = app.add_task.clone().unwrap();
+        submit_add_task(&mut app, &d);
+        assert!(app.add_task.is_none(), "URL 添加成功后弹窗应关闭");
+        let tasks = app.mgr.list_native("all", 0, -1, None);
+        let t = tasks
+            .as_array()
+            .and_then(|a| a.first())
+            .expect("任务应已创建");
+        assert_eq!(t["dir"].as_str(), Some(dir.as_str()));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
