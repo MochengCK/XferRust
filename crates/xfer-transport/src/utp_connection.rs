@@ -684,7 +684,9 @@ impl UtpConnection {
 
         self.consecutive_timeouts += 1;
         self.timeout = (self.timeout * 2).min(RTO_MAX);
-        if self.consecutive_timeouts >= 2 {
+        // 旧阈值 2（仅一次重传机会）在丢包突发链路上频繁夭折；
+        // 提高到 5 给高损失链路足够重传机会（对齐 libtorrent 量级）。
+        if self.consecutive_timeouts >= 5 {
             self.error = true;
             self.state = UtpState::Closed;
             return;

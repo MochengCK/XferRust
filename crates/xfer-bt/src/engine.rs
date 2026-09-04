@@ -178,6 +178,9 @@ const PEX_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_DISCONNECTED_PEERS: usize = 32;
 /// Allowed Fast Set 大小。
 const ALLOWED_FAST_SET_SIZE: usize = 10;
+/// 同一地址连续拨号/会话失败的重试上限——超过后不再回填 pending，
+/// 等 tracker/PEX/DHT 重新发现该地址时清零计数。
+const MAX_DIAL_RETRIES: u32 = 3;
 
 // ---- ut_metadata（BEP 9） ----
 /// 本端为 ut_metadata 分配的扩展消息 ID（BEP 10 扩展握手 "m" 字典）。
@@ -186,6 +189,9 @@ const UT_METADATA_EXT_ID: u8 = 2;
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
 /// 磁力链接获取元数据的整体超时。
 const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
+/// 元数据 total_size 上限（主流客户端元数据普遍 < 1MB，
+/// 4MB 覆盖极端多文件种子的 info 字典；恶意声明更大会被直接拒绝）。
+const MAX_METADATA_SIZE: usize = 4 * 1024 * 1024;
 /// 磁力元数据获取阶段的 announce 补充间隔（秒）。
 const METADATA_ANNOUNCE_INTERVAL: u64 = 5;
 /// 元数据分片流水线深度：一次向同一 peer 在途请求多个分片（BEP 9 允许）。
@@ -213,6 +219,14 @@ impl MetadataAccum {
     fn piece_count(&self) -> Option<usize> {
         self.expected_size
             .map(|sz| sz.div_ceil(METADATA_PIECE_SIZE))
+    }
+
+    /// 清空累积器（解析失败 / info_hash 不匹配 / total_size 冲突时），
+    /// 防止残留分片毒化后续会话的重新收集。
+    fn reset(&mut self) {
+        self.pieces.clear();
+        self.expected_size = None;
+        self.requested.clear();
     }
 
     /// 完整收集后拼接并返回元数据原始字节。
@@ -250,6 +264,21 @@ fn ut_metadata_request(peer_meta_id: u8, piece: usize) -> Vec<u8> {
         payload: encode(&Value::Dict(d)),
     }
     .encode()
+}
+
+/// 判断 ut_metadata payload 是否为 REQUEST（BEP 9 msg_type=0）。
+/// 元数据交换阶段收到 REQUEST 走 REJECT 回复而非报错断开。
+fn payload_is_metadata_request(payload: &[u8]) -> bool {
+    xfer_bencode::decode_prefix(payload)
+        .ok()
+        .and_then(|(v, _)| {
+            v.as_dict().and_then(|d| {
+                d.get(b"msg_type".as_slice())
+                    .and_then(xfer_bencode::Value::as_int)
+                    .map(|t| t == UT_METADATA_REQUEST)
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// 加密模式（PE/MSE 策略，对应 aria2 bt-force-encryption 语义扩展为三档）。
@@ -493,8 +522,9 @@ pub struct PeerState {
     pub flooding_check_at: Instant,
     /// 最近一次发送 keep-alive 的时间。
     pub last_keepalive: Instant,
-    /// 最近一次执行 choking 决策的时间。
-    pub last_choke_round: Instant,
+    /// 最近一次被本端 unchoke 的时间（做种模式上传轮转的排序依据——
+    /// 全员速率为 0 时按「最久未服务优先」选出常规 unchoke 集合）。
+    pub last_unchoke: Instant,
     /// chokingRequired：choking 算法标记此 peer 应被 choke。
     pub choking_required: bool,
     /// optUnchoking：此 peer 被乐观 unchoke 选中。
@@ -526,6 +556,24 @@ impl PeerSource {
             PeerSource::Incoming => "incoming",
         }
     }
+}
+
+/// 乐观 unchoke 引擎级状态。
+#[derive(Debug, Clone, Copy)]
+struct OptimisticUnchoke {
+    addr: SocketAddr,
+    /// 选中时所处的 10s 窗口序号。每逢 `窗口 % 3 == 0` 且序号不同即重掷，
+    /// lucky peer 保持 unchoke 约 30s（3 轮）后回收轮换。
+    window: u64,
+}
+
+/// 出站拨号结果（失败地址回填 pending 重试语义）。
+enum DialOutcome {
+    /// 拨号失败（uTP+TCP 均未建立会话）或会话因错误中断——
+    /// 引擎未停机且未主动淘汰时回填 pending 重试。
+    Failed,
+    /// 会话正常结束（含引擎停机 / 引擎主动淘汰）——不重试。
+    Done,
 }
 
 /// 对端公开信息（RPC getPeers 用）。
@@ -609,6 +657,12 @@ pub struct TorrentProgress {
     pub total: u64,
 }
 
+/// 限速桶容量下限：桶容量 = max(rate, 该值)。
+/// 块大小固定 16 KiB（下载）/ 请求上限 64 KiB（上传）；若桶容量 = rate，
+/// 当 rate < 块长时 `try_consume(块长)` 永远凑不齐令牌 → 限速循环死循环
+/// （容量至少能装下一个最大块）。
+const RATE_LIMITER_MIN_BURST: u64 = 64 * 1024;
+
 /// 令牌桶限速器。
 struct RateLimiter {
     /// 每秒令牌数（bytes/s）。
@@ -626,6 +680,11 @@ impl RateLimiter {
             tokens: rate,
             last_refill: Instant::now(),
         }
+    }
+
+    /// 桶容量：保证不小于最大块长，否则低速率下永远无法消费整块。
+    fn capacity(&self) -> u64 {
+        self.rate.max(RATE_LIMITER_MIN_BURST)
     }
 
     /// 尝试消费 `n` 字节；若不足则返回需要等待的时间。
@@ -656,7 +715,7 @@ impl RateLimiter {
             return;
         }
         let new_tokens = (self.rate as u128 * elapsed.as_millis()) / 1000;
-        self.tokens = (self.tokens + new_tokens as u64).min(self.rate);
+        self.tokens = (self.tokens + new_tokens as u64).min(self.capacity());
         self.last_refill = now;
     }
 
@@ -664,7 +723,7 @@ impl RateLimiter {
     fn set_rate(&mut self, rate: u64) {
         self.refill();
         self.rate = rate;
-        self.tokens = self.tokens.min(rate.max(1));
+        self.tokens = self.tokens.min(self.capacity().max(1));
     }
 }
 
@@ -708,8 +767,17 @@ pub struct TorrentEngine {
     cold_start_done: AtomicBool,
     /// BT 智能调度器（按吞吐边际收益动态调整目标连接数）。
     scheduler: Mutex<PeerScheduler>,
-    /// Choking 算法轮次计数（0-2，每 3 轮执行一次乐观 unchoke）。
-    choke_round: Mutex<u32>,
+    /// choking 决策纪元（轮次由墙钟推导 `(elapsed/10s)%3`，所有会话在
+    /// 同一 10s 窗口内看到一致的轮次——原先的全局计数器会被每个 peer 的
+    /// 10s tick 各推一次（50 peer = 每 10s 推 50 次），乐观 unchoke 节奏失真）。
+    choke_epoch: Instant,
+    /// 乐观 unchoke 当前选中项（引擎级共享状态。lucky peer 自己的 tick
+    /// 算出的 unchoke_set 必然包含自己 → 由其会话真正发出 Unchoke——原先
+    /// 只写 `opt_unchoking` 标志却无任何代码读取，乐观 unchoke 名存实亡）。
+    optimistic_unchoke: Mutex<Option<OptimisticUnchoke>>,
+    /// 出站拨号失败/会话异常中断计数（失败地址回填 pending 重试，
+    /// 超过次数放弃，等 tracker/PEX 重新发现时清零）。
+    dial_failures: Mutex<HashMap<SocketAddr, u32>>,
     /// 本会话已断开 peer 的最后快照（getPeers 的 disconnected 分组），
     /// 上限 [`MAX_DISCONNECTED_PEERS`]，超出淘汰最旧。
     disconnected_peers: Mutex<Vec<PeerInfo>>,
@@ -819,7 +887,9 @@ impl TorrentEngine {
             uploaded_bytes: AtomicU64::new(0),
             cold_start_done: AtomicBool::new(false),
             scheduler: Mutex::new(PeerScheduler::new(sched_cfg)),
-            choke_round: Mutex::new(0),
+            choke_epoch: Instant::now(),
+            optimistic_unchoke: Mutex::new(None),
+            dial_failures: Mutex::new(HashMap::new()),
             disconnected_peers: Mutex::new(Vec::new()),
             last_resume_save: Mutex::new(Instant::now() - Duration::from_secs(60)),
             shutdown: CancellationToken::new(),
@@ -870,7 +940,9 @@ impl TorrentEngine {
             uploaded_bytes: AtomicU64::new(0),
             cold_start_done: AtomicBool::new(false),
             scheduler: Mutex::new(PeerScheduler::new(sched_cfg)),
-            choke_round: Mutex::new(0),
+            choke_epoch: Instant::now(),
+            optimistic_unchoke: Mutex::new(None),
+            dial_failures: Mutex::new(HashMap::new()),
             disconnected_peers: Mutex::new(Vec::new()),
             last_resume_save: Mutex::new(Instant::now() - Duration::from_secs(60)),
             shutdown: CancellationToken::new(),
@@ -1245,8 +1317,12 @@ impl TorrentEngine {
             let e3 = self.clone();
             spawned += 1;
             tokio::spawn(async move {
-                e2.dial_and_run(addr, cell.clone()).await;
-                e3.unregister_peer(&addr, cell);
+                let outcome = e2.dial_and_run(addr, cell.clone()).await;
+                e3.unregister_peer(&addr, cell.clone());
+                // 失败地址回填 pending 重试（引擎主动淘汰不重试）
+                if matches!(outcome, DialOutcome::Failed) && !cell.kill.is_cancelled() {
+                    e3.retry_later(addr, cell.source);
+                }
             });
         }
         tracing::info!(spawned, "冷启动突发连接已派发");
@@ -1300,12 +1376,15 @@ impl TorrentEngine {
             let port = self.actual_listen_port.load(Ordering::Relaxed);
             let numwant = self.config.numwant;
             let event_owned = event.map(|s| s.to_string());
+            // 引擎统计了 uploaded_bytes 却上报 0 —— 私有 tracker 的
+            // 分享率恒为 0 可能被判作弊封号
+            let uploaded_now = self.uploaded_bytes.load(Ordering::Relaxed);
             join_set.spawn(async move {
                 let req = AnnounceRequest {
                     info_hash: &info_hash,
                     peer_id: &peer_id,
                     port,
-                    uploaded: 0,
+                    uploaded: uploaded_now,
                     downloaded: done,
                     left,
                     event: event_owned.as_deref(),
@@ -1334,6 +1413,7 @@ impl TorrentEngine {
             let peer_id = self.peer_id;
             let port = self.actual_listen_port.load(Ordering::Relaxed);
             let numwant = self.config.numwant;
+            let uploaded_now = self.uploaded_bytes.load(Ordering::Relaxed);
             let udp_event = match event {
                 Some("started") => xfer_discovery::udp_tracker::UdpEvent::Started,
                 Some("completed") => xfer_discovery::udp_tracker::UdpEvent::Completed,
@@ -1351,7 +1431,7 @@ impl TorrentEngine {
                     info_hash,
                     peer_id,
                     port,
-                    uploaded: 0,
+                    uploaded: uploaded_now,
                     downloaded: done,
                     left,
                     event: udp_event,
@@ -1478,6 +1558,8 @@ impl TorrentEngine {
         let port = self.actual_listen_port.load(Ordering::Relaxed);
         let done = self.done_bytes.load(Ordering::Relaxed);
         let total = self.total_bytes.load(Ordering::Relaxed);
+        // 分享率统计必须包含上传量
+        let uploaded = self.uploaded_bytes.load(Ordering::Relaxed);
         let urls: Vec<String> = {
             let dyn_list = self.dynamic_announces.lock().unwrap();
             self.config
@@ -1487,19 +1569,56 @@ impl TorrentEngine {
                 .cloned()
                 .collect()
         };
+        // 原先只拼 HTTP 列表，UDP tracker 收不到 stopped/completed
+        // ——部分 tracker 记 incomplete 不释放。与 announce_all 相同的分流逻辑。
+        let udp_urls: Vec<String> = {
+            let dyn_list = self.dynamic_announces.lock().unwrap();
+            self.config
+                .udp_announce_urls
+                .iter()
+                .chain(dyn_list.udp.iter())
+                .cloned()
+                .collect()
+        };
+        let udp_event = match event {
+            Some("started") => xfer_discovery::udp_tracker::UdpEvent::Started,
+            Some("completed") => xfer_discovery::udp_tracker::UdpEvent::Completed,
+            Some("stopped") => xfer_discovery::udp_tracker::UdpEvent::Stopped,
+            _ => xfer_discovery::udp_tracker::UdpEvent::None,
+        };
         tokio::spawn(async move {
             for url in urls {
                 let req = AnnounceRequest {
                     info_hash: &info_hash,
                     peer_id: &peer_id,
                     port,
-                    uploaded: 0,
+                    uploaded,
                     downloaded: done,
                     left: total.saturating_sub(done),
                     event,
                     numwant: 0,
                 };
                 let _ = announce(&client, &url, &req).await;
+            }
+            // UDP tracker（fire-and-forget，尽力通知）
+            for url in udp_urls {
+                let Some(addr) = resolve_udp_tracker_url(&url).await else {
+                    continue;
+                };
+                let Ok(mut tracker) = UdpTracker::new().await else {
+                    continue;
+                };
+                let req = xfer_discovery::udp_tracker::UdpAnnounceRequest {
+                    info_hash,
+                    peer_id,
+                    port,
+                    uploaded,
+                    downloaded: done,
+                    left: total.saturating_sub(done),
+                    event: udp_event,
+                    numwant: 0,
+                };
+                let _ = tracker.announce(addr, &req).await;
             }
         });
     }
@@ -1511,24 +1630,36 @@ impl TorrentEngine {
     /// 空 have 位图，永远无法贡献数据却占用连接槽，还会被调度器当成
     /// "慢节点"引发误判换血。
     async fn add_peers(&self, addrs: Vec<SocketAddr>, source: PeerSource) {
-        let mut pending = self.pending.lock().unwrap();
-        for a in addrs {
-            // 过滤不可路由地址与 0 端口（部分 tracker 会返回，永远连不通）。
-            // 回环地址保留：本机可能有 seed（本地测试/同机部署），
-            // 自连回声由下面的监听端口检查兜底。
-            if is_unroutable(&a) || a.port() == 0 {
-                continue;
+        let mut fresh: Vec<SocketAddr> = Vec::new();
+        {
+            let mut pending = self.pending.lock().unwrap();
+            for a in addrs {
+                // 过滤不可路由地址与 0 端口（部分 tracker 会返回，永远连不通）。
+                // 回环地址保留：本机可能有 seed（本地测试/同机部署），
+                // 自连回声由下面的监听端口检查兜底。
+                if is_unroutable(&a) || a.port() == 0 {
+                    continue;
+                }
+                if a.port() == self.actual_listen_port.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if pending.len() >= self.config.max_peers * 2 {
+                    break;
+                }
+                if pending.contains_key(&a) || self.peers.read().unwrap().contains_key(&a) {
+                    continue;
+                }
+                pending.insert(a, source);
+                fresh.push(a);
             }
-            if a.port() == self.actual_listen_port.load(Ordering::Relaxed) {
-                continue;
+        }
+        // 重新发现 = 新的重试预算（清零失败计数；注意 dial_failures 与
+        // pending 不嵌套持锁，与 retry_later 的加锁顺序一致避免 AB-BA）
+        if !fresh.is_empty() {
+            let mut fails = self.dial_failures.lock().unwrap();
+            for a in fresh {
+                fails.remove(&a);
             }
-            if pending.len() >= self.config.max_peers * 2 {
-                break;
-            }
-            if pending.contains_key(&a) || self.peers.read().unwrap().contains_key(&a) {
-                continue;
-            }
-            pending.insert(a, source);
         }
     }
 
@@ -1578,8 +1709,12 @@ impl TorrentEngine {
             let e2 = self.clone();
             let e3 = self.clone();
             tokio::spawn(async move {
-                e2.dial_and_run(addr, cell.clone()).await;
-                e3.unregister_peer(&addr, cell);
+                let outcome = e2.dial_and_run(addr, cell.clone()).await;
+                e3.unregister_peer(&addr, cell.clone());
+                // 失败地址回填 pending 重试（引擎主动淘汰不重试）
+                if matches!(outcome, DialOutcome::Failed) && !cell.kill.is_cancelled() {
+                    e3.retry_later(addr, cell.source);
+                }
             });
         }
     }
@@ -1626,7 +1761,7 @@ impl TorrentEngine {
                 keepalive_count: 0,
                 flooding_check_at: now,
                 last_keepalive: now,
-                last_choke_round: now,
+                last_unchoke: now,
                 choking_required: true,
                 opt_unchoking: false,
                 client_version: None,
@@ -1997,6 +2132,9 @@ impl TorrentEngine {
         } else {
             None
         };
+        // seed_duration 之前被完全忽略（`let _ = dur;`），任务只能
+        // 靠外部 cancel 停止——与文档「seed 模式持续时间（秒，0 = 永久）」不符
+        let started_at = Instant::now();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -2027,11 +2165,17 @@ impl TorrentEngine {
                     // 主动连接待连接队列中的 peer
                     self.connect_pending_seed().await;
                     self.prune_dead_peers();
-                    // 检查 seed 超时
+                    // 检查 seed 超时：到时正常退出（stopped announce 由
+                    // 调用方 stop_background 前后的收尾路径处理）
                     if let Some(dur) = seed_duration {
-                        // 简化：无独立计时器，靠 tick 间接控制
-                        // 实际超时由外部 cancel 控制
-                        let _ = dur;
+                        if started_at.elapsed() >= dur {
+                            tracing::info!(
+                                secs = self.config.seed_duration,
+                                "seed 时长已到，正常退出做种"
+                            );
+                            self.announce_all_sync(Some("stopped"));
+                            return Ok(());
+                        }
                     }
                 }
             }
@@ -2063,8 +2207,12 @@ impl TorrentEngine {
             let e2 = self.clone();
             let e3 = self.clone();
             tokio::spawn(async move {
-                e2.dial_and_run(addr, cell.clone()).await;
-                e3.unregister_peer(&addr, cell);
+                let outcome = e2.dial_and_run(addr, cell.clone()).await;
+                e3.unregister_peer(&addr, cell.clone());
+                // 失败地址回填 pending 重试（引擎主动淘汰不重试）
+                if matches!(outcome, DialOutcome::Failed) && !cell.kill.is_cancelled() {
+                    e3.retry_later(addr, cell.source);
+                }
             });
         }
     }
@@ -2076,7 +2224,11 @@ impl TorrentEngine {
     /// 按协议模式拨号并运行会话：uTP 优先（握手等待 [`UTP_DIAL_TIMEOUT`]），
     /// 失败/超时回退 TCP；`TcpOnly` 直连 TCP，`UtpOnly` 仅 uTP。
     /// 内联 await `run_peer`，调用方在返回后再 `unregister_peer`。
-    async fn dial_and_run(self: &Arc<Self>, addr: SocketAddr, cell: Arc<PeerCell>) {
+    ///
+    /// 返回 [`DialOutcome`]：调用方据此决定是否把地址回填 pending 重试
+    /// （uTP 会话夭折/拨号失败后原先要等下一轮 announce/PEX——
+    /// interval 可能 30 分钟——才有重试机会）。
+    async fn dial_and_run(self: &Arc<Self>, addr: SocketAddr, cell: Arc<PeerCell>) -> DialOutcome {
         let proto = self.bt_protocol();
         // 磁力冷启动：元数据未就绪时优先 TCP —— uTP 探测（最多 2s）对
         // metadata 交换无增益，反而让每个不支持 uTP 的对端白等一轮；
@@ -2093,9 +2245,14 @@ impl TorrentEngine {
                                 self.clone().run_peer(addr, stream, true, Some(cell)).await
                             {
                                 tracing::debug!(peer = %addr, error = %err, "uTP 出站连接结束");
+                                // 会话错误中断（非停机）→ 可重试；调用方会再
+                                // 过滤 kill（引擎主动淘汰）的情况
+                                return DialOutcome::Failed;
                             }
+                            self.dial_failures.lock().unwrap().remove(&addr);
+                            return DialOutcome::Done;
                         }
-                        return;
+                        return DialOutcome::Done;
                     }
                     Err(err) => {
                         tracing::debug!(peer = %addr, error = %err, "uTP 拨号失败，回退 TCP");
@@ -2110,20 +2267,53 @@ impl TorrentEngine {
                     if !self.shutdown.is_cancelled() {
                         if let Err(err) = self.clone().run_peer(addr, stream, true, Some(cell)).await {
                             tracing::debug!(peer = %addr, error = %err, "TCP 出站连接结束");
+                            return DialOutcome::Failed;
                         }
+                        self.dial_failures.lock().unwrap().remove(&addr);
+                        return DialOutcome::Done;
                     }
+                    return DialOutcome::Done;
                 }
                 Ok(Err(err)) => tracing::debug!(peer = %addr, error = %err, "TCP 拨号失败"),
                 Err(_) => tracing::debug!(peer = %addr, "TCP 拨号超时({:?})", CONNECT_TIMEOUT),
             }
         }
+        DialOutcome::Failed
+    }
+
+    /// 会话失败后的地址回填——计入失败次数并塞回 pending，
+    /// 给地址有限次数的重试机会（超过即放弃，等 tracker/PEX 重新发现，
+    /// 重新发现会清零计数）。引擎停机或主动淘汰（kill）不回填。
+    fn retry_later(self: &Arc<Self>, addr: SocketAddr, source: PeerSource) {
+        if self.shutdown.is_cancelled() {
+            return;
+        }
+        let attempts = {
+            let mut fails = self.dial_failures.lock().unwrap();
+            let e = fails.entry(addr).or_insert(0);
+            *e += 1;
+            *e
+        };
+        if attempts > MAX_DIAL_RETRIES {
+            tracing::debug!(peer = %addr, attempts, "连续失败放弃重试，等待重新发现");
+            return;
+        }
+        let mut pending = self.pending.lock().unwrap();
+        if pending.len() < self.config.max_peers * 2
+            && !pending.contains_key(&addr)
+            && !self.peers.read().unwrap().contains_key(&addr)
+        {
+            pending.insert(addr, source);
+        }
     }
 
     /// 运行一个 peer 会话（主动或被动）。
-    /// M6：MSE 加密流完整集成 — 握手成功后后续所有 I/O 走 EncryptedStream。
     ///
-    /// `existing_cell`：主动连接时调用方已先 register_peer，此处复用避免双重注册；
-    /// 被动连接时为 None，由本方法注册。
+    /// 收尾纪律：
+    /// - 主动连接：调用方先 `register_peer` 并在返回后负责 `unregister_peer`；
+    /// - 被动连接：本方法在此注册，会话结束（含握手早退）后**必须**注销，
+    ///   否则死 peer 残留 peers 表 + 占用的片留在全局 assigned 集合，
+    ///   其他 peer 拿不到这些片，最长停滞 PEER_IDLE_TIMEOUT。
     async fn run_peer<S>(
         self: Arc<Self>,
         addr: SocketAddr,
@@ -2139,7 +2329,43 @@ impl TorrentEngine {
             + Send
             + 'static,
     {
-        let cell = existing_cell.unwrap_or_else(|| self.register_peer(addr, PeerSource::Incoming));
+        match existing_cell {
+            // 主动连接：cell 由调用方持有，收尾也由调用方执行
+            Some(cell) => {
+                self.run_peer_inner(addr, stream, we_initiate, cell)
+                    .await
+            }
+            // 被动连接：自注册 + 会话结束后自注销（与出站路径对称的收尾）
+            None => {
+                let cell = self.register_peer(addr, PeerSource::Incoming);
+                let result = self
+                    .clone()
+                    .run_peer_inner(addr, stream, we_initiate, cell.clone())
+                    .await;
+                self.unregister_peer(&addr, cell);
+                result
+            }
+        }
+    }
+
+    /// M6：MSE 加密流完整集成 — 握手成功后后续所有 I/O 走 EncryptedStream。
+    ///
+    /// `cell`：会话登记项（主动连接由调用方注册，被动连接由 [`Self::run_peer`] 注册）。
+    async fn run_peer_inner<S>(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        stream: S,
+        we_initiate: bool,
+        cell: Arc<PeerCell>,
+    ) -> Result<(), String>
+    where
+        S: IntoPeerStream
+            + tokio::io::AsyncReadExt
+            + tokio::io::AsyncWriteExt
+            + Unpin
+            + Send
+            + 'static,
+    {
         *cell.transport.lock().unwrap() = S::TRANSPORT;
         let info_hash = InfoHash::from_bytes(&self.info_hash);
         let our_id = self.peer_id;
@@ -2680,7 +2906,14 @@ impl TorrentEngine {
                         }
                         // ---- Extension Protocol (BEP 10) ----
                         Message::Extended { ext_id, payload } => {
-                            self.handle_extension_message(ext_id, &payload, &ctx.cell);
+                            if ext_id == UT_METADATA_EXT_ID {
+                                // 服务对端 ut_metadata 请求（我方在扩展握手中
+                                // 广告了 ut_metadata=2 却从不响应 = 蜂群"坏公民"）
+                                self.serve_ut_metadata(stream, &payload, &ctx.cell)
+                                    .await?;
+                            } else {
+                                self.handle_extension_message(ext_id, &payload, &ctx.cell);
+                            }
                         }
                         Message::Choke => {
                             {
@@ -3083,6 +3316,15 @@ impl TorrentEngine {
                 // 数据（而非对端自己广告的 id——此前误用 peer_meta_id 匹配，
                 // 仅当双方恰好都分配 2 时才能收到数据，属「双方都错」侥幸通过）。
                 Message::Extended { ext_id, payload } if ext_id == UT_METADATA_EXT_ID => {
+                    // 对端也可能向我们发 REQUEST（元数据交换阶段我方必然
+                    // 还没有元数据）—— 回 REJECT 并继续等待，不再报错断开
+                    // 会话（旧实现"非 data 消息"→ Err → 整条连接报废）。
+                    if payload_is_metadata_request(&payload) {
+                        let _ = self
+                            .serve_ut_metadata(peer_stream, &payload, cell)
+                            .await;
+                        continue;
+                    }
                     match self.handle_metadata_payload(&payload) {
                         Ok(()) => {
                             if self.has_metadata() {
@@ -3229,6 +3471,14 @@ impl TorrentEngine {
     /// 处理收到的 ut_metadata data 消息（BEP 9 msg_type=1）。
     ///
     /// 分片收集完整后拼接 → 解析 info 字典 → [`Self::install_metadata`]。
+    ///
+    /// 
+    /// - `total_size` 上限 [`MAX_METADATA_SIZE`]，且所有分片必须一致，
+    ///   不一致即清空累积器重新收集（防止假 total_size 撑爆内存/毒化拼接）；
+    /// - piece 索引必须 `< piece_count`（防任意大索引塞 BTreeMap）；
+    /// - `parse_info_bytes` / info_hash 校验失败时**清空整个累积器** ——
+    ///   否则分片残留，此后每个新会话补齐任意一片就再次 assemble →
+    ///   再次失败 → 磁力任务在超时前永久无法拿到真元数据。
     fn handle_metadata_payload(&self, payload: &[u8]) -> Result<(), String> {
         use xfer_bencode::{decode_prefix, Value};
         let (v, consumed) =
@@ -3251,7 +3501,10 @@ impl TorrentEngine {
             return Err("对端拒绝提供元数据".into());
         }
         if msg_type != UT_METADATA_DATA {
-            return Err("非 data 消息".into());
+            // 元数据交换阶段对端可能发来 REQUEST（我们还没有元数据），
+            // 旧实现在此报错断开会话；非 data 消息一律忽略（REJECT 由
+            // run_metadata_exchange 显式回复）。
+            return Ok(());
         }
         let piece = dict
             .get(b"piece".as_slice())
@@ -3261,20 +3514,160 @@ impl TorrentEngine {
             .get(b"total_size".as_slice())
             .and_then(Value::as_int)
             .ok_or_else(|| "缺少 total_size".to_string())? as usize;
+        // total_size 上限校验（恶意 peer 可声明 16MB 撑爆 with_capacity）
+        if total_size == 0 || total_size > MAX_METADATA_SIZE {
+            return Err(format!("元数据总大小非法: {total_size}"));
+        }
         let info_bytes = &payload[consumed..];
         if info_bytes.is_empty() {
             return Err("空元数据分片".into());
         }
+        let piece_count = total_size.div_ceil(METADATA_PIECE_SIZE);
+        // piece 索引无界校验
+        if piece >= piece_count {
+            return Err(format!("元数据分片索引越界: {piece} >= {piece_count}"));
+        }
+        // 分片长度必须与 piece 位置一致（最后一片除外）——
+        // 短分片会在 assemble 时拼出小于 expected_size 的数据
+        let expected_len = METADATA_PIECE_SIZE.min(total_size - piece * METADATA_PIECE_SIZE);
+        if info_bytes.len() != expected_len {
+            return Err(format!(
+                "元数据分片长度错误: {} != {expected_len}",
+                info_bytes.len()
+            ));
+        }
         {
             let mut md = self.metadata.lock().unwrap();
-            md.expected_size = Some(total_size);
+            // 所有分片的 total_size 必须一致，不一致说明 peer 声明冲突
+            // （可能被投毒）—— 清空重置，从声明一致的 peer 重新收集
+            if md.expected_size != Some(total_size) {
+                md.expected_size = Some(total_size);
+                md.pieces.clear();
+                md.requested.clear();
+            }
             md.pieces.insert(piece, info_bytes.to_vec());
             if let Some(assembled) = md.assemble() {
                 drop(md);
-                let meta = xfer_bencode::parse_info_bytes(&assembled)
-                    .map_err(|e| format!("元数据解析失败: {e}"))?;
+                let meta = match xfer_bencode::parse_info_bytes(&assembled) {
+                    Ok(m) => m,
+                    // 解析失败必须清空累积器，否则残留分片毒化后续会话
+                    Err(e) => {
+                        self.metadata.lock().unwrap().reset();
+                        return Err(format!("元数据解析失败: {e}"));
+                    }
+                };
+                // info_hash 不匹配（拼出的是别的内容）同样清空
+                if meta.info_hash != self.info_hash {
+                    self.metadata.lock().unwrap().reset();
+                    return Err("元数据 info_hash 不匹配".into());
+                }
                 self.install_metadata(meta)?;
                 return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// 服务对端的 ut_metadata 请求（BEP 9 服务端语义）。
+    ///
+    /// 我方在扩展握手中声明 `ut_metadata=2`，对端（尤其磁力用户）可能向我们
+    /// 请求元数据。store 就绪时按 16 KiB 分片回 DATA（携带 info 字典原始字节，
+    /// [`TorrentMeta::raw_info`]）；未就绪或索引越界回 REJECT。
+    /// 回复必须使用**对端**广告的 ut_metadata ext_id（BEP 10 语义）。
+    async fn serve_ut_metadata(
+        &self,
+        stream: &mut PeerStream,
+        payload: &[u8],
+        cell: &Arc<PeerCell>,
+    ) -> Result<(), String> {
+        use std::collections::BTreeMap;
+        use xfer_bencode::{decode_prefix, encode, Value};
+
+        let reply_ext_id = cell.state.lock().unwrap().ut_metadata_id;
+        if reply_ext_id == 0 {
+            // 对端未在扩展握手中声明 ut_metadata：无法构造它能识别的回复
+            return Ok(());
+        }
+
+        let v = match decode_prefix(payload) {
+            Ok((v, _)) => v,
+            Err(_) => return Ok(()),
+        };
+        let dict = match v.as_dict() {
+            Some(d) => d,
+            None => return Ok(()),
+        };
+        let msg_type = dict
+            .get(b"msg_type".as_slice())
+            .and_then(Value::as_int)
+            .unwrap_or(-1);
+        // 只处理 REQUEST；data/reject 属客户端路径，不在此响应
+        if msg_type != UT_METADATA_REQUEST {
+            return Ok(());
+        }
+        let piece = match dict.get(b"piece".as_slice()).and_then(Value::as_int) {
+            Some(p) if p >= 0 => p as usize,
+            _ => return Ok(()),
+        };
+
+        let mut d = BTreeMap::new();
+        let info = self
+            .meta
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.raw_info.clone());
+        match info {
+            Some(info) => {
+                let count = info.len().div_ceil(METADATA_PIECE_SIZE);
+                if piece < count {
+                    let start = piece * METADATA_PIECE_SIZE;
+                    let end = (start + METADATA_PIECE_SIZE).min(info.len());
+                    d.insert(b"msg_type".to_vec(), Value::Int(UT_METADATA_DATA));
+                    d.insert(b"piece".to_vec(), Value::Int(piece as i64));
+                    d.insert(b"total_size".to_vec(), Value::Int(info.len() as i64));
+                    let mut body = encode(&Value::Dict(d));
+                    body.extend_from_slice(&info[start..end]);
+                    stream
+                        .write_all(
+                            &Message::Extended {
+                                ext_id: reply_ext_id,
+                                payload: body,
+                            }
+                            .encode(),
+                        )
+                        .await
+                        .map_err(|e| format!("metadata DATA 发送失败: {e}"))?;
+                } else {
+                    // 索引越界：REJECT
+                    d.insert(b"msg_type".to_vec(), Value::Int(UT_METADATA_REJECT));
+                    d.insert(b"piece".to_vec(), Value::Int(piece as i64));
+                    stream
+                        .write_all(
+                            &Message::Extended {
+                                ext_id: reply_ext_id,
+                                payload: encode(&Value::Dict(d)),
+                            }
+                            .encode(),
+                        )
+                        .await
+                        .map_err(|e| format!("metadata REJECT 发送失败: {e}"))?;
+                }
+            }
+            None => {
+                // 元数据未就绪（磁力模式自身还在收集）：REJECT
+                d.insert(b"msg_type".to_vec(), Value::Int(UT_METADATA_REJECT));
+                d.insert(b"piece".to_vec(), Value::Int(piece as i64));
+                stream
+                    .write_all(
+                        &Message::Extended {
+                            ext_id: reply_ext_id,
+                            payload: encode(&Value::Dict(d)),
+                        }
+                        .encode(),
+                    )
+                    .await
+                    .map_err(|e| format!("metadata REJECT 发送失败: {e}"))?;
             }
         }
         Ok(())
@@ -3386,42 +3779,57 @@ impl TorrentEngine {
 
     /// Choking 算法决策（BEP 3 Choking Algorithm）。
     ///
-    /// - Leecher 模式：每 10s 排序 peer 按下载速率，unchoke 前 3 + 1 个乐观 unchoke
-    /// - Seeder 模式：按上传速率/最近 unchoke 时间排序
+    /// 每 peer 会话在自己的 10s tick 里调用，但决策所需的全局状态
+    /// （轮次、乐观 unchoke 选中项）由墙钟 + 引擎级共享字段推导，
+    /// 因此所有会话在同一窗口内得出一致的全局视角：
+    /// - Leecher 模式：按下载速率 unchoke 前 3 + 1 个乐观 unchoke
+    /// - Seeder 模式（全员速率为 0）：按「最久未服务优先」轮转
+    ///
+    /// 修复要点：① 轮次不再由 per-peer tick 推进全局计数器（50 peer =
+    /// 每 10s 推 50 次，「每 3 轮一次乐观 unchoke」完全失真）；② 乐观
+    /// unchoke 选中项改为引擎级共享状态，lucky peer 自己的 tick 必然
+    /// 把自己算进 unchoke_set → 真正发出 Unchoke（原先只写标志无人读）；
+    /// ③ 做种时全员速率 0，按速率排序退化为 HashMap 迭代序随机选——
+    /// 改为 last_unchoke 升序轮转。
     async fn decide_choking(
         self: &Arc<Self>,
         stream: &mut PeerStream,
         cell: &Arc<PeerCell>,
     ) -> Result<(), String> {
-        // 全局 choking 轮次
-        let round = {
-            let mut r = self.choke_round.lock().unwrap();
-            let current = *r;
-            *r = if current >= 2 { 0 } else { current + 1 };
-            current
-        };
+        // 全局 choking 轮次：由墙钟推导，全局一致（0/1/2 循环，窗口 10s）
+        let window = Instant::now().duration_since(self.choke_epoch).as_secs() / 10;
+        let round = (window % 3) as u32;
 
-        // 收集所有活跃 peer 的速率信息
-        let mut peer_entries: Vec<(SocketAddr, u64, bool, bool)> = {
+        // 收集所有活跃 peer 的速率信息（addr, 速率, interested, we_choked, last_unchoke）
+        let mut peer_entries: Vec<(SocketAddr, u64, bool, bool, Instant)> = {
             let peers = self.peers.read().unwrap();
-            let mut entries: Vec<(SocketAddr, u64, bool, bool)> = Vec::new();
+            let mut entries: Vec<(SocketAddr, u64, bool, bool, Instant)> = Vec::new();
             for (addr, c) in peers.iter() {
                 let st = c.state.lock().unwrap();
-                entries.push((*addr, st.recent_speed, st.peer_interested, st.we_choked));
+                entries.push((
+                    *addr,
+                    st.recent_speed,
+                    st.peer_interested,
+                    st.we_choked,
+                    st.last_unchoke,
+                ));
             }
             entries
         };
 
-        // 排序：按速率降序
-        peer_entries.sort_by_key(|e| std::cmp::Reverse(e.1));
+        // 排序：有下载贡献时按速率降序；全员速率为 0（做种/冷启动）时按
+        // 「最近一次被 unchoke」升序——最久未服务的优先，上传轮转公平
+        let total_download: u64 = peer_entries.iter().map(|e| e.1).sum();
+        if total_download == 0 {
+            peer_entries.sort_by_key(|e| e.4);
+        } else {
+            peer_entries.sort_by_key(|e| std::cmp::Reverse(e.1));
+        }
 
-        // Leecher: 前 3 + 1 乐观 unchoke
-        // Seeder: 前 4 + 1 乐观 unchoke
+        // 常规 unchoke：选择排序最前的 N 个 interested peer
         let regular_unchoke_count = 3;
         let mut unchoke_set: HashSet<SocketAddr> = HashSet::new();
-
-        // 常规 unchoke：选择速率最高的 N 个 interested peer
-        for (addr, _, interested, _) in peer_entries.iter() {
+        for (addr, _, interested, _, _) in peer_entries.iter() {
             if unchoke_set.len() >= regular_unchoke_count {
                 break;
             }
@@ -3430,30 +3838,51 @@ impl TorrentEngine {
             }
         }
 
-        // 乐观 unchoke（每 3 轮执行一次）
-        if round == 0 {
-            // 从被 choke 的 interested peer 中随机选一个
-            let candidates: Vec<SocketAddr> = peer_entries
-                .iter()
-                .filter(|(addr, _, interested, we_choked)| {
-                    *interested && *we_choked && !unchoke_set.contains(addr)
-                })
-                .map(|(addr, _, _, _)| *addr)
-                .collect();
-            if !candidates.is_empty() {
-                // 使用 getrandom 生成随机索引
-                let mut rand_buf = [0u8; 4];
-                let _ = getrandom::fill(&mut rand_buf);
-                let idx = u32::from_le_bytes(rand_buf) as usize % candidates.len();
-                let lucky = candidates[idx];
-                unchoke_set.insert(lucky);
-                // 标记为乐观 unchoke
-                {
-                    let peers = self.peers.read().unwrap();
+        // 乐观 unchoke（引擎级共享状态）：每逢 round==0 的窗口重掷一次，
+        // 窗口间保持不变（lucky peer 保持 unchoke 约 30s 后回收轮换）
+        {
+            let mut opt = self.optimistic_unchoke.lock().unwrap();
+            let peers = self.peers.read().unwrap();
+            let current = opt.filter(|o| peers.contains_key(&o.addr));
+            // 重掷条件：无有效选中项，或进入新的 round==0 窗口
+            let should_roll = match current {
+                Some(o) => round == 0 && o.window != window,
+                None => true,
+            };
+            let mut entry = current;
+            if should_roll {
+                // 回收旧 lucky 的标志
+                if let Some(o) = current {
+                    if let Some(c) = peers.get(&o.addr) {
+                        c.state.lock().unwrap().opt_unchoking = false;
+                    }
+                }
+                // 从被 choke 的 interested peer 中随机选一个
+                let candidates: Vec<SocketAddr> = peer_entries
+                    .iter()
+                    .filter(|(addr, _, interested, we_choked, _)| {
+                        *interested && *we_choked && !unchoke_set.contains(addr)
+                    })
+                    .map(|(addr, _, _, _, _)| *addr)
+                    .collect();
+                entry = None;
+                if !candidates.is_empty() {
+                    let mut rand_buf = [0u8; 4];
+                    let _ = getrandom::fill(&mut rand_buf);
+                    let idx = u32::from_le_bytes(rand_buf) as usize % candidates.len();
+                    let lucky = candidates[idx];
                     if let Some(c) = peers.get(&lucky) {
                         c.state.lock().unwrap().opt_unchoking = true;
                     }
+                    entry = Some(OptimisticUnchoke {
+                        addr: lucky,
+                        window,
+                    });
                 }
+                *opt = entry;
+            }
+            if let Some(o) = entry {
+                unchoke_set.insert(o.addr);
             }
         }
 
@@ -3474,6 +3903,7 @@ impl TorrentEngine {
                 .map_err(|e| e.to_string())?;
         } else if !should_choke && current_choked {
             cell.state.lock().unwrap().we_choked = false;
+            cell.state.lock().unwrap().last_unchoke = Instant::now();
             stream
                 .write_all(&Message::Unchoke.encode())
                 .await
@@ -4401,7 +4831,7 @@ mod tests {
             keepalive_count: 0,
             flooding_check_at: now,
             last_keepalive: now,
-            last_choke_round: now,
+            last_unchoke: now,
             choking_required: true,
             opt_unchoking: false,
             client_version: None,
@@ -4530,7 +4960,7 @@ mod tests {
             keepalive_count: 0,
             flooding_check_at: now,
             last_keepalive: now,
-            last_choke_round: now,
+            last_unchoke: now,
             choking_required: false,
             opt_unchoking: false,
             client_version: None,

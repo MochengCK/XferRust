@@ -21,6 +21,11 @@ pub struct TorrentMeta {
     pub creation_date: Option<i64>,
     /// 原始 bencode 字节（会话持久化用：重启后直接重新 parse 恢复 bt_meta）。
     pub raw_bencode: Option<Vec<u8>>,
+    /// info 字典的原始编码字节。
+    ///
+    /// ut_metadata（BEP 9）服务端用：对端请求元数据时必须返回 info 字典的
+    /// **原始字节**（重新编码可能哈希错位），因此解析时保留原文。
+    pub raw_info: Option<Vec<u8>>,
 }
 
 /// info 字典解析结果。
@@ -113,6 +118,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta, String> {
         created_by,
         creation_date,
         raw_bencode: Some(bytes.to_vec()),
+        raw_info: Some(info_bytes.to_vec()),
     })
 }
 
@@ -141,17 +147,45 @@ pub fn parse_info_bytes(bytes: &[u8]) -> Result<TorrentMeta, String> {
         created_by: None,
         creation_date: None,
         raw_bencode: None,
+        raw_info: Some(bytes.to_vec()),
     })
+}
+
+/// 清洗种子内单个路径段 —— 防路径穿越写任意文件。
+///
+/// 恶意 .torrent / 磁力元数据可用 `name="../x"`、path 段 `"../.."` 把文件写到
+/// 下载目录外（`PieceStore` 用 `root.join(name)` / `base.join(path…)` 拼路径）。
+/// 采用 qBittorrent/aria2 的**替换**语义而非整体拒绝：个别段奇怪的合法种子
+/// 仍可下载，危险字节被中和——
+/// - `/` 与 `\`（路径分隔符，段内出现时中和为字面字符，无法再构造层级）；
+/// - `:`（Windows 盘符 "C:" 与 NTFS 备用数据流）；
+/// - 整段为空 / `.` / `..` / 含 NUL → 整段替换为 `_`（穿越只对整段成立）。
+fn sanitize_segment(seg: &str) -> String {
+    if seg.contains('\0') {
+        return "_".to_string();
+    }
+    let cleaned: String = seg
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' => '_',
+            _ => c,
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "_".to_string()
+    } else {
+        cleaned
+    }
 }
 
 fn parse_info(v: &Value) -> Result<Info, String> {
     let dict = v.as_dict().ok_or_else(|| "info 必须是字典".to_string())?;
-    let name = dict
-        .get(b"name.utf-8".as_slice())
-        .or_else(|| dict.get(b"name".as_slice()))
-        .and_then(Value::as_str)
-        .ok_or_else(|| "info 缺少 name".to_string())?
-        .to_string();
+    let name = sanitize_segment(
+        dict.get(b"name.utf-8".as_slice())
+            .or_else(|| dict.get(b"name".as_slice()))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "info 缺少 name".to_string())?,
+    );
     let piece_length = dict
         .get(b"piece length".as_slice())
         .and_then(Value::as_int)
@@ -221,7 +255,7 @@ fn parse_info(v: &Value) -> Result<Info, String> {
             let parts: Vec<String> = path_raw
                 .split(|&b| b == 0)
                 .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).to_string())
+                .map(|s| sanitize_segment(&String::from_utf8_lossy(s)))
                 .collect();
             if parts.is_empty() {
                 return Err("文件条目 path 为空".into());
@@ -445,5 +479,58 @@ mod tests {
         ]));
         let top = dict(BTreeMap::from([(b"info".to_vec(), info)]));
         assert!(parse_torrent(&encode(&top)).is_err());
+    }
+
+    // 路径穿越清洗 —— 恶意 name/path 段不得逃出下载目录
+    #[test]
+    fn sanitizes_path_traversal() {
+        // name 带穿越段
+        let info = dict(BTreeMap::from([
+            (b"name".to_vec(), bytes("../evil")),
+            (b"piece length".to_vec(), int(16)),
+            (b"length".to_vec(), int(40)),
+            (b"pieces".to_vec(), bytes(vec![0xAA; 20])),
+        ]));
+        let top = dict(BTreeMap::from([(b"info".to_vec(), info)]));
+        let meta = parse_torrent(&encode(&top)).unwrap();
+        // "/"" 被中和为字面字符："../evil" → ".._evil"（单段，不再含层级）
+        assert_eq!(meta.info.name, ".._evil");
+
+        // 整段就是 ".." / "." / 绝对路径
+        assert_eq!(super::sanitize_segment(".."), "_");
+        assert_eq!(super::sanitize_segment("."), "_");
+        assert_eq!(super::sanitize_segment("/etc/passwd"), "_etc_passwd");
+        // ':' 与 '\' 各替换一次
+        assert_eq!(super::sanitize_segment("C:\\Windows\\evil"), "C__Windows_evil");
+        // 反斜杠 / 冒号（Windows 盘符、备用数据流）
+        assert_eq!(super::sanitize_segment("a\\..\\..\\b"), "a_.._.._b");
+        assert_eq!(super::sanitize_segment("name:stream"), "name_stream");
+        // NUL
+        assert_eq!(super::sanitize_segment("a\0b"), "_");
+        assert_eq!(super::sanitize_segment(""), "_");
+        // 正常名不受影响
+        assert_eq!(super::sanitize_segment("Ubuntu 24.04 LTS"), "Ubuntu 24.04 LTS");
+        assert_eq!(super::sanitize_segment("a..b"), "a..b");
+
+        // 多文件种子的 path 段同样清洗
+        let files = list(vec![dict(BTreeMap::from([
+            (b"length".to_vec(), int(10)),
+            (
+                b"path".to_vec(),
+                list(vec![bytes(".."), bytes("sub"), bytes("f.bin")]),
+            ),
+        ]))]);
+        let info = dict(BTreeMap::from([
+            (b"name".to_vec(), bytes("root")),
+            (b"piece length".to_vec(), int(16)),
+            (b"pieces".to_vec(), bytes(vec![0x11; 20])),
+            (b"files".to_vec(), files),
+        ]));
+        let top = dict(BTreeMap::from([(b"info".to_vec(), info)]));
+        let meta = parse_torrent(&encode(&top)).unwrap();
+        assert_eq!(
+            meta.info.files[0].path,
+            vec!["_".to_string(), "sub".to_string(), "f.bin".to_string()]
+        );
     }
 }

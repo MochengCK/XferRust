@@ -11,7 +11,7 @@
 //! - 首次 get_peers 立即执行；
 //! - 未找到 peer 时按 5s/30s/2min 三档重试。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use sha1::{Digest, Sha1};
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use xfer_types::InfoHash;
@@ -72,6 +72,15 @@ pub struct GetPeersResult {
     pub announce_nodes: Vec<NodeEntry>,
 }
 
+/// known_peers 的 info_hash 总量上限——恶意节点对随机 info_hash 洪水
+/// announce_peer 时，无上限的 HashMap 可被撑到 GB 级。触顶按插入顺序 FIFO
+/// 淘汰（活跃下载的 info_hash 会被本端/对端继续 announce 刷新回来）。
+const MAX_KNOWN_INFOHASHES: usize = 4096;
+/// 每 info_hash 的 peer 地址上限（原有行为显式化为常量）。
+const MAX_PEERS_PER_INFOHASH: usize = 100;
+/// 接收处理任务并发上限。
+const RECV_CONCURRENCY: usize = 256;
+
 /// DHT 节点。
 pub struct Dht {
     socket: Arc<UdpSocket>,
@@ -82,6 +91,13 @@ pub struct Dht {
     token_salt: [u8; 8],
     /// 已知 peer（info_hash → SocketAddr 集合）——本端下载或被 announce 告知。
     known_peers: Arc<Mutex<HashMap<InfoHash, Vec<SocketAddr>>>>,
+    /// info_hash 的插入顺序（总量上限触顶时按 FIFO 淘汰最旧的
+    /// info_hash，防恶意 announce 洪水把 known_peers 撑爆内存）。
+    known_order: Arc<Mutex<VecDeque<InfoHash>>>,
+    /// 收包处理任务并发上限（每 datagram spawn 一个任务原本无限制，
+    /// 洪水攻击可瞬时堆出十万级任务；满载时直接丢包——UDP 无序可靠
+    /// 语义，KRPC 查询自带 tid 重试）。
+    recv_permits: Arc<Semaphore>,
     /// 路由表持久化文件。
     routing_table_file: Option<PathBuf>,
     /// 取消令牌。
@@ -118,6 +134,8 @@ impl Dht {
             table: Arc::new(RwLock::new(table)),
             token_salt: salt,
             known_peers: Arc::new(Mutex::new(HashMap::new())),
+            known_order: Arc::new(Mutex::new(VecDeque::new())),
+            recv_permits: Arc::new(Semaphore::new(RECV_CONCURRENCY)),
             routing_table_file: config.routing_table_file,
             cancel: CancellationToken::new(),
         }))
@@ -176,10 +194,18 @@ impl Dht {
                     };
                     let data = buf[..n].to_vec();
                     let dht = self.clone();
+                    // 并发上限——洪水攻击下不无限制 spawn；满载直接丢包
+                    //（UDP 无可靠语义，KRPC 查询自带 tid 重试机制）
+                    let permits = dht.recv_permits.clone();
+                    let Ok(permit) = permits.try_acquire_owned() else {
+                        tracing::debug!(from = %addr, "DHT 处理任务已满载，丢弃数据包");
+                        continue;
+                    };
                     tokio::spawn(async move {
                         if let Err(e) = dht.handle_incoming(&data, addr).await {
                             tracing::debug!(from = %addr, error = %e, "DHT 消息处理失败");
                         }
+                        drop(permit); // 任务结束归还许可
                     });
                 }
             }
@@ -278,12 +304,35 @@ impl Dht {
     /// 添加已知 peer（用于 announce_peer 与本端下载宣告）。
     async fn add_known_peer(&self, info_hash: InfoHash, addr: SocketAddr) {
         let mut map = self.known_peers.lock().await;
-        map.entry(info_hash).or_default().push(addr);
-        // 保留最多 100 个 peer
-        if let Some(v) = map.get_mut(&info_hash) {
-            if v.len() > 100 {
-                v.drain(0..(v.len() - 100));
+        // 新 info_hash 在插入前检查总量上限，触顶按插入顺序 FIFO 淘汰
+        // 最旧的（活跃下载的 hash 会被后续 announce 重新插入并刷新）。
+        if !map.contains_key(&info_hash) {
+            let mut order = self.known_order.lock().await;
+            while map.len() >= MAX_KNOWN_INFOHASHES {
+                match order.pop_front() {
+                    Some(old) => {
+                        map.remove(&old);
+                    }
+                    // 队列与 map 失步（历史遗留）：兜底删除任意一个
+                    None => {
+                        let Some(victim) = map.keys().next().copied() else {
+                            break;
+                        };
+                        map.remove(&victim);
+                    }
+                }
             }
+            order.push_back(info_hash);
+        }
+        let entry = map.entry(info_hash).or_default();
+        // 去重：同一 addr 重复 announce 不挤占配额
+        if entry.contains(&addr) {
+            return;
+        }
+        entry.push(addr);
+        // 每 info_hash 内保留最多 MAX_PEERS_PER_INFOHASH 个 peer
+        if entry.len() > MAX_PEERS_PER_INFOHASH {
+            entry.drain(0..(entry.len() - MAX_PEERS_PER_INFOHASH));
         }
     }
 

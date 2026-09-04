@@ -122,11 +122,18 @@ impl PeerScheduler {
         }
 
         // 吞吐边际收益：相对上一轮的增长率
-        let base = self.last_throughput.max(1);
+        let prev_throughput = self.last_throughput;
+        let base = prev_throughput.max(1);
         let gain = throughput as f64 / base as f64 - 1.0;
         self.last_throughput = throughput;
 
-        if gain > self.cfg.gain_ratio {
+        if throughput == 0 && prev_throughput == 0 {
+            // 0→0 是冷启动停滞（tracker/DHT 还没给出 peer，真实场景
+            // 常见），不是「下滑 100%」——按持平处理。原先走乘性缩减分支：
+            // 每 10s 目标 ×3/4，从 max_peers 一路崩到 min_peers；等 peer 出现
+            // 后每轮只 +expand_step 爬回，起速被人为拖慢约 2 分钟。
+            self.stagnant += 1;
+        } else if gain > self.cfg.gain_ratio {
             // 加连接确实带来了吞吐增长 → 继续扩张（不超过上限）
             self.stagnant = 0;
             self.target = (self.target + self.cfg.expand_step).min(self.cfg.max_peers);

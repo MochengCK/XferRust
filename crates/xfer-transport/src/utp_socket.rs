@@ -194,6 +194,11 @@ struct ConnContext {
     phase_tx: tokio::sync::watch::Sender<UtpPhase>,
     /// 最近一次已广播的阶段（避免重复 send）。
     phase: UtpPhase,
+    /// 连接 `pending_send` 满（MAX_PENDING_SEND）时 `conn.write`
+    /// 只接受部分字节，剩余数据在此排队，每个 tick 重试灌入。
+    /// 之前剩余字节被直接丢弃，而 `UtpStream::write_all` 已向调用方返回
+    /// Ok —— 上行流出现缺口 → 流损坏。
+    write_backlog: Vec<u8>,
 }
 
 impl ConnContext {
@@ -281,8 +286,18 @@ impl UtpManager {
             data_tx,
             phase_tx,
             phase: UtpPhase::Connecting,
+            write_backlog: Vec::new(),
         };
 
+        // 16-bit id 碰撞时不能静默覆盖旧连接 —— 放弃本次拨号
+        // （上层引擎会回退 TCP），而不是破坏在用会话。
+        if self.connections.contains_key(&recv_id) {
+            debug!(recv_id, "uTP 拨号连接 id 冲突，放弃（回退 TCP）");
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "uTP 连接 id 冲突",
+            ));
+        }
         self.connections.insert(recv_id, ctx);
 
         // 立即处理 tick 以编码 SYN 到 outbox
@@ -384,8 +399,15 @@ impl UtpManager {
                 data_tx,
                 phase_tx,
                 phase: UtpPhase::Connecting,
+                write_backlog: Vec::new(),
             };
 
+            // 入站 SYN 的 recv_id 与现有连接冲突时丢弃该 SYN，
+            // 不覆盖在用连接（对端重连时会换 id 重试）。
+            if self.connections.contains_key(&recv_id) {
+                debug!(recv_id, "uTP 入站 SYN 连接 id 冲突，丢弃");
+                return;
+            }
             self.connections.insert(recv_id, ctx);
 
             // 创建 UtpStream 推入 incoming 通道
@@ -406,47 +428,49 @@ impl UtpManager {
             // 路由到现有连接
             let conn_id = hdr.connection_id;
 
-            // 先处理包，再处理可读数据和关闭检查
-            let (want_read_data, is_closed) = if let Some(ctx) = self.connections.get_mut(&conn_id)
-            {
-                ctx.conn.handle_packet(data, now);
-                ctx.sync_phase();
-                let mut read_data = Vec::new();
-                while ctx.conn.want_read() {
-                    let mut buf = vec![0u8; 65536];
-                    let n = ctx.conn.read(&mut buf);
-                    if n == 0 {
-                        break;
-                    }
-                    buf.truncate(n);
-                    read_data.push(buf);
+            // 路由命中后必须校验源地址 —— 不比对 src 时任意主机
+            // 伪造匹配 id 的包即可注入数据/伪造 ACK，破坏在用连接的窗口。
+            if let Some(ctx) = self.connections.get(&conn_id) {
+                if ctx.conn.remote_addr() != src {
+                    debug!(conn_id, ?src, "uTP 数据报源地址与连接不匹配，丢弃");
+                    return;
                 }
-                let closed = ctx.conn.is_closed() || ctx.conn.has_error();
-                (read_data, closed)
             } else {
                 // 没有匹配的连接，丢弃
                 return;
+            }
+
+            // 先处理包，再推送可读数据（带容量检查）与关闭检查
+            let is_closed = {
+                let Some(ctx) = self.connections.get_mut(&conn_id) else {
+                    return;
+                };
+                ctx.conn.handle_packet(data, now);
+                ctx.sync_phase();
+                ctx.conn.is_closed() || ctx.conn.has_error()
             };
 
-            // 推送可读数据
-            for data in &want_read_data {
-                if let Some(ctx) = self.connections.get(&conn_id) {
-                    let _ = ctx.data_tx.try_send(Ok(data.clone()));
-                }
-            }
+            // 立即推送可读数据（低时延）；通道满时数据留在 recv_out，
+            // 由 1ms tick 的 process_readable_data 重试
+            self.process_readable_data(conn_id);
 
             // 关闭检查
             if is_closed {
-                if let Some(ctx) = self.connections.get_mut(&conn_id) {
-                    ctx.sync_phase();
-                    let _ = ctx.data_tx.try_send(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        "uTP 连接已关闭",
-                    )));
-                }
-                self.connections.remove(&conn_id);
+                self.finalize_closed_connection(conn_id);
             }
         }
+    }
+
+    /// 连接关闭后的统一收尾：广播失败阶段、通知读端、移除连接。
+    fn finalize_closed_connection(&mut self, conn_id: u16) {
+        if let Some(ctx) = self.connections.get_mut(&conn_id) {
+            ctx.sync_phase();
+            let _ = ctx.data_tx.try_send(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "uTP 连接已关闭",
+            )));
+        }
+        self.connections.remove(&conn_id);
     }
 
     /// 处理所有连接的 tick。
@@ -467,14 +491,7 @@ impl UtpManager {
                 .unwrap_or(true);
 
             if is_closed {
-                if let Some(ctx) = self.connections.get_mut(&conn_id) {
-                    ctx.sync_phase();
-                    let _ = ctx.data_tx.try_send(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        "uTP 连接已关闭",
-                    )));
-                }
-                self.connections.remove(&conn_id);
+                self.finalize_closed_connection(conn_id);
             }
         }
     }
@@ -498,6 +515,18 @@ impl UtpManager {
 
     /// 处理 stream 命令（write/close）。
     fn process_stream_commands(&mut self, conn_id: u16, now: Instant) {
+        // 先重试上次未接受完的积压数据（保持用户写入顺序）。
+        // pending_send 腾出空间后逐步灌入；灌不进去就等下个 tick。
+        if let Some(ctx) = self.connections.get_mut(&conn_id) {
+            while !ctx.write_backlog.is_empty() {
+                let accepted = ctx.conn.write(&ctx.write_backlog);
+                if accepted == 0 {
+                    break;
+                }
+                ctx.write_backlog.drain(..accepted);
+            }
+        }
+
         // 收集所有命令，避免可变借用冲突
         let commands: Vec<UtpCmd> = {
             let Some(ctx) = self.connections.get_mut(&conn_id) else {
@@ -514,7 +543,12 @@ impl UtpManager {
             match cmd {
                 UtpCmd::Write(data) => {
                     if let Some(ctx) = self.connections.get_mut(&conn_id) {
-                        ctx.conn.write(&data);
+                        // 连接只接受部分字节（pending_send 满）时，
+                        // 未接受部分进入 backlog 等 tick 重试，绝不丢弃。
+                        let accepted = ctx.conn.write(&data);
+                        if accepted < data.len() {
+                            ctx.write_backlog.extend_from_slice(&data[accepted..]);
+                        }
                     }
                     self.process_connection_tick(conn_id, now);
                 }
@@ -536,7 +570,12 @@ impl UtpManager {
         };
 
         if let Some(ctx) = self.connections.get_mut(&conn_id) {
-            while ctx.conn.want_read() {
+            // 读之前检查通道容量。字节一旦从 recv_out 取走就视为
+            // 已交付（对端已 ACK），try_send 失败再丢弃会破坏有序可靠流
+            // （报文边界错位 → 校验失败/连接反复断开）。容量不足时把数据
+            // 留在 recv_out —— 通告窗口（recv_buffered + recv_out）自动
+            // 收缩，对端自然减速，这正是 uTP 流控的正确姿势。
+            while ctx.conn.want_read() && data_tx.capacity() > 0 {
                 let mut buf = vec![0u8; 65536];
                 let n = ctx.conn.read(&mut buf);
                 if n == 0 {
@@ -549,7 +588,10 @@ impl UtpManager {
                     break;
                 }
                 buf.truncate(n);
-                let _ = data_tx.try_send(Ok(buf));
+                // capacity > 0 已检查且管理器单线程，必然成功
+                if data_tx.try_send(Ok(buf)).is_err() {
+                    break;
+                }
             }
         }
     }
