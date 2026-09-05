@@ -178,6 +178,9 @@ pub struct Task {
     pub uploaded_atomic: AtomicU64,
     /// 无锁上传速度计数器：speed_ticker 按上传字节差值 store。
     pub upload_speed_atomic: AtomicU64,
+    /// 完成/错误时刻（Unix 毫秒；0 = 未知）。终态转移时设置，
+    /// 会话持久化保存，重启恢复后客户端仍可显示完成时间。
+    pub finished_at: AtomicU64,
 }
 
 impl Task {
@@ -228,6 +231,7 @@ impl Task {
             speed_atomic: AtomicU64::new(0),
             uploaded_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
+            finished_at: AtomicU64::new(0),
         }
     }
 
@@ -279,6 +283,7 @@ impl Task {
             speed_atomic: AtomicU64::new(0),
             uploaded_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
+            finished_at: AtomicU64::new(0),
         }
     }
 
@@ -330,6 +335,7 @@ impl Task {
             speed_atomic: AtomicU64::new(0),
             uploaded_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
+            finished_at: AtomicU64::new(0),
         }
     }
 
@@ -445,6 +451,8 @@ pub struct TaskSnapshot {
     pub uris: Vec<(String, UriState)>,
     /// 已用时间（毫秒，仅 active 状态累计；暂停/等待冻结）。
     pub elapsed_ms: u64,
+    /// 完成/错误时刻（Unix 毫秒；0 = 未知）。
+    pub finished_at: u64,
 }
 
 pub fn snapshot(task: &Task) -> TaskSnapshot {
@@ -480,6 +488,7 @@ pub fn snapshot(task: &Task) -> TaskSnapshot {
             + sh.active_since
                 .map(|s| s.elapsed().as_millis() as u64)
                 .unwrap_or(0),
+        finished_at: task.finished_at.load(Ordering::Relaxed),
         uris: task
             .uris
             .iter()
@@ -670,6 +679,7 @@ pub fn status_json_native(task: &Task) -> Value {
         "errorCode": s.error_code,
         "errorMessage": s.error_message,
         "elapsedMs": s.elapsed_ms,
+        "finishedAt": s.finished_at,
         "dir": s.dir,
         "files": files,
         "numSeeders": num_seeders,

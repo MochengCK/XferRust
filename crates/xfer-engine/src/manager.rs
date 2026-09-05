@@ -58,6 +58,14 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
+/// 当前 Unix 毫秒（任务完成/错误时间戳）。
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// 订阅源刷新的同步语义（调用方持有 Inner 锁）：
 /// 远程列表 `remote` 与该订阅源在全局列表中的现状对齐。
 ///
@@ -533,6 +541,9 @@ impl TaskManager {
                     .map(|p| p.rsplit(['/', '\\']).next().unwrap_or("").to_string());
                 sh.error_code = t["errorCode"].as_i64().unwrap_or(0);
                 sh.error_message = t["errorMessage"].as_str().unwrap_or("").to_string();
+                // 恢复完成/错误时间戳（仅终态任务有意义；重新入队时保持 0）
+                task.finished_at
+                    .store(t["finishedAt"].as_u64().unwrap_or(0), Ordering::Relaxed);
                 match t["status"].as_str().unwrap_or("waiting") {
                     "paused" => sh.status = Status::Paused,
                     "complete" => sh.status = Status::Complete,
@@ -612,6 +623,7 @@ impl TaskManager {
                     "completedLength": s.completed,
                     "totalLength": s.total_len.unwrap_or(0),
                     "elapsedMs": s.elapsed_ms,
+                    "finishedAt": s.finished_at,
                     "path": s.path,
                     "errorCode": s.error_code,
                     "errorMessage": s.error_message,
@@ -790,6 +802,7 @@ impl TaskManager {
                 Ok(()) => {
                     sh.status = Status::Complete;
                     sh.error_code = 0;
+                    task.finished_at.store(now_millis(), Ordering::Relaxed);
                     ("complete", true)
                 }
                 Err(f) if f.is_cancelled() => {
@@ -803,6 +816,7 @@ impl TaskManager {
                             // 做种中用户手动停止 → 任务转完成
                             sh.status = Status::Complete;
                             sh.error_code = 0;
+                            task.finished_at.store(now_millis(), Ordering::Relaxed);
                             ("complete", true)
                         }
                         _ => {
@@ -815,6 +829,7 @@ impl TaskManager {
                     sh.status = Status::Error;
                     sh.error_code = f.error_code();
                     sh.error_message = f.to_string();
+                    task.finished_at.store(now_millis(), Ordering::Relaxed);
                     tracing::warn!(gid = %task.gid, code = sh.error_code, "任务失败: {f}");
                     ("error", true)
                 }
