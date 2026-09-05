@@ -48,7 +48,16 @@ async fn main() {
 
 /// 阻塞运行：任务内核 + 协议路由 + 传输服务；shutdown 令牌触发后退出。
 async fn run(cfg: EngineConfig) -> std::io::Result<()> {
-    let manager = xfer_engine::TaskManager::start(cfg.download_dir.clone(), cfg.max_concurrent);
+    // 传入 --save-session（或兼容别名 --input-file）时开启会话持久化：
+    // 启动恢复上次任务（waiting/active 断点续传、终态进历史），状态转移自动落盘
+    let manager = match &cfg.session {
+        Some(path) => xfer_engine::TaskManager::start_with_session(
+            Some(cfg.download_dir.clone()),
+            Some(cfg.max_concurrent),
+            path.clone(),
+        ),
+        None => xfer_engine::TaskManager::start(cfg.download_dir.clone(), cfg.max_concurrent),
+    };
     let events = manager.events();
     let router = std::sync::Arc::new(xfer_rpc::Router::new(
         cfg.rpc_secret.clone(),

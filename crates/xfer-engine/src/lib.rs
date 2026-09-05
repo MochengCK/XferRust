@@ -24,6 +24,8 @@ pub struct EngineConfig {
     pub max_concurrent: usize,
     pub log_file: Option<PathBuf>,
     pub log_level: Option<String>,
+    /// 会话文件路径（Some 时开启持久化：启动恢复 + 状态转移自动落盘）。
+    pub session: Option<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -35,6 +37,7 @@ impl Default for EngineConfig {
             max_concurrent: 5,
             log_file: None,
             log_level: None,
+            session: None,
         }
     }
 }
@@ -89,6 +92,19 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParsedArgs {
             "log-level" => {
                 if !value.is_empty() {
                     cfg.log_level = Some(value.to_string());
+                }
+            }
+            // 会话持久化：启动时若文件存在则恢复任务与设置，运行中自动落盘。
+            // `input-file` 为兼容桌面端/aria2 风格启动参数的别名（同一路径
+            // 兼作恢复与保存；save-session 显式给出时优先）。
+            "save-session" => {
+                if !value.is_empty() {
+                    cfg.session = Some(PathBuf::from(value));
+                }
+            }
+            "input-file" => {
+                if !value.is_empty() {
+                    cfg.session.get_or_insert_with(|| PathBuf::from(value));
                 }
             }
             _ => ignored.push(format!("--{key}")),
