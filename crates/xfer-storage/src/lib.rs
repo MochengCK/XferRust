@@ -90,6 +90,11 @@ impl FileSink {
     /// 以续写模式打开：定位到 `offset`（必须等于现有文件长度）。
     pub fn append_at(path: &Path, offset: u64) -> io::Result<Self> {
         use std::io::Seek;
+        // 与 create 对齐：父目录缺失时自动创建（重启恢复场景下
+        // 会话记录的目录可能已被系统清理，否则 open 直接 ENOENT）。
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)

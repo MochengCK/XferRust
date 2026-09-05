@@ -2746,18 +2746,37 @@ fn is_transient_failure(f: &TaskFailure) -> bool {
 /// 依次尝试 URI 列表（镜像故障转移），全部失败返回最后一个错误。
 /// 瞬态失败先在同 URI 上重试（断点续传式），避免单次网络抖动
 /// 直接打失败整个任务。
+///
+/// 本地路径自愈：重启恢复的任务，会话记录的路径可能已失效
+/// （下载目录被系统清理 / 存储权限变化 / 应用数据被清除）。
+/// 某次尝试零进度即遇 Io 失败（首写即败，典型的路径不可达）
+/// 时，清除旧路径与控制文件、释放路径占位，按当前下载目录重新
+/// 落位并重试一次——任务自动重下而非直接报错。
 async fn drive_download(
     mgr: &TaskManager,
     task: &Arc<Task>,
     cancel: &CancellationToken,
 ) -> Result<(), TaskFailure> {
     let mut last_err: Option<TaskFailure> = None;
+    let mut path_reset_done = false;
     for (idx, uri) in task.uris.iter().enumerate() {
         let mut attempt = 1u32;
         loop {
+            let progress_before = task.completed_live();
             match try_uri(mgr, &mgr.client, task, uri, idx, cancel).await {
                 Ok(()) => return Ok(()),
                 Err(f) if f.is_cancelled() => return Err(f),
+                Err(TaskFailure::Http(xfer_http::HttpError::Io(e)))
+                    if !path_reset_done && task.completed_live() == progress_before =>
+                {
+                    path_reset_done = true;
+                    reset_task_path(mgr, task);
+                    tracing::warn!(
+                        gid = %task.gid, uri = idx, error = %e,
+                        "本地写入路径失效，重置任务路径后重试"
+                    );
+                    continue;
+                }
                 Err(f) => {
                     if is_transient_failure(&f) && attempt < URI_TRANSIENT_ATTEMPTS {
                         attempt += 1;
@@ -2787,6 +2806,24 @@ async fn drive_download(
             "无可用下载地址".into(),
         ))),
     )
+}
+
+/// 清除任务的已解析路径与控制文件，让下次 `try_uri` 重新落位。
+///
+/// 不删除已下载的部分数据文件：若旧路径只是暂时不可达（如 FUSE
+/// 未就绪），重新解析出同一路径时仍可按 `existing_len` 续传；
+/// 若目录确实失效，重新解析会得到不冲突的新文件名。
+fn reset_task_path(mgr: &TaskManager, task: &Task) {
+    let old_path = {
+        let mut sh = task.shared.lock().unwrap();
+        let p = sh.path.take();
+        sh.filename = None;
+        p
+    };
+    if let Some(p) = old_path {
+        let _ = std::fs::remove_file(xfer_storage::ctrl_path(&p));
+        mgr.inner.lock().unwrap().claims.remove(&p);
+    }
 }
 
 async fn try_uri(
