@@ -120,6 +120,7 @@ impl NativeDispatcher {
             "task.pause" => e.pause(&gid("gid")?).map(|_| json!({"ok": true})),
             "task.resume" => e.unpause(&gid("gid")?).map(|_| json!({"ok": true})),
             "task.remove" => e.remove(&gid("gid")?).map(|_| json!({"ok": true})),
+            "task.stopSeed" => e.stop_seeding(&gid("gid")?).map(|_| json!({"ok": true})),
             "task.purgeResults" => e.purge_download_result().map(|_| json!({"ok": true})),
             "task.removeResult" => e
                 .remove_download_result(&gid("gid")?)

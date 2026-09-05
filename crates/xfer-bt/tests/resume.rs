@@ -198,6 +198,7 @@ fn make_config(dir: &std::path::Path, tracker_url: &str) -> TorrentConfig {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        seed_ratio: 0.0,
         selected_files: None,
     }
 }

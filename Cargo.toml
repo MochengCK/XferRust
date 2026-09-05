@@ -41,21 +41,36 @@ xfer-types = { path = "crates/xfer-types" }
 xfer-rpc = { path = "crates/xfer-rpc" }
 xfer-engine = { path = "crates/xfer-engine" }
 xfer-geo = { path = "crates/xfer-geo" }
-unicode-width = "0.1"
+unicode-width = { version = "0.1", optional = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
-crossterm = { workspace = true }
-ratatui = { workspace = true }
-tokio-tungstenite = { workspace = true }
-base64 = { workspace = true }
-futures-util = "0.3"
+crossterm = { workspace = true, optional = true }
+ratatui = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+futures-util = { version = "0.3", optional = true }
 
+# TUI feature：crossterm + ratatui + WS RPC 客户端。
+# Android 等无终端平台只构建引擎内核（xferrust），不启用此 feature。
+[features]
+default = ["tui"]
+tui = [
+    "dep:crossterm",
+    "dep:ratatui",
+    "dep:unicode-width",
+    "dep:tokio-tungstenite",
+    "dep:base64",
+    "dep:futures-util",
+]
+
+# TUI 二进制：仅在启用 tui feature 时构建（Android 等平台禁用）
 [[bin]]
 name = "xfer"
 path = "src/bin/xfer.rs"
+required-features = ["tui"]
 
 # 发布体积优化：
 # - strip=true        删除符号表/调试信息（省 ~18-20%，无行为影响）

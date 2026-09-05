@@ -164,6 +164,7 @@ async fn download_from_real_libtorrent_seeder() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        seed_ratio: 0.0,
         selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
@@ -231,6 +232,7 @@ async fn download_from_real_libtorrent_seeder_over_utp() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        seed_ratio: 0.0,
         selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();

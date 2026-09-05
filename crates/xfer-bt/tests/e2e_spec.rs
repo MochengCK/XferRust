@@ -1241,6 +1241,7 @@ async fn run_engine(
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        seed_ratio: 0.0,
         selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).map_err(|e| e.to_string())?;
@@ -1857,6 +1858,7 @@ async fn spec_magnet_ut_metadata_full_download() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        seed_ratio: 0.0,
         selected_files: None,
     };
     let engine = TorrentEngine::new_magnet(info_hash, cfg).unwrap();

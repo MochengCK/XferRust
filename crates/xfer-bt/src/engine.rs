@@ -437,6 +437,9 @@ pub struct TorrentConfig {
     pub seed_mode: bool,
     /// seed 模式持续时间（秒，0 = 永久）。
     pub seed_duration: u64,
+    /// 做种分享率上限（上传字节 / 数据总量；0 = 不限，做种到手动停止）。
+    /// seed 模式下达到该值即正常退出做种（任务转完成）。
+    pub seed_ratio: f64,
     /// 文件选择（None = 全部文件；Some = 仅下载这些文件索引）。
     /// 磁力链接解析出文件列表后由用户勾选，未选文件的片不请求。
     pub selected_files: Option<Vec<usize>>,
@@ -462,6 +465,7 @@ impl Default for TorrentConfig {
             upload_limit: 0,
             seed_mode: false,
             seed_duration: 0,
+            seed_ratio: 0.0,
             selected_files: None,
         }
     }
@@ -808,6 +812,9 @@ pub struct TorrentEngine {
     /// 初始值来自 [`TorrentConfig::selected_files`]，可经
     /// [`Self::set_selected_files`] 热更新。
     selected_files: Mutex<Option<Vec<usize>>>,
+    /// 是否处于做种阶段（下载完成、seed 模式运行中）。
+    /// 管理器据此上报"做种中"状态并豁免下载并发槽。
+    seeding: AtomicBool,
     /// 由 `selected_files` 推导的所需片位图（None = 全量）。
     /// 元数据就绪 / 文件选择变更时重算。
     wanted: Mutex<Option<PieceMap>>,
@@ -918,6 +925,7 @@ impl TorrentEngine {
             bt_protocol_mode: std::sync::atomic::AtomicU8::new(protocol_code),
             dynamic_announces: Mutex::new(DynamicAnnounces::default()),
             selected_files: Mutex::new(selected_files_init),
+            seeding: AtomicBool::new(false),
             wanted: Mutex::new(None),
         });
         engine.refresh_done_bytes();
@@ -975,6 +983,7 @@ impl TorrentEngine {
             bt_protocol_mode: std::sync::atomic::AtomicU8::new(protocol_code),
             dynamic_announces: Mutex::new(DynamicAnnounces::default()),
             selected_files: Mutex::new(selected_files_init),
+            seeding: AtomicBool::new(false),
             wanted: Mutex::new(None),
         });
         Ok(engine)
@@ -1311,9 +1320,13 @@ impl TorrentEngine {
                 _ = tick.tick() => {
                     if self.is_done() {
                         self.finish();
-                        // seed 模式：下载完成后继续做种
+                        // seed 模式：下载完成后继续做种（分享率达标 /
+                        // 时长已到 / 手动停止 才退出，任务随即转完成）
                         if self.config.seed_mode {
-                            if let Err(e) = self.run_seed_mode(&cancel).await {
+                            self.seeding.store(true, Ordering::Relaxed);
+                            let r = self.run_seed_mode(&cancel).await;
+                            self.seeding.store(false, Ordering::Relaxed);
+                            if let Err(e) = r {
                                 self.stop_background();
                                 return Err(e);
                             }
@@ -2074,6 +2087,11 @@ impl TorrentEngine {
         self.all_wanted_done()
     }
 
+    /// 是否处于做种阶段（下载完成、seed 模式运行中）。
+    pub fn is_seeding(&self) -> bool {
+        self.seeding.load(Ordering::Relaxed)
+    }
+
     fn finish(&self) {
         self.finished.store(true, Ordering::Relaxed);
         {
@@ -2283,6 +2301,22 @@ impl TorrentEngine {
                     // 主动连接待连接队列中的 peer
                     self.connect_pending_seed().await;
                     self.prune_dead_peers();
+                    // 检查分享率上限：上传字节 / 数据总量 达标即正常退出
+                    // 做种（任务由管理器转完成）；0 = 不限
+                    if self.config.seed_ratio > 0.0 {
+                        let total = self.total_bytes.load(Ordering::Relaxed);
+                        let uploaded = self.uploaded_bytes.load(Ordering::Relaxed);
+                        if total > 0 && uploaded as f64 >= total as f64 * self.config.seed_ratio {
+                            tracing::info!(
+                                uploaded,
+                                total,
+                                ratio = self.config.seed_ratio,
+                                "做种分享率达标，正常退出做种"
+                            );
+                            self.announce_all_sync(Some("stopped"));
+                            return Ok(());
+                        }
+                    }
                     // 检查 seed 超时：到时正常退出（stopped announce 由
                     // 调用方 stop_background 前后的收尾路径处理）
                     if let Some(dur) = seed_duration {

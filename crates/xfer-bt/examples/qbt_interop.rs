@@ -143,6 +143,7 @@ fn make_config(
         upload_limit,
         seed_mode,
         seed_duration: 0,
+        seed_ratio: 0.0,
         selected_files: None,
     }
 }

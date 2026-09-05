@@ -138,6 +138,7 @@ async fn run_download_with_timeout(
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        seed_ratio: 0.0,
         selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).map_err(|e| e.to_string())?;

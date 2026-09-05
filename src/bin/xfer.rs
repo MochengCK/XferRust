@@ -537,6 +537,7 @@ fn status_style(s: &str) -> ratatui::style::Style {
     use ratatui::style::{Color, Style};
     match s {
         "active" => Style::new().fg(Color::LightGreen),
+        "seeding" => Style::new().fg(Color::LightCyan),
         "waiting" | "paused" => Style::new().fg(Color::Yellow),
         "complete" => Style::new().fg(Color::Cyan),
         "error" => Style::new().fg(Color::Red),
@@ -548,7 +549,7 @@ fn gauge_style(status: &str) -> ratatui::style::Style {
     use ratatui::style::{Color, Style};
     match status {
         "active" => Style::new().fg(Color::LightGreen),
-        "complete" => Style::new().fg(Color::Cyan),
+        "seeding" | "complete" => Style::new().fg(Color::Cyan),
         "error" | "stopped" => Style::new().fg(Color::Red),
         _ => Style::new().fg(Color::Yellow),
     }
@@ -719,6 +720,11 @@ enum SettingKey {
     MaxConnPerServer,
     /// 最小分片大小（字节，0 = 默认）。
     MinSplitSize,
+    /// BT 做种模式（完成后是否自动做种）。
+    #[allow(dead_code)]
+    BtSeedMode,
+    /// BT 做种分享率上限（0 = 不限/持续做种）。
+    BtSeedRatio,
 }
 
 /// 输入弹窗类型。
@@ -802,6 +808,10 @@ struct App {
     bt_protocol: String,
     /// BT 智能调度开关。
     bt_adaptive: bool,
+    /// BT 做种模式（完成后自动做种）。
+    bt_seed_mode: bool,
+    /// BT 做种分享率上限（0 = 不限/持续做种到手动停止）。
+    bt_seed_ratio: f64,
     /// 单服务器连接数（0 = 引擎默认）。
     max_conn_per_server: u64,
     /// 最小分片大小（字节，0 = 引擎默认）。
@@ -869,7 +879,8 @@ impl Category {
         match self {
             Category::All => true,
             Category::Downloading => status == "active" && completed < total,
-            Category::Seeding => status == "active" && total > 0 && completed >= total,
+            Category::Seeding => status == "seeding"
+                || (status == "active" && total > 0 && completed >= total),
             Category::Complete => status == "complete",
             Category::Error => status == "error",
         }
@@ -1147,6 +1158,8 @@ async fn app_loop(mgr: Arc<TaskManager>) -> i32 {
         bt_encryption: "adaptive".to_string(),
         bt_protocol: "tcp+utp".to_string(),
         bt_adaptive: true,
+        bt_seed_mode: false,
+        bt_seed_ratio: 0.0,
         max_conn_per_server: 0,
         min_split_size: 0,
         add_task: None,
@@ -1261,6 +1274,14 @@ fn refresh_app(app: &mut App) {
         .as_str()
         .map(|v| v != "false" && v != "0")
         .unwrap_or(true);
+    app.bt_seed_mode = opts["bt-seed-mode"]
+        .as_str()
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(false);
+    app.bt_seed_ratio = opts["bt-seed-ratio"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
     // 未设置(0)即引擎默认：归一到引擎导出默认值，设置页直接显示数值
     app.max_conn_per_server = opts["max-connection-per-server"]
         .as_str()
@@ -1419,8 +1440,23 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                         | InputKind::EditSetting(SettingKey::BtConnections)
                         | InputKind::EditSetting(SettingKey::MaxDownloadLimit)
                         | InputKind::EditSetting(SettingKey::MaxUploadLimit)
+                        | InputKind::EditSetting(SettingKey::MaxConnPerServer)
+                        | InputKind::EditSetting(SettingKey::MinSplitSize)
                 );
-                if !digit_only || c.is_ascii_digit() {
+                let decimal_ok = matches!(
+                    kind,
+                    InputKind::EditSetting(SettingKey::BtSeedRatio)
+                );
+                // digit_only → 仅数字；decimal_ok → 数字或小数点（仅一个）；
+                // 其他（目录等）→ 任意字符
+                let ok = if digit_only {
+                    c.is_ascii_digit()
+                } else if decimal_ok {
+                    c.is_ascii_digit() || (c == '.' && !buf.contains('.'))
+                } else {
+                    true
+                };
+                if ok {
                     buf.push(c);
                 }
             }
@@ -1568,6 +1604,7 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
             }
             KeyCode::Char('s') => app.view = MainView::Settings,
             KeyCode::Char('r') => app_action(app, "toggle"),
+            KeyCode::Char('S') => app_action(app, "stop_seed"),
             KeyCode::Char('x') => {
                 if let Some(g) = current_gid(app) {
                     app.confirm_remove = Some(g);
@@ -1634,6 +1671,7 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                 }
             }
             KeyCode::Char('r') => app_action(app, "toggle"),
+            KeyCode::Char('S') => app_action(app, "stop_seed"),
             KeyCode::Char('t') => {
                 if let MainView::Detail(g) = app.view.clone() {
                     // 只有 BT 任务才能添加 tracker
@@ -1677,8 +1715,8 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                 }
             },
             KeyCode::Down | KeyCode::Char('j') => match app.settings_area {
-                // 参数区共 12 项（0..=11，末项为「界面语言」），上限必须到 11
-                0 => app.settings_sel = (app.settings_sel + 1).min(11),
+                // 参数区共 14 项（0..=13，末项为「界面语言」），上限必须到 13
+                0 => app.settings_sel = (app.settings_sel + 1).min(13),
                 1 => {
                     if app.tracker_sel + 1 < app.global_trackers.len() {
                         app.tracker_sel += 1;
@@ -1702,14 +1740,14 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
             }
             KeyCode::Enter => {
                 if app.settings_area == 0 {
-                    if app.settings_sel == 11 {
+                    if app.settings_sel == 13 {
                         // 界面语言：三个选项全部摆出，直接选择
                         app.lang_picker = Some(match lang() {
                             Lang::Zh => 0,
                             Lang::ZhTw => 1,
                             Lang::En => 2,
                         });
-                    } else if !matches!(app.settings_sel, 5 | 6 | 7 | 8) {
+                    } else if !matches!(app.settings_sel, 5 | 6 | 7 | 8 | 9) {
                         let (kind, init) = match app.settings_sel {
                             0 => (
                                 InputKind::EditSetting(SettingKey::MaxConcurrent),
@@ -1731,7 +1769,11 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                                 InputKind::EditSetting(SettingKey::MaxUploadLimit),
                                 app.ul_limit_kbs.to_string(),
                             ),
-                            9 => (
+                            10 => (
+                                InputKind::EditSetting(SettingKey::BtSeedRatio),
+                                format!("{:.1}", app.bt_seed_ratio),
+                            ),
+                            11 => (
                                 InputKind::EditSetting(SettingKey::MaxConnPerServer),
                                 app.max_conn_per_server.to_string(),
                             ),
@@ -2445,6 +2487,26 @@ fn submit_setting(app: &mut App, key: SettingKey, val: &str) {
             )
             .into(),
         },
+        SettingKey::BtSeedRatio => match val.parse::<f64>() {
+            Ok(n) if n >= 0.0 => apply_global_option(
+                app,
+                "bt-seed-ratio",
+                &format!("{:.1}", n),
+                tr("BT 做种分享率", "seed ratio"),
+            ),
+            _ => tr(
+                "分享率须为非负小数（0 = 不限）",
+                "Seed ratio must be a non-negative float (0 = unlimited)",
+            )
+            .into(),
+        },
+        // BtSeedMode 通过左右切换设置，不走输入框
+        SettingKey::BtSeedMode => apply_global_option(
+            app,
+            "bt-seed-mode",
+            if app.bt_seed_mode { "false" } else { "true" },
+            tr("BT 完成行为", "BT on done"),
+        ),
     };
     app.message = Some((msg, std::time::Instant::now()));
 }
@@ -2589,6 +2651,32 @@ fn adjust_concurrency(app: &mut App, delta: i32) {
             app.message = Some((msg, std::time::Instant::now()));
         }
         9 => {
+            // BT 完成行为循环：完成即止 → 做种
+            let next = !app.bt_seed_mode;
+            let val = if next { "true" } else { "false" };
+            let msg = apply_global_option(
+                app,
+                "bt-seed-mode",
+                val,
+                tr("BT 完成行为", "BT on done"),
+            );
+            app.message = Some((msg, std::time::Instant::now()));
+        }
+        10 => {
+            // BT 做种分享率步进 0.1
+            let n = ((app.bt_seed_ratio * 10.0) as i32 + delta).max(0) as f64 / 10.0;
+            if (n - app.bt_seed_ratio).abs() < 0.001 {
+                return;
+            }
+            let msg = apply_global_option(
+                app,
+                "bt-seed-ratio",
+                &format!("{:.1}", n),
+                tr("BT 做种分享率", "seed ratio"),
+            );
+            app.message = Some((msg, std::time::Instant::now()));
+        }
+        11 => {
             let n = (app.max_conn_per_server as i32 + delta).clamp(0, 128) as u64;
             if n == app.max_conn_per_server {
                 return;
@@ -2601,7 +2689,7 @@ fn adjust_concurrency(app: &mut App, delta: i32) {
             );
             app.message = Some((msg, std::time::Instant::now()));
         }
-        10 => {
+        12 => {
             // 最小分片大小步长 1 MiB
             let step = (1024 * 1024) as i64 * delta as i64;
             let n = ((app.min_split_size as i64 + step).max(0)) as u64;
@@ -2671,7 +2759,7 @@ fn app_action(app: &mut App, act: &str) {
         return;
     };
     let r = match act {
-        // r 切换：下载中/等待 → 暂停；已暂停 → 恢复；终态不可操作
+        // r 切换：下载中/等待/做种 → 暂停；已暂停 → 恢复；终态不可操作
         "toggle" => {
             let status = app
                 .tasks
@@ -2681,7 +2769,7 @@ fn app_action(app: &mut App, act: &str) {
                 .unwrap_or("")
                 .to_string();
             match status.as_str() {
-                "active" | "waiting" => app
+                "active" | "waiting" | "seeding" => app
                     .mgr
                     .pause(&gid)
                     .map(|_| tr("已暂停", "Paused").to_string()),
@@ -2690,6 +2778,23 @@ fn app_action(app: &mut App, act: &str) {
                     .unpause(&gid)
                     .map(|_| tr("已恢复", "Resumed").to_string()),
                 _ => Err(tr("任务已结束，无需切换", "Task finished, nothing to toggle").into()),
+            }
+        }
+        // S 停止做种：做种中的任务手动结束 → 转完成
+        "stop_seed" => {
+            let status = app
+                .tasks
+                .iter()
+                .find(|t| t["gid"].as_str() == Some(gid.0.as_str()))
+                .and_then(|t| t["status"].as_str())
+                .unwrap_or("")
+                .to_string();
+            if status == "seeding" {
+                app.mgr
+                    .stop_seeding(&gid)
+                    .map(|_| tr("已停止做种", "Stopped seeding").to_string())
+            } else {
+                Err(tr("任务未在做种", "Task is not seeding").into())
             }
         }
         _ => return,
@@ -3182,40 +3287,28 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
     ])
     .split(rows[1]);
 
-    // 侧边栏：分类（每行整条背景，选中项加亮、焦点态反色，不用指针）。
-    // 背景条与左右竖线各留 1 格间距（对称）；文字再右移 1 格与竖线拉开。
+    // 侧边栏：分类（选中项默认背景高亮、焦点态反色，不用指针）
     let inner_w = (sidebar_w as usize).saturating_sub(2); // 左右各 1 列内边距
-    let bar_bg = Color::Rgb(38, 38, 38); // 未选中项整行背景条
     let mut cat_items = vec![Line::from("")];
-    let mut bar_rows: Vec<(u16, Color)> = Vec::new(); // (分类行 y, 背景色)
-    for (i, c) in CATEGORIES.iter().enumerate() {
+    for c in CATEGORIES.iter() {
         let count = app.tasks.iter().filter(|t| c.matches(t)).count();
         let active = *c == app.category;
         let count_s = format!("({count})");
         let pad = inner_w
-            .saturating_sub(2 + disp_w(c.label().as_str()) + disp_w(&count_s))
+            .saturating_sub(1 + disp_w(c.label().as_str()) + disp_w(&count_s))
             .max(1);
-        let bg = if active {
+        let text = format!(" {}{}{}", c.label(), " ".repeat(pad), count_s);
+        let style = if active {
             if app.sidebar_focus {
-                Color::Cyan
+                Style::new().fg(Color::Black).bg(Color::Cyan)
             } else {
                 // 默认选中项：背景高亮
-                Color::DarkGray
+                Style::new().bg(Color::DarkGray)
             }
         } else {
-            bar_bg
+            dim
         };
-        let style = if active && app.sidebar_focus {
-            Style::new().fg(Color::Black).bg(bg)
-        } else {
-            dim.bg(bg)
-        };
-        // 首格（x=1）留在背景条外：与左竖线留 1 格间距，和右侧对称
-        cat_items.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(format!(" {}{}{}", c.label(), " ".repeat(pad), count_s), style),
-        ]));
-        bar_rows.push((rows[1].y + 1 + i as u16, bg));
+        cat_items.push(Line::from(Span::styled(text, style)));
     }
     let sidebar =
         List::new(cat_items).block(Block::default().padding(Padding::horizontal(1)));
@@ -3224,28 +3317,6 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
     // 任务列表（按当前分类过滤）：圆角边框（横线横跨全宽、左右均圆角）+ 列对齐表格
     let shown = filtered_indices(app);
     draw_main_borders(f, rows[1], cols[1].x);
-    // 背景条补全：CJK 宽字符的续格会被 ratatui reset 掉背景（条裂成数段），
-    // 逐格 set_bg 补齐（只改背景、保留字符与前景色）。
-    // 条范围 x=2..=sidebar_w-2：与左右竖线各留 1 格，不触碰边框。
-    let bar_last = rows[1].bottom().saturating_sub(1); // 底边框行不含
-    let bar_x0 = cols[0].x + 2;
-    let bar_x1 = cols[0].x + sidebar_w - 2;
-    for (y, bg) in &bar_rows {
-        if *y >= bar_last {
-            break;
-        }
-        #[allow(unused_imports)]
-        use std::io::Write as _;
-        eprintln!(
-            "[dbg] fill y={y} x={}..={}",
-            bar_x0, bar_x1
-        );
-        for x in bar_x0..=bar_x1 {
-            if let Some(cell) = f.buffer_mut().cell_mut((x, *y)) {
-                cell.set_bg(*bg);
-            }
-        }
-    }
     let content_block = Block::default().padding(Padding::new(2, 2, 1, 1));
     if shown.is_empty() {
         // 空状态：文字在任务框内垂直 + 水平居中
@@ -3316,6 +3387,10 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
                 };
                 let speed_s = if status == "active" {
                     format!("{}/s", fmt_size(speed))
+                } else if status == "seeding" {
+                    let up = t["uploadSpeed"].as_u64().unwrap_or(0);
+                    let ratio = t["seedRatio"].as_f64().unwrap_or(0.0);
+                    format!("{}↑ R:{:.2}", fmt_size(up), ratio)
                 } else {
                     "--".to_string()
                 };
@@ -3369,6 +3444,7 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
         ("Enter", tr("详情", "detail")),
         ("↑↓", tr("选择", "select")),
         ("r", tr("暂停/继续", "pause/resume")),
+        ("S", tr("停止做种", "stop seed")),
         ("x", tr("移除", "remove")),
         ("c", tr("清除完成", "clear")),
         ("s", tr("设置", "settings")),
@@ -3398,8 +3474,8 @@ fn draw_detail(f: &mut ratatui::Frame, app: &App, gid: &Gid) {
     let hist = app.hist.get(&gid.0).cloned().unwrap_or_default();
     let st = TuiState { last, hist };
     let footer = tr(
-        " Esc/回车 返回 · Tab 切换焦点 · ↑↓←→ 滚动 · PgUp/PgDn 翻页 · r 暂停/继续 · t 添加tracker · x 移除 · q 退出 ",
-        " Esc/Enter back · Tab focus · ↑↓←→ scroll · PgUp/PgDn page · r pause/resume · t add tracker · x remove · q quit ",
+        " Esc/回车 返回 · Tab 切换焦点 · ↑↓←→ 滚动 · PgUp/PgDn 翻页 · r 暂停/继续 · S 停止做种 · t 添加tracker · x 移除 · q 退出 ",
+        " Esc/Enter back · Tab focus · ↑↓←→ scroll · PgUp/PgDn page · r pause/resume · S stop seed · t add tracker · x remove · q quit ",
     );
 
     let is_bt = app.mgr.is_bt_task(gid);
@@ -3793,7 +3869,7 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
     // 分区卡片：参数 / Tracker 服务器 / 订阅源 / 引擎信息
     // （聚焦分区亮边框 + 黄色标题，替代旧的"◄ 焦点"文字标记）
     let areas = Layout::vertical([
-        Constraint::Length(15), // 参数（13 行 + 边框 2）
+        Constraint::Length(17), // 参数（15 行 + 边框 2）
         Constraint::Length(1),  // 空行
         Constraint::Min(5),     // Tracker 服务器列表
         Constraint::Length(1),  // 空行
@@ -3870,6 +3946,17 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
             tr("关", "off")
         })
         .to_string(),
+        (if app.bt_seed_mode {
+            tr("做种", "Seed")
+        } else {
+            tr("完成即止", "Complete")
+        })
+        .to_string(),
+        if app.bt_seed_ratio > 0.0 {
+            format!("{:.1}", app.bt_seed_ratio)
+        } else {
+            tr("不限", "unlimited").to_string()
+        },
         conn_str,
         size_str(app.min_split_size),
         lang_display_name(lang()).to_string(),
@@ -3889,8 +3976,10 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
                 6 => tr("BT 加密模式", "BT encryption"),
                 7 => tr("BT 传输协议", "BT transport"),
                 8 => tr("BT 智能调度", "BT adaptive"),
-                9 => tr("单服务器连接数", "Conns per server"),
-                10 => tr("最小分片大小", "Min split size"),
+                9 => tr("BT 完成行为", "BT on done"),
+                10 => tr("BT 做种分享率", "Seed ratio"),
+                11 => tr("单服务器连接数", "Conns per server"),
+                12 => tr("最小分片大小", "Min split size"),
                 _ => tr("界面语言", "Language"),
             };
             Line::from(vec![
@@ -4165,6 +4254,12 @@ fn draw_input_popup(f: &mut ratatui::Frame, app: &App) {
             " 最小分片大小（字节，0 = 默认） ",
             " Min split size (bytes, 0 = default) ",
         ),
+        InputKind::EditSetting(SettingKey::BtSeedRatio) => tr(
+            " 做种分享率上限（0 = 不限/持续做种） ",
+            " Seed ratio limit (0 = unlimited) ",
+        ),
+        // BtSeedMode 通过左右切换设置，不走输入框——此处兜底
+        InputKind::EditSetting(SettingKey::BtSeedMode) => "".to_string(),
         InputKind::AddTracker(_) => tr(
             " 添加 Tracker（支持空格/逗号分隔批量输入） ",
             " Add trackers (space/comma separated) ",
@@ -4983,7 +5078,7 @@ mod tests {
         }
         // 选中分类默认有背景高亮，不再用 ▸ 指针
         // （侧栏区 x<16 内找 DarkGray 背景块；任务表的高亮行在 x>=18，不会混入）
-        let hl_cells: Vec<(u16, u16)> = (2..15)
+        let hl_cells: Vec<(u16, u16)> = (1..16)
             .flat_map(|x| (1..17).map(move |y| (x, y)))
             .filter(|&(x, y)| buf[(x, y)].bg == ratatui::style::Color::DarkGray)
             .collect();
@@ -4991,54 +5086,11 @@ mod tests {
             !hl_cells.is_empty(),
             "默认选中分类应有背景高亮:\n{text}"
         );
-        // 所在行应是选中的「完成」分类
+        // 背景块应从侧栏内容左缘（x=1）开始，且所在行是「完成」分类
         let hl_y = hl_cells[0].1;
-        // 选中条应连续覆盖 x=2..=14（含「完成」等 CJK 宽字符的续格，无断口）
-        for x in 2..=14u16 {
-            assert_eq!(
-                buf[(x, hl_y)].bg,
-                ratatui::style::Color::DarkGray,
-                "选中条在 x={x} 应连续:\n{text}"
-            );
-        }
-        // 与左右竖线各留 1 格间距（对称）；边框外 x=0 保持默认
-        assert_eq!(
-            buf[(1, hl_y)].bg,
-            ratatui::style::Color::Reset,
-            "背景条与左竖线应留 1 格间距:\n{text}"
-        );
-        assert_eq!(buf[(1, hl_y)].symbol(), "│", "左竖线字符应保留");
-        assert_eq!(
-            buf[(15, hl_y)].bg,
-            ratatui::style::Color::Reset,
-            "背景条与分隔竖线应留 1 格间距:\n{text}"
-        );
-        assert_eq!(
-            buf[(0, hl_y)].bg,
-            ratatui::style::Color::Reset,
-            "背景不应越过边框到 x=0:\n{text}"
-        );
-        // 未选中项也是整条连续暗色背景；标签右移后从 x=3 起
-        let all_y = (1..17)
-            .find(|&y| buf[(3, y)].symbol() == "全")
-            .expect("全部分类标签应在 x=3");
-        for x in 2..=14u16 {
-            assert_eq!(
-                buf[(x, all_y)].bg,
-                ratatui::style::Color::Rgb(38, 38, 38),
-                "未选中条在 x={x} 应连续:\n{text}"
-            );
-        }
-        assert_eq!(buf[(1, all_y)].symbol(), "│", "未选中行左竖线应保留");
-        assert_eq!(
-            buf[(1, all_y)].bg,
-            ratatui::style::Color::Reset,
-            "未选中条与左竖线应留 1 格间距:\n{text}"
-        );
-        assert_eq!(
-            buf[(0, all_y)].bg,
-            ratatui::style::Color::Reset,
-            "未选中条不应越过边框:\n{text}"
+        assert!(
+            hl_cells.iter().any(|&(x, _)| x == 1),
+            "选中分类背景应从内容左缘开始:\n{text}"
         );
         let row_compact: String = (0..100)
             .map(|x| buf[(x, hl_y)].symbol().to_string())
@@ -5281,37 +5333,6 @@ mod tests {
             app.settings_sel, 11,
             "末项之后继续下移应保持在界面语言行"
         );
-    }
-
-    /// [临时调试] dump 侧栏区域每格的符号/前景/背景，验证后删除。
-    #[test]
-    fn debug_dump_sidebar_cells() {
-        let _g = LANG_LOCK.lock().unwrap();
-        let mut app = app_with_peers(vec![]);
-        app.tasks = vec![
-            sample_task("aaa", "active", 10, 100),
-            sample_task("ccc", "complete", 100, 100),
-        ];
-        app.category = Category::Complete;
-        let backend = TestBackend::new(100, 20);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw_list(f, &app)).unwrap();
-        let buf = term.backend().buffer().clone();
-        for y in 1..8u16 {
-            let mut row = format!("y={y}: ");
-            for x in 0..18u16 {
-                let c = &buf[(x, y)];
-                let sym = c.symbol().chars().next().unwrap_or(' ');
-                row.push(match c.bg {
-                    ratatui::style::Color::Reset => sym,
-                    ratatui::style::Color::DarkGray => '▓',
-                    ratatui::style::Color::Rgb(r, _, _) if r == 38 => '░',
-                    ratatui::style::Color::Cyan => '█',
-                    _ => '?',
-                });
-            }
-            println!("{row}");
-        }
     }
 
     fn render_list(app: &App, w: u16, h: u16) -> Vec<String> {

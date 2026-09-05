@@ -592,9 +592,9 @@ impl TaskManager {
             .iter()
             .map(|t| {
                 let s = snapshot(t);
-                // active 序列化为 waiting：重启后重新入队（断点续传）
+                // active/seeding 序列化为 waiting：重启后重新入队（断点续传）
                 let status = match t.status() {
-                    Status::Active => "waiting",
+                    Status::Active | Status::Seeding => "waiting",
                     st => st.as_str(),
                 };
                 let mut opts = serde_json::Map::new();
@@ -699,6 +699,17 @@ impl TaskManager {
         {
             let mut inner = self.inner.lock().unwrap();
             while inner.active.len() < inner.max_concurrent {
+                // 做种中的任务不占下载并发槽（豁免：已完成的 BT 任务在做种阶段
+                // 不阻塞新下载任务启动）
+                let downloading = inner
+                    .active
+                    .iter()
+                    .filter_map(|g| inner.tasks.get(g))
+                    .filter(|t| t.status() != Status::Seeding)
+                    .count();
+                if downloading >= inner.max_concurrent {
+                    break;
+                }
                 let Some(gid) = inner.queue.front().cloned() else {
                     break;
                 };
@@ -787,6 +798,12 @@ impl TaskManager {
                         Intent::Pause => {
                             sh.status = Status::Paused;
                             ("pause", false)
+                        }
+                        Intent::StopSeeding => {
+                            // 做种中用户手动停止 → 任务转完成
+                            sh.status = Status::Complete;
+                            sh.error_code = 0;
+                            ("complete", true)
                         }
                         _ => {
                             sh.status = Status::Removed;
@@ -995,7 +1012,7 @@ impl TaskManager {
                 self.save_session_now();
                 Ok(())
             }
-            Status::Active => {
+            Status::Active | Status::Seeding => {
                 // 先设意图再取消：工作者据此转入 Paused
                 *task.intent.lock().unwrap() = Intent::Pause;
                 task.cancel.read().unwrap().cancel();
@@ -1030,6 +1047,19 @@ impl TaskManager {
         Ok(())
     }
 
+    /// 停止做种：BT 做种中的任务手动停止 → 任务转完成。
+    /// 仅对 Seeding 状态有效（与 pause 不同：pause 保留做种可恢复性，
+    /// stop_seeding 是彻底结束做种转为 Complete）。
+    pub fn stop_seeding(&self, gid: &Gid) -> Result<(), String> {
+        let task = self.task_of(gid)?;
+        if task.status() != Status::Seeding {
+            return Err("任务未处于做种状态".into());
+        }
+        *task.intent.lock().unwrap() = Intent::StopSeeding;
+        task.cancel.read().unwrap().cancel();
+        Ok(())
+    }
+
     pub fn remove(&self, gid: &Gid) -> Result<(), String> {
         self.remove_with_files(gid, false)
     }
@@ -1046,7 +1076,7 @@ impl TaskManager {
                 self.finish_removed(&task, gid);
                 Ok(())
             }
-            Status::Active => {
+            Status::Active | Status::Seeding => {
                 *task.intent.lock().unwrap() = Intent::Remove;
                 task.cancel.read().unwrap().cancel();
                 Ok(())
@@ -1362,6 +1392,22 @@ impl TaskManager {
         (encryption, protocol)
     }
 
+    /// BT 做种配置：全局选项 `bt-seed-mode`（true=完成后做种）和
+    /// `bt-seed-ratio`（分享率上限，0=不限/持续做种到手动停止）。
+    fn bt_seed_config(&self) -> (bool, f64) {
+        let g = self.inner.lock().unwrap().global_options.clone();
+        let seed_mode = g
+            .get("bt-seed-mode")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(false);
+        let seed_ratio = g
+            .get("bt-seed-ratio")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|r| *r >= 0.0)
+            .unwrap_or(0.0);
+        (seed_mode, seed_ratio)
+    }
+
     fn resolve_path(&self, task: &Arc<Task>, probe: &xfer_http::Probe) -> PathBuf {
         // 暂停恢复：沿用已解析路径
         if let Some(p) = task.shared.lock().unwrap().path.clone() {
@@ -1458,8 +1504,10 @@ impl TaskManager {
                     | "min-split-size"
                     | "bt-max-peers"
                     | "bt-adaptive"
+                    | "bt-seed-mode"
+                    | "bt-seed-ratio"
             ) {
-                // HTTP 分片参数 / BT 连接参数：存储后在下载时生效
+                // HTTP 分片参数 / BT 连接参数 / BT 做种配置：存储后在下载时生效
             } else {
                 tracing::debug!(option = %k, "全局选项暂未支持，已忽略");
             }
@@ -1556,6 +1604,20 @@ impl TaskManager {
             .map(|v| v != "false" && v != "0")
             .unwrap_or(true);
         m.insert("bt-adaptive".into(), Value::String(bt_adaptive.to_string()));
+        // BT 做种模式：完成后是否自动进入做种（true/false）
+        let bt_seed_mode = inner
+            .global_options
+            .get("bt-seed-mode")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(false);
+        m.insert("bt-seed-mode".into(), Value::String(bt_seed_mode.to_string()));
+        // BT 做种分享率上限（0 = 不限/持续做种到手动停止）
+        let bt_seed_ratio = inner
+            .global_options
+            .get("bt-seed-ratio")
+            .cloned()
+            .unwrap_or_else(|| "0".to_string());
+        m.insert("bt-seed-ratio".into(), Value::String(bt_seed_ratio));
         // 全局 BT tracker 服务器列表
         m.insert(
             "bt-trackers".into(),
@@ -2515,6 +2577,9 @@ async fn drive_bt_download(
     if selected_files.is_none() && task.awaiting_selection.load(Ordering::SeqCst) {
         selected_files = Some(Vec::new());
     }
+    // BT 做种配置：全局选项 bt-seed-mode（默认 false = 完成即结束），
+    // bt-seed-ratio（分享率上限，0 = 不限/持续做种到手动停止）。
+    let (seed_mode, seed_ratio) = _mgr.bt_seed_config();
     let cfg = TorrentConfig {
         dir: task.dir.clone(),
         peer_id: PeerId::azureus_prefix(&rand12),
@@ -2531,8 +2596,9 @@ async fn drive_bt_download(
         bt_protocol,
         download_limit: dl_limit,
         upload_limit: ul_limit,
-        seed_mode: false,
+        seed_mode,
         seed_duration: 0,
+        seed_ratio,
         // 磁力解析后用户勾选的文件（None = 全部；等待勾选时为 Some(空) 占位）
         selected_files,
     };
@@ -2599,6 +2665,11 @@ async fn drive_bt_download(
                         cancel.cancel();
                         break;
                     }
+                }
+                // 下载完成进入做种阶段：状态转 Seeding（非终态，仍活跃）
+                if engine.is_seeding() && task.shared.lock().unwrap().status != Status::Seeding {
+                    task.set_status(Status::Seeding);
+                    tracing::info!(gid = %task.gid, "进入做种状态");
                 }
                 if p.done >= p.total && p.total > 0 {
                     // 完成后也同步一次再退出

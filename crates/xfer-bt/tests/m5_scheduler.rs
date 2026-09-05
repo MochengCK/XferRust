@@ -222,6 +222,7 @@ async fn pipeline_adaptive_grows_under_fast_peer() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        seed_ratio: 0.0,
         selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
@@ -286,6 +287,7 @@ async fn slow_peer_does_not_block_download() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        seed_ratio: 0.0,
         selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
@@ -351,6 +353,7 @@ async fn rate_limit_caps_download_speed() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        seed_ratio: 0.0,
         selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
@@ -423,6 +426,7 @@ async fn seed_mode_accepts_incoming_connections() {
         upload_limit: 0,
         seed_mode: true,
         seed_duration: 3, // 3 秒后由 cancel 停止
+        seed_ratio: 0.0,
         selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
@@ -498,6 +502,7 @@ async fn cold_start_burst_connects_multiple_seeds() {
         upload_limit: 0,
         seed_mode: false,
         seed_duration: 0,
+        seed_ratio: 0.0,
         selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();

@@ -18,6 +18,8 @@ use xfer_types::Gid;
 pub enum Status {
     Waiting,
     Active,
+    /// BT 下载完成后的做种状态（活跃，继续上传；可暂停/停止）。
+    Seeding,
     Paused,
     Complete,
     Error,
@@ -29,6 +31,7 @@ impl Status {
         match self {
             Status::Waiting => "waiting",
             Status::Active => "active",
+            Status::Seeding => "seeding",
             Status::Paused => "paused",
             Status::Complete => "complete",
             Status::Error => "error",
@@ -64,6 +67,8 @@ pub enum Intent {
     None,
     Pause,
     Remove,
+    /// 停止做种：seed 模式运行中用户手动结束 → 任务转完成。
+    StopSeeding,
 }
 
 /// 引擎侧任务失败分类（映射任务错误码）。
@@ -585,6 +590,13 @@ pub fn status_json(task: &Task) -> Value {
     m.insert("seeder".into(), json!(seeder.to_string()));
     m.insert("numPieces".into(), json!(num_pieces.to_string()));
     m.insert("pieceLength".into(), json!(piece_length.to_string()));
+    // 做种分享率（uploaded/total，0 时为 0）
+    let seed_ratio = if s.total_len.unwrap_or(0) > 0 {
+        s.uploaded as f64 / s.total_len.unwrap() as f64
+    } else {
+        0.0
+    };
+    m.insert("seedRatio".into(), json!(format!("{:.3}", seed_ratio)));
     Value::Object(m)
 }
 
@@ -665,5 +677,11 @@ pub fn status_json_native(task: &Task) -> Value {
         "numPieces": num_pieces,
         "pieceLength": piece_length,
         "awaitingSelection": task.awaiting_selection.load(Ordering::Relaxed),
+        // 做种分享率（uploaded/total，0 时为 0）
+        "seedRatio": if s.total_len.unwrap_or(0) > 0 {
+            s.uploaded as f64 / s.total_len.unwrap() as f64
+        } else {
+            0.0
+        },
     })
 }

@@ -22,8 +22,9 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 构建：3 平台各自产出 TUI(xfer) 与引擎内核(xferrust) 两个二进制。
+  # 构建：桌面平台各自产出 TUI(xfer) 与引擎内核(xferrust) 两个二进制。
   # macOS 在 arm64 运行器上同时编译 arm64 + x86_64 并 lipo 合成通用二进制。
+  # Android 只构建引擎内核（xferrust），不包含 TUI（无终端界面）。
   # ---------------------------------------------------------------------------
   build:
     name: Build ${{ matrix.artifact }}
@@ -105,6 +106,77 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # Android 构建：仅引擎内核（xferrust），不包含 TUI。
+  # 使用 NDK 交叉编译 aarch64-linux-android（arm64-v8a），API 24+（Android 7.0+）。
+  # ---------------------------------------------------------------------------
+  build-android:
+    name: Build android-arm64-v8a
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Build engine core for Android (no TUI)
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          API_LEVEL=24
+          TARGET=aarch64-linux-android
+          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG_PREFIX="${TARGET}${API_LEVEL}"
+
+          export CC_aarch64_linux_android="$LLVM_BIN/${CLANG_PREFIX}-clang"
+          export CXX_aarch64_linux_android="$LLVM_BIN/${CLANG_PREFIX}-clang++"
+          export AR_aarch64_linux_android="$LLVM_BIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$LLVM_BIN/${CLANG_PREFIX}-clang"
+
+          echo "NDK:       $ANDROID_NDK_HOME"
+          echo "Target:    $TARGET"
+          echo "API Level: $API_LEVEL"
+          echo "CC:        $CC_aarch64_linux_android"
+
+          # --no-default-features 禁用 TUI；--bin xferrust 仅构建引擎内核
+          cargo build --release \
+            --no-default-features \
+            --bin xferrust \
+            --target "$TARGET"
+
+          mkdir -p dist
+          cp "target/${TARGET}/release/xferrust" "dist/xferrust"
+          file "dist/xferrust"
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          mkdir -p pkg-xferrust
+          cp dist/xferrust pkg-xferrust/xferrust
+          cp LICENSE README.md pkg-xferrust/
+          tar -C pkg-xferrust -czf "xferrust-android-arm64-v8a.tar.gz" xferrust LICENSE README.md
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-android-arm64-v8a
+          path: |
+            xferrust-android-arm64-v8a.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   # 严格测试：3 平台各自黑盒测试编译产物（引擎运行 / HTTP / HTTPS / 磁力）
   # ---------------------------------------------------------------------------
   test:
@@ -176,7 +248,7 @@ jobs:
   release:
     name: Release (草稿/不覆盖已发布)
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-    needs: [build, test]
+    needs: [build, test, build-android]
     runs-on: ubuntu-latest
     permissions:
       contents: write

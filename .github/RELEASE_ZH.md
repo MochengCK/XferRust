@@ -1,4 +1,4 @@
-**摘要**：本版本聚焦磁力下载体验与 BT 引擎稳定性——磁力链接解析完成后以表格勾选要下载的文件（确认后才开始下载），并修复入站会话泄漏、低限速死循环与 uTP 流损坏，补齐路径穿越与元数据投毒防御，完善 ut_metadata 服务、tracker 上报与 choking 行为；同时 TUI 全面改版——新建任务弹窗支持独立下载目录（可直接调用系统目录选择框）、磁力链接输入后立即解析并向下扩展文件选择表格，主界面重构为融入背景的现代布局，任务详情页顶部保留全局信息栏。
+**摘要**：本版本聚焦磁力下载体验与 BT 引擎稳定性——磁力链接解析完成后以表格勾选要下载的文件（确认后才开始下载），并修复入站会话泄漏、低限速死循环与 uTP 流损坏，补齐路径穿越与元数据投毒防御，完善 ut_metadata 服务、tracker 上报与 choking 行为；同时 TUI 全面改版——新建任务弹窗支持独立下载目录（可直接调用系统目录选择框）、磁力链接输入后立即解析并向下扩展文件选择表格，主界面重构为融入背景的现代布局，任务详情页顶部保留全局信息栏。此外新增 BT 做种完整生命周期管理（可配置分享率自动停止、持续做种至手动停止）与 Android 平台引擎内核交叉编译支持。
 
 ## 新功能
 
@@ -6,6 +6,21 @@
 - 磁力任务的会话可恢复：未确认的等待选择任务重启后重新弹出文件表格，不会跳过选择直接全量下载
 - 响应 ut_metadata（BEP 9）请求：磁力 peer 按规范收到 DATA/REJECT，不再被无视
 - 实现 `seed_duration` 配置：做种到时自动正常退出并通知 tracker
+
+### BT 做种生命周期管理
+
+- BT 任务下载完成后可配置进入做种状态（而非直接结束），通过全局选项 `bt-seed-mode`（`true`/`false`）控制
+- 做种任务实时显示分享率（上传量 / 下载量），支持设置目标分享率 `bt-seed-ratio`（如 `1.5`、`2.0`），达到后自动结束做种
+- 做种中的任务可暂停与恢复，也可手动停止做种（RPC `task.stopSeed` / TUI `S` 键）
+- 可设置持续做种直到手动停止（`bt-seed-ratio` 为 `0` 时不自动停止）
+- TUI 设置页新增做种模式与目标分享率选项，任务列表/详情页对做种状态显示上传速度与分享率
+
+### Android 引擎内核构建
+
+- 新增 Android（aarch64-linux-android / arm64-v8a）交叉编译支持，仅构建引擎内核（`xferrust`），不包含 TUI
+- `Cargo.toml` 将 TUI 依赖（crossterm、ratatui 等）改为 `tui` feature 下的可选依赖，`default = ["tui"]`，`xfer` 二进制标记 `required-features = ["tui"]`
+- CI 新增 `build-android` 作业：使用 NDK r27c + API 24（Android 7.0+）交叉编译，产物 `xferrust-android-arm64-v8a.tar.gz` 随 Release 发布
+- 新增本地构建脚本 `scripts/build-android.sh`：自动检测 NDK host-tag（macOS / Linux），设置 CC/CXX/AR/Linker 环境变量并调用 `cargo build --no-default-features --bin xferrust`
 
 ### TUI 改版
 
@@ -39,6 +54,7 @@
 
 - 新增文件选择 API：`select_files(gid, 文件索引)` / `get_selected_files(gid)`，运行中任务热生效；`add_uri` 传 `bt-file-selection` 选项可让磁力任务解析后暂停等待选择
 - 任务状态新增 `awaitingSelection` 字段，`files[].selected` 反映真实勾选
+- 新增做种状态 `seeding` 与 `seedRatio` 字段；RPC 新增 `task.stopSeed` 方法；会话保存/恢复正确处理做种任务（序列化为 `waiting` 以便重启后重新下载）
 - 拨号/会话失败的地址有限次回填重试，不再干等下一轮 announce
 - DHT 加固：已知 peer 表总量上限（FIFO 淘汰）、收包处理并发限制
 - 新增 27 项 TUI 渲染回归测试（边框几何、列对齐、弹窗流程、详情页顶栏等）
