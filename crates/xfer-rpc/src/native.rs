@@ -119,7 +119,15 @@ impl NativeDispatcher {
             }
             "task.pause" => e.pause(&gid("gid")?).map(|_| json!({"ok": true})),
             "task.resume" => e.unpause(&gid("gid")?).map(|_| json!({"ok": true})),
-            "task.remove" => e.remove(&gid("gid")?).map(|_| json!({"ok": true})),
+            "task.remove" => {
+                // 可选 deleteFiles（默认 false）：连带删除已下载文件与控制文件
+                let delete_files = obj
+                    .get("deleteFiles")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                e.remove_with_files(&gid("gid")?, delete_files)
+                    .map(|_| json!({"ok": true}))
+            }
             "task.stopSeed" => e.stop_seeding(&gid("gid")?).map(|_| json!({"ok": true})),
             "task.purgeResults" => e.purge_download_result().map(|_| json!({"ok": true})),
             "task.removeResult" => e
