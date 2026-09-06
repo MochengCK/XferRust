@@ -58,6 +58,13 @@ const ENDGAME_MIN_SPLIT: u64 = 256 * 1024;
 /// 停滞看门狗阈值：全局无字节落盘达到该时长即强制回收搁浅段。
 /// 刻意大于读超时（30s）——只在所有常规恢复路径都失效时才出手。
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// 读空闲超时：响应体连续该时长无任何字节即断开重连（按短读处理）。
+///
+/// 背景：reqwest `read_timeout`（30s）触发后归类为 `Timeout`，消耗的是
+/// 普通失败预算（4 次即任务失败）；而"连接静默停摆（对端无数据也无
+/// FIN）"与尾段断流一样是可再生瞬态。10s 无字节即从水位重连续传——
+/// 已收字节不丢、不占致命预算，恢复速度也从最坏 30s 缩短到 10s。
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 控制文件的最小落盘间隔（节流 fsync）。
 const CTRL_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 /// 请求批水位（通道容量）：过高徒增内存，过低限制吞吐。
@@ -1275,7 +1282,11 @@ async fn run_worker(ctx: WorkerCtx) {
                     return;
                 }
                 release = Some((seg, true));
-                let ms = backoff_ms(if is_short_read { short_reads } else { failures });
+                let ms = if is_short_read {
+                    short_read_backoff_ms(short_reads)
+                } else {
+                    backoff_ms(failures)
+                };
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
                     _ = ctx.stop.cancelled() => return,
@@ -1290,6 +1301,20 @@ fn backoff_ms(failures: u32) -> u64 {
         1 => 500,
         2 => 1000,
         _ => 2000,
+    }
+}
+
+/// 短读重试退避（独立于普通失败的退避曲线）。
+///
+/// 短读（响应体短于请求区间）是可再生瞬态：重试从水位续传必然推进，
+/// 退避过久只会拖长尾声收尾（线上"99% 停顿十几秒"的构成之一：
+/// 0.5→2s 的短读退避在重试风暴下累积）。上限压到 1s——
+/// 真正恒坏的服务器由 8 次短读折算失败的预算收敛，不受影响。
+fn short_read_backoff_ms(n: u32) -> u64 {
+    match n {
+        0 | 1 => 250,
+        2 => 500,
+        _ => 1000,
     }
 }
 
@@ -1386,6 +1411,12 @@ async fn run_segment(
                 Some(Err(e)) => return Err(HttpError::from_reqwest(&e)),
                 None => break,
             },
+            // 读空闲超时：连接静默停摆（对端无数据也无 FIN）时按短读
+            // 处理——从水位重连续传，不占普通失败预算。每次循环新建
+            // 定时器，计时的自然是"距上一块的间隔"。
+            _ = tokio::time::sleep(READ_IDLE_TIMEOUT) => {
+                return Err(HttpError::ShortRead);
+            }
         };
         if chunk.is_empty() {
             continue;
@@ -1510,7 +1541,7 @@ mod tests {
     use super::*;
     use axum::http::{header, HeaderValue, StatusCode};
     use std::net::SocketAddr;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     /// 生成确定性测试数据（位置敏感，任何错位写都会被校验出来）。
     fn sample(len: usize) -> Vec<u8> {
@@ -1832,6 +1863,110 @@ mod tests {
         }
     }
 
+    /// 回归：读空闲超时。服务器对首个区间请求先发一小块后静默停摆
+    /// （无数据也无 FIN，模拟连接僵死）。修复前只能等 reqwest 30s
+    /// read_timeout（归类 Timeout，消耗普通失败预算）；修复后 10s
+    /// 读空闲即按短读从水位重连续传——总耗时应明显小于 30s。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_idle_stall_recovers_fast() {
+        let len = 4 * 1024 * 1024;
+        let data = Arc::new(sample(len));
+        let expect = data.clone();
+        let stall_flag = Arc::new(AtomicBool::new(false));
+        let app = axum::Router::new().route(
+            "/file.bin",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let data = data.clone();
+                let stall_flag = stall_flag.clone();
+                async move {
+                    let range = headers
+                        .get(header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let total = data.len();
+                    let (from, to) =
+                        match range.strip_prefix("bytes=").and_then(|r| r.split_once('-')) {
+                            Some((f, t)) => (
+                                f.parse::<usize>().unwrap_or(0),
+                                t.parse::<usize>().unwrap_or(total),
+                            ),
+                            None => (0, total),
+                        };
+                    let from = from.min(total);
+                    let to = (to + 1).min(total).max(from);
+                    // 仅首个请求注入 12s 静默停摆（> READ_IDLE_TIMEOUT 10s）
+                    let stall = !stall_flag.swap(true, Ordering::SeqCst);
+                    let mut head: Vec<Result<Bytes, std::io::Error>> = Vec::new();
+                    let mut rest: Vec<Result<Bytes, std::io::Error>> = Vec::new();
+                    let mut off = from;
+                    while off < to {
+                        let end = (off + 8192).min(to);
+                        let c = Ok(Bytes::copy_from_slice(&data[off..end]));
+                        if stall && off == from {
+                            head.push(c);
+                        } else {
+                            rest.push(c);
+                        }
+                        off = end;
+                    }
+                    let stalled = stall;
+                    let stream = futures_util::stream::iter(head)
+                        .chain(futures_util::stream::once(async move {
+                            if stalled {
+                                tokio::time::sleep(Duration::from_secs(12)).await;
+                            }
+                            Ok(Bytes::new())
+                        }))
+                        .chain(futures_util::stream::iter(rest));
+                    let body = axum::body::Body::from_stream(stream);
+                    let mut resp = axum::response::Response::new(body);
+                    if from > 0 || to < total {
+                        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                        resp.headers_mut().insert(
+                            header::CONTENT_RANGE,
+                            HeaderValue::from_str(&format!(
+                                "bytes {}-{}/{}",
+                                from,
+                                to.saturating_sub(1),
+                                total
+                            ))
+                            .unwrap(),
+                        );
+                    }
+                    resp
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let url = format!("http://{addr}/file.bin");
+        let dir = tmpdir("read-idle-stall");
+        let path = dir.join("out.bin");
+        let cancel = CancellationToken::new();
+        let t0 = Instant::now();
+        download_split(
+            &crate::build_client(),
+            &url,
+            &path,
+            len as u64,
+            &opts(4, 256 * 1024),
+            &cancel,
+            SplitStats::new(0),
+        )
+        .await
+        .expect("分片下载失败");
+        let elapsed = t0.elapsed();
+        assert_file(&path, &expect);
+        // 修复前：僵死连接要等 30s read_timeout 才恢复；修复后 10s 读空闲
+        // 即重连续传。25s 上限证明走的是快路径（留足 CI 抖动余量）。
+        assert!(
+            elapsed < Duration::from_secs(25),
+            "读空闲恢复耗时 {elapsed:?}，疑似仍卡在 30s read_timeout"
+        );
+    }
+
     /// 回归：分片下载短读风暴 + 暂停/恢复循环下仍能正确完成。
     /// 直接穿引擎层会引入过多噪声，这里只验证 HTTP 层自身在
     /// 尾声断流 + 中途取消恢复的叠加下不丢字节、不假完成。
@@ -1868,7 +2003,8 @@ mod tests {
             }
         });
         let mut done_any = false;
-        for _ in 0..200 {
+        // 30s 上限：并行跑测试套件时机器负载高，10s 会偶发误报
+        for _ in 0..600 {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if stats.completed.load(Ordering::Relaxed) > len as u64 * 3 / 4 {
                 done_any = true;

@@ -1,4 +1,4 @@
-**Summary**: A magnet-experience and BT-stability release — pick which files to download from a table after a magnet link is parsed (download starts only after confirmation), plus fixes for a peer session leak, rate-limiter deadlock and uTP stream corruption, hardening against path traversal and metadata poisoning, and completed ut_metadata serving, tracker reporting and choking behavior. The TUI is fully redesigned as well — the add-task dialog supports a per-task download directory (with a native system folder picker), magnet links start parsing immediately and expand the dialog in place into a file-selection table once metadata is ready, the main layout is rebuilt into a modern flat design, and the global info bar stays visible on task detail pages. Additionally, this release adds full BT seeding lifecycle management (configurable share-ratio auto-stop, continuous seeding until manual stop) and Android platform engine-core cross-compilation support.
+**Summary**: A magnet-experience and BT-stability release — pick which files to download from a table after a magnet link is parsed (download starts only after confirmation), plus fixes for a peer session leak, rate-limiter deadlock and uTP stream corruption, hardening against path traversal and metadata poisoning, and completed ut_metadata serving, tracker reporting and choking behavior. The TUI is fully redesigned as well — the add-task dialog supports a per-task download directory (with a native system folder picker), magnet links start parsing immediately and expand the dialog in place into a file-selection table once metadata is ready, the main layout is rebuilt into a modern flat design, and the global info bar stays visible on task detail pages. Additionally, this release adds full BT seeding lifecycle management (configurable share-ratio auto-stop, continuous seeding until manual stop) and Android platform engine-core cross-compilation support; it also completes BT network discoverability — local peer discovery (LPD), automatic UPnP/NAT-PMP port mapping and configurable BT/DHT listen ports — and fixes the tail-end stall that left HTTP/HTTPS downloads hanging at 99%.
 
 ## New Features
 
@@ -14,6 +14,13 @@
 - Seeding tasks can be paused/resumed, and seeding can be manually stopped (RPC `task.stopSeed` / TUI `S` key)
 - Continuous seeding until manual stop is supported (`bt-seed-ratio` of `0` disables auto-stop)
 - TUI settings page adds seeding mode and target share ratio options; task list/detail views show upload speed and share ratio for seeding tasks
+
+### BT Network Discovery & Port Configuration
+
+- Local peer discovery (LPD / BEP 14): each BT task joins the LSD multicast group, periodically announces to and listens on the LAN, so peers on the same network can find each other without trackers; discovered peers enter scheduling with an `lpd` source
+- Automatic UPnP / NAT-PMP port mapping: when a BT task starts, the engine sets up a TCP + UDP dual mapping on the router (2-hour lease, renewed every 1/3 of the lease, automatic retry next cycle after a single failure) and best-effort removes the mapping on shutdown — better connectability, no more manual router port forwarding
+- Configurable BT / DHT listen ports: new global options `bt-listen-port` / `dht-listen-port` (`0` = random port), applied when a BT task is created; if the listen port or DHT port is taken, the engine falls back to an ephemeral port with a warning instead of disabling listening entirely
+- New switches `bt-enable-lpd` / `bt-port-mapping` (both on by default) to disable either feature independently; `engine.getOptions` exposes the new options and `changeGlobalOption` validates port values (0–65535)
 
 ### Android Engine-Core Build
 
@@ -41,6 +48,10 @@
 - Fix choking algorithm: wall-clock rounds shared by all sessions, engine-level optimistic unchoke that actually reaches the lucky peer, round-robin uploads while seeding
 - Fix tracker announces always reporting zero uploaded bytes (private-tracker ratio tracking works now)
 - Fix UDP trackers never receiving stopped/completed events
+- Fix HTTP/HTTPS downloads hanging at 99% for over ten seconds before finishing:
+  - Tail short reads (response body shorter than the requested range) now use a dedicated backoff curve (from 250 ms, capped at 1 s) instead of sharing the 0.5–2 s hard-failure backoff — short reads always make progress when retried from the watermark, and the old backoff accumulated into a long tail under retry storms
+  - New 10-second read-idle watchdog: a silently stalled connection (dead peer / half-open socket) resumes from the watermark immediately instead of waiting out the 30-second read timeout
+  - Read timeouts are now classified as renewable transients: they no longer consume the 4-strike failure budget, so tail retries are no longer killed prematurely
 
 ## UI Redesign
 
@@ -56,5 +67,7 @@
 - Task status exposes a new `awaitingSelection` field, and `files[].selected` now reflects the real selection
 - New seeding status `seeding` and `seedRatio` field; RPC adds `task.stopSeed` method; session save/restore handles seeding tasks correctly (serialized as `waiting` so they re-download on restart)
 - Failed dial / session addresses are re-queued for a bounded number of retries instead of waiting for the next announce
+- A short-read storm exceeding 8 consecutive retries folds into one regular failure under the normal failure budget — the relaxed backoff does not slow down error reporting for permanently broken servers
+- Added HTTP tail-truncation + pause/resume regression tests (short-read storms, silent stalls, cancel & resume scenarios)
 - DHT hardening: known-peer table capped with FIFO eviction, inbound datagram processing concurrency limited
 - Added 27 TUI rendering regression tests (border geometry, column alignment, dialog flow, detail top bar, etc.)

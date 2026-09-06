@@ -192,6 +192,8 @@ fn make_config(dir: &std::path::Path, tracker_url: &str) -> TorrentConfig {
         udp_announce_urls: Vec::new(),
         enable_dht: false,
         dht_port: 0,
+        enable_lpd: false,
+        enable_port_mapping: false,
         encryption: xfer_bt::EncryptionMode::PlaintextOnly,
         bt_protocol: xfer_bt::BtProtocol::TcpOnly,
         download_limit: 0,

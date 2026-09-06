@@ -137,6 +137,8 @@ fn make_config(
         pipeline: 0,
         enable_dht: false,
         dht_port: 0,
+        enable_lpd: false,
+        enable_port_mapping: false,
         encryption: xfer_bt::EncryptionMode::PreferEncryption,
         bt_protocol: xfer_bt::BtProtocol::default(),
         download_limit: 0,

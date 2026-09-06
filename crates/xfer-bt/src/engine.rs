@@ -25,7 +25,8 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use xfer_bencode::TorrentMeta;
 use xfer_dht::{Dht, DhtConfig};
-use xfer_discovery::UdpTracker;
+use xfer_discovery::lsd::{LSD_ANNOUNCE_INTERVAL, LSD_LISTEN_TIMEOUT};
+use xfer_discovery::{Lsd, LsdConfig, PortMappingProtocol, UpnpClient, UdpTracker};
 use xfer_storage::{PieceLayout, PieceMap, PieceStore};
 use xfer_transport::{UtpManager, UtpManagerHandle, UtpStream};
 use xfer_types::{InfoHash, PeerId, ENGINE_NAME, ENGINE_VERSION};
@@ -395,6 +396,11 @@ impl BtProtocol {
     }
 }
 
+/// UPnP/NAT-PMP 映射租期（秒，NAT-PMP 需周期续约）。
+const PORT_MAPPING_LEASE_SECS: u32 = 7200;
+/// 映射续期间隔（租期的 1/3，单次失败下个周期自动重试）。
+const PORT_MAPPING_RENEW_SECS: u64 = 2400;
+
 /// 引擎配置。
 #[derive(Debug, Clone)]
 pub struct TorrentConfig {
@@ -425,6 +431,10 @@ pub struct TorrentConfig {
     pub enable_dht: bool,
     /// DHT 监听端口（0 = 系统分配）。
     pub dht_port: u16,
+    /// 是否启用 LSD 本地发现（BEP 14，多播 239.192.0.0:6771，默认开）。
+    pub enable_lpd: bool,
+    /// 是否启用 UPnP/NAT-PMP 端口映射（TCP+UDP 双映射，默认开）。
+    pub enable_port_mapping: bool,
     /// 加密模式（BEP 8 / PE 策略，默认优先加密）。
     pub encryption: EncryptionMode,
     /// peer 传输协议（TCP / uTP / 两者，默认两者）。
@@ -459,6 +469,8 @@ impl Default for TorrentConfig {
             pipeline: 0, // 0 = 自适应
             enable_dht: false,
             dht_port: 0,
+            enable_lpd: true,
+            enable_port_mapping: true,
             encryption: EncryptionMode::default(),
             bt_protocol: BtProtocol::default(),
             download_limit: 0,
@@ -551,6 +563,8 @@ pub enum PeerSource {
     Dht,
     /// PEX（Peer Exchange，BEP 11）从其他 peer 交换获得。
     Pex,
+    /// LSD 本地发现（BEP 14，同网段多播）。
+    Lsd,
     /// 被动入站连接（对端主动连入）。
     Incoming,
 }
@@ -561,6 +575,7 @@ impl PeerSource {
             PeerSource::Tracker => "tracker",
             PeerSource::Dht => "dht",
             PeerSource::Pex => "pex",
+            PeerSource::Lsd => "lsd",
             PeerSource::Incoming => "incoming",
         }
     }
@@ -1147,61 +1162,184 @@ impl TorrentEngine {
         sel.iter().all(|i| set.contains(i))
     }
 
-    /// 启动监听（端口 0 = 系统自动分配，避免多任务冲突）。
+    /// 启动监听（端口 0 = 系统自动分配）。
+    ///
+    /// 配置端口被其他任务/进程占用时回退系统分配端口，保证任务可用
+    /// （多任务共享同一配置端口时，仅首个任务能绑到该端口）。
     async fn spawn_listener(self: &Arc<Self>) -> Result<(), String> {
-        match TcpListener::bind(("0.0.0.0", self.config.listen_port)).await {
-            Ok(listener) => {
-                let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
-                self.actual_listen_port.store(port, Ordering::Relaxed);
-                let engine = self.clone();
-                let shutdown = self.shutdown.clone();
-                tokio::spawn(async move {
-                    loop {
-                        // 停机信号优先：暂停/完成后不再接受新连接
-                        let accepted = tokio::select! {
-                            _ = shutdown.cancelled() => break,
-                            r = listener.accept() => r,
-                        };
-                        match accepted {
-                            Ok((stream, addr)) => {
-                                let e = engine.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e2) = e.run_peer(addr, stream, false, None).await {
-                                        tracing::debug!(peer = %addr, error = %e2, "被动连接结束");
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "accept 失败");
-                                tokio::time::sleep(Duration::from_millis(200)).await;
-                            }
-                        }
-                    }
-                });
-                tracing::info!(port, "BT 监听已启动");
-
-                // uTP 同端口监听（§7.6）。始终绑定，模式只决定是否接受/拨号，
-                // 以便运行时热切换协议；UDP 绑定失败则本引擎禁用 uTP。
-                match UtpManager::bind("0.0.0.0", port).await {
-                    Ok((handle, incoming_rx)) => {
-                        *self.utp.lock().unwrap() = Some(handle);
-                        let engine = self.clone();
-                        let shutdown = self.shutdown.clone();
+        let listener = match TcpListener::bind(("0.0.0.0", self.config.listen_port)).await {
+            Ok(l) => l,
+            Err(e) if self.config.listen_port != 0 => {
+                tracing::warn!(
+                    port = self.config.listen_port,
+                    error = %e,
+                    "配置的 BT 监听端口被占用，回退系统分配端口"
+                );
+                TcpListener::bind(("0.0.0.0", 0))
+                    .await
+                    .map_err(|e2| format!("BT 监听端口绑定失败: {e2}"))?
+            }
+            Err(e) => return Err(format!("BT 监听端口绑定失败: {e}")),
+        };
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        self.actual_listen_port.store(port, Ordering::Relaxed);
+        let engine = self.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                // 停机信号优先：暂停/完成后不再接受新连接
+                let accepted = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    r = listener.accept() => r,
+                };
+                match accepted {
+                    Ok((stream, addr)) => {
+                        let e = engine.clone();
                         tokio::spawn(async move {
-                            engine.utp_incoming_loop(incoming_rx, shutdown).await;
+                            if let Err(e2) = e.run_peer(addr, stream, false, None).await {
+                                tracing::debug!(peer = %addr, error = %e2, "被动连接结束");
+                            }
                         });
-                        tracing::info!(port, "uTP 监听已启动");
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "uTP 端口绑定失败，本引擎禁用 uTP");
+                        tracing::warn!(error = %e, "accept 失败");
+                        tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                 }
             }
+        });
+        tracing::info!(port, "BT 监听已启动");
+
+        // uTP 同端口监听（§7.6）。始终绑定，模式只决定是否接受/拨号，
+        // 以便运行时热切换协议；UDP 绑定失败则本引擎禁用 uTP。
+        match UtpManager::bind("0.0.0.0", port).await {
+            Ok((handle, incoming_rx)) => {
+                *self.utp.lock().unwrap() = Some(handle);
+                let engine = self.clone();
+                let shutdown = self.shutdown.clone();
+                tokio::spawn(async move {
+                    engine.utp_incoming_loop(incoming_rx, shutdown).await;
+                });
+                tracing::info!(port, "uTP 监听已启动");
+            }
             Err(e) => {
-                tracing::warn!(error = %e, "BT 监听端口绑定失败，降级为不监听");
+                tracing::warn!(error = %e, "uTP 端口绑定失败，本引擎禁用 uTP");
             }
         }
         Ok(())
+    }
+
+    /// UPnP/NAT-PMP 端口映射：TCP+UDP 双映射、周期续期、停机时尽力撤销。
+    ///
+    /// 使用 `spawn_listener` 确定的实际端口（配置端口被占回退后仍正确）。
+    /// 映射失败仅记录日志——入站不可达时出站连接仍可下载（可能受运营商
+    /// NAT 限速影响），不阻断任务。
+    fn spawn_port_mapping(self: &Arc<Self>) {
+        let port = self.actual_listen_port.load(Ordering::Relaxed);
+        if port == 0 {
+            return;
+        }
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let client = UpnpClient::new();
+            // 首次映射（lease 2 小时，NAT-PMP 要求租约续期）
+            for r in client.map_port(port, port, PORT_MAPPING_LEASE_SECS).await {
+                match r {
+                    Ok(m) => tracing::info!(
+                        protocol = %m.protocol,
+                        external_ip = %m.external_ip,
+                        external_port = m.external_port,
+                        source = %m.source,
+                        "端口映射成功"
+                    ),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "端口映射失败（出站下载不受影响）")
+                    }
+                }
+            }
+            // 续期 + 停机撤销
+            let mut iv = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(PORT_MAPPING_RENEW_SECS),
+                Duration::from_secs(PORT_MAPPING_RENEW_SECS),
+            );
+            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = engine.shutdown.cancelled() => {
+                        // 尽力撤销映射（短超时，不阻塞停机；失败时租约自然过期）
+                        for proto in [PortMappingProtocol::Tcp, PortMappingProtocol::Udp] {
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                client.unmap_port(port, proto),
+                            )
+                            .await;
+                        }
+                        tracing::debug!(port, "端口映射已撤销");
+                        break;
+                    }
+                    _ = iv.tick() => {
+                        for r in client.map_port(port, port, PORT_MAPPING_LEASE_SECS).await {
+                            if let Err(e) = r {
+                                tracing::debug!(error = %e, "端口映射续期失败");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// LSD 本地发现（BEP 14）：周期多播 announce + 监听发现的本地 peer。
+    ///
+    /// 6771 端口同一主机只能绑定一个（未用 SO_REUSEADDR）：多任务并发时
+    /// 首个任务收发兼备，后续任务退化为仅发送——对端收到 announce 后会
+    /// 主动连入，本端发现能力交给首个任务的监听，整体发现不受影响。
+    fn spawn_lsd(self: &Arc<Self>) {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let info_hash = InfoHash::from_bytes(&engine.info_hash);
+            let listen_port = engine.actual_listen_port.load(Ordering::Relaxed);
+            let cfg = LsdConfig {
+                listen_port,
+                ..Default::default()
+            };
+            let lsd = match Lsd::new(cfg.clone()).await {
+                Ok(l) => Arc::new(l),
+                Err(e) => {
+                    tracing::debug!(error = %e, "LSD 多播绑定失败（多任务并发？），退化为仅发送");
+                    match Lsd::sender_only(cfg).await {
+                        Ok(l) => Arc::new(l),
+                        Err(e2) => {
+                            tracing::debug!(error = %e2, "LSD 不可用，本任务跳过本地发现");
+                            return;
+                        }
+                    }
+                }
+            };
+            // interval 首个 tick 立即触发：启动即 announce 一次
+            let mut iv = tokio::time::interval(LSD_ANNOUNCE_INTERVAL);
+            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = engine.shutdown.cancelled() => break,
+                    _ = iv.tick() => {
+                        if let Err(e) = lsd.announce(&info_hash).await {
+                            tracing::debug!(error = %e, "LSD announce 失败");
+                            continue;
+                        }
+                        // 监听 5s 收集发现的 peer（期间停机即时退出）
+                        let found = tokio::select! {
+                            _ = engine.shutdown.cancelled() => break,
+                            found = lsd.listen(&info_hash, LSD_LISTEN_TIMEOUT) => found,
+                        };
+                        if !found.is_empty() {
+                            tracing::debug!(count = found.len(), "LSD 发现本地 peer");
+                            engine.add_peers(found, PeerSource::Lsd).await;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// uTP 入站连接循环：从管理器接收新连接，按当前协议模式过滤后交给
@@ -1235,15 +1373,37 @@ impl TorrentEngine {
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<(), String> {
         self.spawn_listener().await?;
 
-        // DHT 初始化（如果启用）
+        // UPnP/NAT-PMP 端口映射（TCP+UDP 双映射；实际端口在 bind 后确定）
+        if self.config.enable_port_mapping {
+            self.spawn_port_mapping();
+        }
+        // LSD 本地发现（BEP 14）
+        if self.config.enable_lpd {
+            self.spawn_lsd();
+        }
+
+        // DHT 初始化（如果启用）。配置端口被占时回退系统分配端口重试，
+        // 避免多任务共享同一 dht-listen-port 时后续任务整个失去 DHT。
         let dht = if self.config.enable_dht {
-            match Dht::new(DhtConfig {
+            let mut attempted = Dht::new(DhtConfig {
                 listen_port: self.config.dht_port,
                 bind_addr: Some("0.0.0.0".into()),
                 ..Default::default()
             })
-            .await
-            {
+            .await;
+            if attempted.is_err() && self.config.dht_port != 0 {
+                tracing::warn!(
+                    port = self.config.dht_port,
+                    "DHT 监听端口被占用，回退系统分配端口"
+                );
+                attempted = Dht::new(DhtConfig {
+                    listen_port: 0,
+                    bind_addr: Some("0.0.0.0".into()),
+                    ..Default::default()
+                })
+                .await;
+            }
+            match attempted {
                 Ok(dht) => {
                     *self.dht.lock().unwrap() = Some(dht.clone());
                     dht.spawn_background();

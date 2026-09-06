@@ -1423,6 +1423,33 @@ impl TaskManager {
         (seed_mode, seed_ratio)
     }
 
+    /// BT/DHT 监听端口（全局选项 `bt-listen-port` / `dht-listen-port`；
+    /// 0 = 系统分配）。端口被占时引擎侧自动回退临时端口。
+    fn bt_listen_ports(&self) -> (u16, u16) {
+        let g = self.inner.lock().unwrap().global_options.clone();
+        let listen_port = g
+            .get("bt-listen-port")
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .unwrap_or(0);
+        let dht_port = g
+            .get("dht-listen-port")
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .unwrap_or(0);
+        (listen_port, dht_port)
+    }
+
+    /// 发现渠道开关（全局选项）：`bt-enable-lpd`（LSD 本地发现）、
+    /// `bt-port-mapping`（UPnP/NAT-PMP 端口映射），默认均启用。
+    fn bt_discovery_flags(&self) -> (bool, bool) {
+        let g = self.inner.lock().unwrap().global_options.clone();
+        let on = |k: &str, default: bool| {
+            g.get(k)
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(default)
+        };
+        (on("bt-enable-lpd", true), on("bt-port-mapping", true))
+    }
+
     fn resolve_path(&self, task: &Arc<Task>, probe: &xfer_http::Probe) -> PathBuf {
         // 暂停恢复：沿用已解析路径
         if let Some(p) = task.shared.lock().unwrap().path.clone() {
@@ -1512,6 +1539,11 @@ impl TaskManager {
                     return Err(format!("bt-protocol 取值无效: {v}（可选 tcp+utp/tcp/utp）"));
                 }
                 bt_modes_changed = true;
+            } else if k == "bt-listen-port" || k == "dht-listen-port" {
+                // BT/DHT 监听端口：0 = 系统分配；存储后在下载时生效
+                if v.trim().parse::<u16>().is_err() {
+                    return Err(format!("{k} 必须是 0-65535 的端口号: {v}"));
+                }
             } else if matches!(
                 k.as_str(),
                 "split"
@@ -1521,6 +1553,8 @@ impl TaskManager {
                     | "bt-adaptive"
                     | "bt-seed-mode"
                     | "bt-seed-ratio"
+                    | "bt-enable-lpd"
+                    | "bt-port-mapping"
             ) {
                 // HTTP 分片参数 / BT 连接参数 / BT 做种配置：存储后在下载时生效
             } else {
@@ -1633,6 +1667,32 @@ impl TaskManager {
             .cloned()
             .unwrap_or_else(|| "0".to_string());
         m.insert("bt-seed-ratio".into(), Value::String(bt_seed_ratio));
+        // BT/DHT 监听端口（0 = 系统分配）
+        let bt_listen_port = inner
+            .global_options
+            .get("bt-listen-port")
+            .cloned()
+            .unwrap_or_else(|| "0".to_string());
+        m.insert("bt-listen-port".into(), Value::String(bt_listen_port));
+        let dht_listen_port = inner
+            .global_options
+            .get("dht-listen-port")
+            .cloned()
+            .unwrap_or_else(|| "0".to_string());
+        m.insert("dht-listen-port".into(), Value::String(dht_listen_port));
+        // 发现渠道开关：LSD 本地发现 / UPnP-NAT-PMP 端口映射（默认开）
+        let bt_lpd = inner
+            .global_options
+            .get("bt-enable-lpd")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        m.insert("bt-enable-lpd".into(), Value::String(bt_lpd.to_string()));
+        let bt_pmap = inner
+            .global_options
+            .get("bt-port-mapping")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        m.insert("bt-port-mapping".into(), Value::String(bt_pmap.to_string()));
         // 全局 BT tracker 服务器列表
         m.insert(
             "bt-trackers".into(),
@@ -2595,10 +2655,13 @@ async fn drive_bt_download(
     // BT 做种配置：全局选项 bt-seed-mode（默认 false = 完成即结束），
     // bt-seed-ratio（分享率上限，0 = 不限/持续做种到手动停止）。
     let (seed_mode, seed_ratio) = _mgr.bt_seed_config();
+    // BT/DHT 监听端口（0 = 系统分配）与发现开关（LSD/端口映射默认开）
+    let (listen_port, dht_port) = _mgr.bt_listen_ports();
+    let (enable_lpd, enable_port_mapping) = _mgr.bt_discovery_flags();
     let cfg = TorrentConfig {
         dir: task.dir.clone(),
         peer_id: PeerId::azureus_prefix(&rand12),
-        listen_port: 0,
+        listen_port,
         max_peers,
         adaptive,
         numwant: 50,
@@ -2606,7 +2669,9 @@ async fn drive_bt_download(
         udp_announce_urls,
         pipeline: 0, // 自适应 16→256
         enable_dht,
-        dht_port: 0,
+        dht_port,
+        enable_lpd,
+        enable_port_mapping,
         encryption,
         bt_protocol,
         download_limit: dl_limit,
