@@ -264,6 +264,15 @@ impl TaskManager {
         })
     }
 
+    /// 注入命令行携带的初始全局选项（与 engine.changeOptions 同一存储；
+    /// 会话恢复的设置随后会覆盖同名键）。
+    pub fn set_initial_options(&self, opts: &[(String, String)]) {
+        let mut inner = self.inner.lock().unwrap();
+        for (k, v) in opts {
+            inner.global_options.insert(k.clone(), v.clone());
+        }
+    }
+
     /// 启动调度器循环（须在 tokio runtime 内调用，幂等性由调用方保证）。
     /// M6：同时启动定期会话保存（30s 间隔）。
     pub fn spawn_scheduler(self: &Arc<Self>) {
@@ -1503,7 +1512,38 @@ impl TaskManager {
         let mut inner = self.inner.lock().unwrap();
         let mut rate_changed = false;
         let mut bt_modes_changed = false;
+        // bt-trackers：全量替换语义（应用端每次推送完整列表），
+        // 原始值可能是数组或换行/逗号分隔的字符串，需在字符串化前处理
+        let mut tracker_replace: Option<Vec<String>> = None;
         for (k, v) in opts {
+            if k == "bt-trackers" {
+                let list: Vec<String> = match v {
+                    Value::Array(a) => a
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    Value::String(s) => s
+                        .split(|c| c == '\n' || c == ',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    _ => return Err("bt-trackers 必须是字符串数组".into()),
+                };
+                tracker_replace = Some(list);
+                continue;
+            }
+            if k == "auto-update-trackers" {
+                // 订阅自动更新开关（布尔语义，"false"/"0" 均视为关闭）
+                inner.auto_update_trackers = match v {
+                    Value::Bool(b) => *b,
+                    Value::String(s) => s != "false" && s != "0",
+                    Value::Null => false,
+                    _ => v.to_string() != "false" && v.to_string() != "0",
+                };
+                continue;
+            }
             let v = match v {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -1563,6 +1603,63 @@ impl TaskManager {
             inner.global_options.insert(k.clone(), v);
         }
         drop(inner);
+        // 全量替换全局 tracker：与 add/remove_global_tracker 相同的
+        // 增量语义（新增注入活动任务与引擎，移除从任务同步剔除）
+        if let Some(list) = tracker_replace {
+            let (added, removed): (Vec<String>, Vec<String>) = {
+                let mut inner = self.inner.lock().unwrap();
+                let old: std::collections::HashSet<&String> = inner.global_trackers.iter().collect();
+                let new: std::collections::HashSet<&String> = list.iter().collect();
+                let removed: Vec<String> = inner
+                    .global_trackers
+                    .iter()
+                    .filter(|t| !new.contains(*t))
+                    .cloned()
+                    .collect();
+                let added: Vec<String> =
+                    list.iter().filter(|t| !old.contains(*t)).cloned().collect();
+                inner.global_trackers = list;
+                for url in &added {
+                    inner
+                        .tracker_sources
+                        .entry(url.clone())
+                        .or_default()
+                        .insert("manual".into());
+                }
+                for url in &removed {
+                    inner.tracker_sources.remove(url);
+                }
+                (added, removed)
+            };
+            if !added.is_empty() {
+                self.apply_tracker_delta(&added, &[]);
+            }
+            if !removed.is_empty() {
+                // 从所有非终态 BT 任务的 tracker 列表剔除
+                let tasks: Vec<Arc<Task>> = {
+                    let inner = self.inner.lock().unwrap();
+                    inner
+                        .tasks
+                        .values()
+                        .filter(|t| {
+                            !t.status().is_terminal()
+                                && (t.bt_meta.lock().unwrap().is_some()
+                                    || t.bt_info_hash.lock().unwrap().is_some())
+                        })
+                        .cloned()
+                        .collect()
+                };
+                for task in tasks {
+                    let mut bt = task.bt_trackers.lock().unwrap();
+                    bt.retain(|t| !removed.contains(t));
+                }
+            }
+            tracing::info!(
+                added = added.len(),
+                removed = removed.len(),
+                "全局 tracker 列表已全量更新"
+            );
+        }
         if rate_changed {
             self.apply_rate_limits();
         }

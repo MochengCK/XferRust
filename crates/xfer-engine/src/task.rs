@@ -515,6 +515,39 @@ pub fn filter_keys(v: Value, keys: Option<&[String]>) -> Value {
     }
 }
 
+/// 计算 BT 任务的 info_hash 十六进制表示（None = 非 BT 任务）。
+/// .torrent 任务 bt_info_hash 不落盘，回退取 bt_meta 解析时计算的哈希。
+fn info_hash_hex(task: &Task) -> Option<String> {
+    if let Some(h) = &*task.bt_info_hash.lock().unwrap() {
+        return Some(h.iter().map(|b| format!("{b:02x}")).collect());
+    }
+    task.bt_meta
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.info_hash.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// 合成 aria2 风格 `bittorrent` 对象（前端 BT 识别与任务命名依赖）：
+/// - 非 BT 任务：`Null`（前端判 BT 依据 `task.bittorrent` 真值）；
+/// - 元数据就绪（.torrent / 磁力已取回元信息）：`{"info": {"name", "hash"}}`；
+/// - 磁力元数据获取中：`{}`（前端据此显示"获取元数据中"）。
+fn bittorrent_json(task: &Task, hash: Option<&str>) -> Value {
+    let Some(hash) = hash else {
+        return Value::Null;
+    };
+    match task.bt_meta.lock().unwrap().as_ref().map(|m| m.info.name.clone()) {
+        Some(name) => json!({
+            "info": {
+                "name": name,
+                "hash": hash,
+            },
+        }),
+        // 磁力任务：元数据获取中，尚无 info 字段
+        None => json!({}),
+    }
+}
+
 /// 任务状态 → 前端兼容协议 JSON（数值以字符串承载）。
 pub fn status_json(task: &Task) -> Value {
     let s = snapshot(task);
@@ -606,6 +639,15 @@ pub fn status_json(task: &Task) -> Value {
         0.0
     };
     m.insert("seedRatio".into(), json!(format!("{:.3}", seed_ratio)));
+    // BT 标识：bittorrent 对象（前端任务命名 / BT 识别依赖）与 infoHash
+    let info_hash = info_hash_hex(task);
+    if info_hash.is_some() {
+        m.insert(
+            "bittorrent".into(),
+            bittorrent_json(task, info_hash.as_deref()),
+        );
+        m.insert("infoHash".into(), json!(info_hash));
+    }
     Value::Object(m)
 }
 
@@ -665,6 +707,7 @@ pub fn status_json_native(task: &Task) -> Value {
         .filter(|p| p.seed)
         .count();
     let seeder = s.completed > 0 && s.total_len.is_some_and(|t| s.completed >= t && t > 0);
+    let hash = info_hash_hex(task);
     json!({
         "gid": s.gid,
         "status": s.status.as_str(),
@@ -693,5 +736,8 @@ pub fn status_json_native(task: &Task) -> Value {
         } else {
             0.0
         },
+        // BT 标识：bittorrent 对象（前端任务命名 / BT 识别依赖）与 infoHash
+        "infoHash": hash,
+        "bittorrent": bittorrent_json(task, hash.as_deref()),
     })
 }

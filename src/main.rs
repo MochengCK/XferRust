@@ -58,6 +58,10 @@ async fn run(cfg: EngineConfig) -> std::io::Result<()> {
         ),
         None => xfer_engine::TaskManager::start(cfg.download_dir.clone(), cfg.max_concurrent),
     };
+    // 命令行运行时选项（split / bt-* / enable-upnp 映射等）注入全局配置。
+    // 放在 start_with_session 之后：应用端每次启动都会携带最新配置，
+    // CLI 传值应覆盖会话恢复的旧值；Android 等无 CLI 场景不受影响。
+    manager.set_initial_options(&cfg.initial_options);
     let events = manager.events();
     let router = std::sync::Arc::new(xfer_rpc::Router::new(
         cfg.rpc_secret.clone(),

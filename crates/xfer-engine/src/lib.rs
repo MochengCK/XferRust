@@ -26,6 +26,9 @@ pub struct EngineConfig {
     pub log_level: Option<String>,
     /// 会话文件路径（Some 时开启持久化：启动恢复 + 状态转移自动落盘）。
     pub session: Option<PathBuf>,
+    /// 命令行携带的运行时全局选项（--key=value），启动时注入
+    /// global_options，与 RPC engine.changeOptions 同一存储。
+    pub initial_options: Vec<(String, String)>,
 }
 
 impl Default for EngineConfig {
@@ -38,6 +41,7 @@ impl Default for EngineConfig {
             log_file: None,
             log_level: None,
             session: None,
+            initial_options: Vec::new(),
         }
     }
 }
@@ -48,6 +52,26 @@ pub struct ParsedArgs {
     pub config: EngineConfig,
     pub ignored: Vec<String>,
 }
+
+/// 命令行可直通注入 global_options 的运行时选项
+/// （与 manager::change_global_option 接受的键保持一致）。
+const RUNTIME_OPTIONS: &[&str] = &[
+    "split",
+    "max-connection-per-server",
+    "min-split-size",
+    "max-overall-download-limit",
+    "max-overall-upload-limit",
+    "bt-max-peers",
+    "bt-adaptive",
+    "bt-seed-mode",
+    "bt-seed-ratio",
+    "bt-encryption",
+    "bt-protocol",
+    "bt-listen-port",
+    "dht-listen-port",
+    "bt-enable-lpd",
+    "bt-port-mapping",
+];
 
 /// 解析引擎命令行（`--key=value` 形式）。
 ///
@@ -107,6 +131,22 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParsedArgs {
                     cfg.session.get_or_insert_with(|| PathBuf::from(value));
                 }
             }
+            // 应用侧开关 → 引擎运行时选项映射：
+            // UPnP/NAT-PMP 端口映射、uTP 传输开关
+            "enable-upnp" | "enable-nat-pmp" => {
+                let on = value != "false" && value != "0";
+                cfg.initial_options
+                    .push(("bt-port-mapping".into(), on.to_string()));
+            }
+            "enable-utp" => {
+                let on = value != "false" && value != "0";
+                cfg.initial_options
+                    .push(("bt-protocol".into(), if on { "tcp+utp".into() } else { "tcp".into() }));
+            }
+            // 引擎在任务启动/下载时读取的运行时选项：直通注入
+            k if RUNTIME_OPTIONS.contains(&k) => {
+                cfg.initial_options.push((k.to_string(), value.to_string()));
+            }
             _ => ignored.push(format!("--{key}")),
         }
     }
@@ -129,9 +169,9 @@ mod tests {
             "--max-concurrent-downloads=10".to_string(),
             "--log=/tmp/x.log".to_string(),
             "--log-level=warn".to_string(),
-            "--listen-port=21301".to_string(), // 已知但未实现
-            "--bt-max-peers=128".to_string(),  // 已知但未实现
-            "--enable-dht=true".to_string(),   // 已知但未实现
+            "--listen-port=21301".to_string(), // 已知但未实现 → 忽略告警
+            "--bt-max-peers=128".to_string(),  // 运行时选项 → 注入 global_options
+            "--enable-dht=true".to_string(),   // 已知但未实现 → 忽略告警
         ]);
         assert_eq!(p.config.rpc_listen_port, 21301);
         assert_eq!(p.config.rpc_secret.as_deref(), Some("abc"));
@@ -139,7 +179,20 @@ mod tests {
         assert_eq!(p.config.max_concurrent, 10);
         assert_eq!(p.config.log_file, Some(PathBuf::from("/tmp/x.log")));
         assert_eq!(p.config.log_level.as_deref(), Some("warn"));
-        assert_eq!(p.ignored.len(), 3);
+        assert_eq!(p.ignored, vec!["--listen-port", "--enable-dht"]);
+        assert!(p.config.initial_options.contains(&("bt-max-peers".to_string(), "128".to_string())));
+    }
+
+    #[test]
+    fn maps_app_toggles() {
+        let p = parse_args([
+            "--enable-upnp=true".to_string(),
+            "--enable-utp=false".to_string(),
+            "--enable-nat-pmp=true".to_string(),
+        ]);
+        assert!(p.ignored.is_empty());
+        assert!(p.config.initial_options.contains(&("bt-port-mapping".to_string(), "true".to_string())));
+        assert!(p.config.initial_options.contains(&("bt-protocol".to_string(), "tcp".to_string())));
     }
 
     #[test]
