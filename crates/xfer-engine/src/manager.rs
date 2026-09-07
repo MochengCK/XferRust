@@ -4,10 +4,11 @@
 //! 下载由独立的 tokio 任务驱动，`fill_slots` 按并发槽拉起。
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Notify};
@@ -188,6 +189,9 @@ struct Inner {
     tracker_subscriptions: Vec<TrackerSubscription>,
     /// 是否启用 Tracker 订阅自动更新（默认 true）。
     auto_update_trackers: bool,
+    /// 全局 BT 封禁名单：IP → 过期时刻（None = 永久）。作用于所有
+    /// BT 任务（aria2 banPeer 的全局语义），随会话持久化。
+    bt_bans: HashMap<IpAddr, Option<Instant>>,
 }
 
 /// Tracker 订阅源：远程 URL 返回纯文本（每行一个 tracker URL）。
@@ -253,6 +257,7 @@ impl TaskManager {
                 tracker_sources: HashMap::new(),
                 tracker_subscriptions: Vec::new(),
                 auto_update_trackers: true,
+                bt_bans: HashMap::new(),
             }),
             bt_engines: Mutex::new(HashMap::new()),
             kick: Notify::new(),
@@ -393,6 +398,34 @@ impl TaskManager {
                 .collect();
             if !gt.is_empty() {
                 mgr.inner.lock().unwrap().global_trackers = gt;
+            }
+        }
+        // 恢复 BT 封禁名单（过滤已过期条目；expires 为 Unix 秒，0 = 永久）
+        if let Some(bans) = v
+            .as_ref()
+            .and_then(|v| v["settings"]["btIpBans"].as_array())
+        {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let mut restored: HashMap<IpAddr, Option<Instant>> = HashMap::new();
+            for entry in bans {
+                let Some(ip) = entry.get("ip").and_then(Value::as_str).and_then(|s| s.parse().ok())
+                else {
+                    continue;
+                };
+                let expires = match entry.get("expires").and_then(Value::as_u64).unwrap_or(0) {
+                    0 => None,
+                    secs if secs > now_unix => {
+                        Some(Instant::now() + Duration::from_secs(secs - now_unix))
+                    }
+                    _ => continue, // 已过期：丢弃
+                };
+                restored.insert(ip, expires);
+            }
+            if !restored.is_empty() {
+                mgr.inner.lock().unwrap().bt_bans = restored;
             }
         }
         // 恢复 Tracker 订阅源
@@ -623,7 +656,7 @@ impl TaskManager {
                 }
                 json!({
                     "gid": s.gid,
-                    "uris": t.uris,
+                    "uris": t.uris.lock().unwrap().clone(),
                     "dir": s.dir,
                     "out": t.out,
                     "checksum": t.checksum.as_ref().map(|(a, e)| format!("{a:?}={e}").to_lowercase()),
@@ -654,6 +687,25 @@ impl TaskManager {
         for (k, v) in &inner.global_options {
             global_opts.insert(k.clone(), Value::String(v.clone()));
         }
+        // BT 封禁名单：过滤已过期条目，expires 为 Unix 秒（0 = 永久）
+        let now = Instant::now();
+        let bt_ip_bans: Vec<Value> = inner
+            .bt_bans
+            .iter()
+            .filter(|(_, e)| e.map(|t| t > now).unwrap_or(true))
+            .map(|(ip, e)| {
+                json!({
+                    "ip": ip.to_string(),
+                    "expires": e.map(|t| {
+                        t.duration_since(Instant::now()).as_secs()
+                            + std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0)
+                    }).unwrap_or(0),
+                })
+            })
+            .collect();
         json!({
             "version": 1,
             "settings": {
@@ -664,6 +716,7 @@ impl TaskManager {
                 "trackerSubscriptions": inner.tracker_subscriptions.clone(),
                 "trackerSources": inner.tracker_sources.clone(),
                 "autoUpdateTrackers": inner.auto_update_trackers,
+                "btIpBans": bt_ip_bans,
             },
             "stoppedTotal": inner.stopped_total,
             "tasks": tasks,
@@ -1515,6 +1568,8 @@ impl TaskManager {
         // bt-trackers：全量替换语义（应用端每次推送完整列表），
         // 原始值可能是数组或换行/逗号分隔的字符串，需在字符串化前处理
         let mut tracker_replace: Option<Vec<String>> = None;
+        // bt-ip-ban-list：永久封禁名单的全量替换（应用端 BT IP 封禁偏好）
+        let mut ban_replace: Option<Vec<String>> = None;
         for (k, v) in opts {
             if k == "bt-trackers" {
                 let list: Vec<String> = match v {
@@ -1532,6 +1587,29 @@ impl TaskManager {
                     _ => return Err("bt-trackers 必须是字符串数组".into()),
                 };
                 tracker_replace = Some(list);
+                continue;
+            }
+            if k == "bt-ip-ban-list" {
+                let list: Vec<String> = match v {
+                    Value::Array(a) => a
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    Value::String(s) => s
+                        .split(|c| c == '\n' || c == ',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    _ => return Err("bt-ip-ban-list 必须是 IP 数组".into()),
+                };
+                for ip in &list {
+                    if ip.parse::<IpAddr>().is_err() {
+                        return Err(format!("bt-ip-ban-list 含非法 IP: {ip}"));
+                    }
+                }
+                ban_replace = Some(list);
                 continue;
             }
             if k == "auto-update-trackers" {
@@ -1659,6 +1737,23 @@ impl TaskManager {
                 removed = removed.len(),
                 "全局 tracker 列表已全量更新"
             );
+        }
+        // 全量替换永久封禁名单：新增条目永久封禁，被移除的旧永久条目
+        // 解封（限时封禁不受影响）；即时下发活动引擎
+        if let Some(list) = ban_replace {
+            let parsed: Vec<IpAddr> = list.iter().filter_map(|s| s.parse().ok()).collect();
+            let parsed_set: std::collections::HashSet<IpAddr> = parsed.iter().copied().collect();
+            {
+                let mut inner = self.inner.lock().unwrap();
+                inner
+                    .bt_bans
+                    .retain(|ip, e| !(e.is_none() && !parsed_set.contains(ip)));
+                for ip in &parsed {
+                    inner.bt_bans.insert(*ip, None);
+                }
+            }
+            self.apply_bans_to_running();
+            tracing::info!(count = parsed.len(), "全局 BT IP 封禁名单已全量更新");
         }
         if rate_changed {
             self.apply_rate_limits();
@@ -1863,6 +1958,7 @@ impl TaskManager {
                     "protocol": p.protocol,
                     "connectedSecs": p.connected_secs,
                     "progress": p.progress,
+                    "bitfield": p.bitfield,
                 })
             })
             .collect();
@@ -1967,9 +2063,211 @@ impl TaskManager {
         Ok(())
     }
 
-    /// 查询 BT 任务的 tracker 列表。
-    pub fn get_trackers(&self, gid: &Gid) -> Result<Value, String> {
+    // ------------------------------------------------------------------
+    // BT IP 封禁
+    // ------------------------------------------------------------------
+
+    /// 封禁 BT 对端 IP（原生 task.banPeer；aria2 banPeer 的全局语义，
+    /// `gid` 仅作归属校验不限定作用域）。
+    ///
+    /// - `duration_secs <= 0` 视为永久封禁，否则到期自动解封；
+    /// - 立即下发所有活动 BT 引擎（断开现有连接 + 拒绝后续连接）；
+    /// - 随会话持久化，重启后继续生效。
+    pub fn ban_peer_ip(&self, ip: &str, duration_secs: i64) -> Result<(), String> {
+        let parsed: IpAddr = ip
+            .trim()
+            .parse()
+            .map_err(|_| format!("IP 地址非法: {ip}"))?;
+        let expires = if duration_secs > 0 {
+            Some(Instant::now() + Duration::from_secs(duration_secs as u64))
+        } else {
+            None
+        };
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.bt_bans.insert(parsed, expires);
+            // 顺手清理其它已过期条目，避免名单无限增长
+            let now = Instant::now();
+            inner.bt_bans.retain(|_, e| e.map(|t| t > now).unwrap_or(true));
+        }
+        self.apply_bans_to_running();
+        self.save_session_now();
+        tracing::info!(ip = %parsed, secs = duration_secs, "封禁对端 IP");
+        Ok(())
+    }
+
+    /// 解封 BT 对端 IP（原生 task.unbanPeer）。全局作用域。
+    pub fn unban_peer_ip(&self, ip: &str) -> Result<(), String> {
+        let parsed: IpAddr = ip
+            .trim()
+            .parse()
+            .map_err(|_| format!("IP 地址非法: {ip}"))?;
+        let existed = self.inner.lock().unwrap().bt_bans.remove(&parsed).is_some();
+        // 无论名单里是否有记录都通知引擎解封：名单只在管理器侧保存，
+        // 引擎侧可能存在任务启动前批量下发的旧条目
+        {
+            let engines: Vec<Arc<TorrentEngine>> =
+                self.bt_engines.lock().unwrap().values().cloned().collect();
+            for engine in engines {
+                engine.unban_ip(&parsed);
+            }
+        }
+        if existed {
+            self.save_session_now();
+        }
+        tracing::info!(ip = %parsed, existed, "解封对端 IP");
+        Ok(())
+    }
+
+    /// 当前未过期的封禁名单快照（新 BT 引擎启动时批量下发用）。
+    fn bt_bans_snapshot(&self) -> Vec<(IpAddr, Option<Instant>)> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .bt_bans
+            .retain(|_, e| e.map(|t| t > now).unwrap_or(true));
+        inner.bt_bans.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// 把当前封禁名单下发到指定 BT 引擎（任务启动路径）。
+    fn apply_bans_to_engine(&self, engine: &Arc<TorrentEngine>) {
+        for (ip, expires) in self.bt_bans_snapshot() {
+            engine.ban_ip(ip, expires);
+        }
+    }
+
+    /// 把当前封禁名单下发到所有活动 BT 引擎（ban/unban RPC 路径）。
+    fn apply_bans_to_running(&self) {
+        let bans = self.bt_bans_snapshot();
+        if bans.is_empty() {
+            // 名单可能整体解空，仍需通知运行中的引擎清掉旧条目
+            let engines: Vec<Arc<TorrentEngine>> =
+                self.bt_engines.lock().unwrap().values().cloned().collect();
+            for engine in engines {
+                let banned: Vec<IpAddr> = engine.banned_ips();
+                for ip in banned {
+                    engine.unban_ip(&ip);
+                }
+            }
+            return;
+        }
+        let engines: Vec<Arc<TorrentEngine>> =
+            self.bt_engines.lock().unwrap().values().cloned().collect();
+        for engine in engines {
+            // 先解掉引擎侧不在最新名单中的条目，再全量下发
+            let stale: Vec<IpAddr> = engine
+                .banned_ips()
+                .into_iter()
+                .filter(|ip| !bans.iter().any(|(b, _)| b == ip))
+                .collect();
+            for ip in stale {
+                engine.unban_ip(&ip);
+            }
+            for (ip, expires) in &bans {
+                engine.ban_ip(*ip, *expires);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // HTTP 任务 URI 维护（changeUri / getServers）
+    // ------------------------------------------------------------------
+
+    /// 更新任务 URI（原生 task.changeUri，aria2 兼容语义）。
+    ///
+    /// 仅支持 waiting/paused 的 HTTP 任务（BT 任务无 URI 概念）：
+    /// 从 `file_index` 对应文件（本引擎 HTTP 任务单文件）的 URI 列表
+    /// 中删除 `del_uris`，追加 `add_uris`。active 状态返回错误
+    /// （与 aria2 一致，应用端会回退为"暂停→重建任务"路径）。
+    pub fn change_uri(
+        &self,
+        gid: &Gid,
+        file_index: usize,
+        del_uris: Vec<String>,
+        add_uris: Vec<String>,
+    ) -> Result<Value, String> {
         let task = self.task_of(gid)?;
+        if task.bt_meta.lock().unwrap().is_some()
+            || task.bt_info_hash.lock().unwrap().is_some()
+        {
+            return Err(format!("Cannot change URI for BT GID#{}", gid.0));
+        }
+        if file_index != 1 {
+            return Err(format!("fileIndex {} 不存在（HTTP 任务单文件）", file_index));
+        }
+        match task.status() {
+            Status::Waiting | Status::Paused => {}
+            other => {
+                return Err(format!(
+                    "Cannot change URI for GID#{} (status={})",
+                    gid.0,
+                    other.as_str()
+                ))
+            }
+        }
+        let mut uris = task.uris.lock().unwrap().clone();
+        // 删除待移除 URI（全部匹配项），空列表表示不删除
+        for del in &del_uris {
+            uris.retain(|u| u != del);
+        }
+        // 追加新 URI（与 aria2 一致：addUris 直接落表尾，调度时按序取用）
+        let mut added = 0usize;
+        for add in &add_uris {
+            if !add.trim().is_empty() {
+                uris.push(add.clone());
+                added += 1;
+            }
+        }
+        if uris.is_empty() {
+            return Err("Cannot change URI: 结果 URI 列表为空".into());
+        }
+        *task.uris.lock().unwrap() = uris;
+        // URI 状态重建为 Waiting：任务恢复后由 worker 重新取用
+        *task.uri_states.lock().unwrap() =
+            vec![crate::task::UriState::Waiting; task.uris.lock().unwrap().len()];
+        tracing::info!(
+            gid = %gid,
+            deleted = del_uris.len(),
+            added,
+            "任务 URI 已更新"
+        );
+        self.save_session_now();
+        Ok(json!({"ok": true, "added": added}))
+    }
+
+    /// 任务服务器列表（原生 task.getServers，aria2 getServers 兼容形状）。
+    /// HTTP 任务返回当前 URI 的汇总条目（本引擎同一时刻仅对一个 URI
+    /// 活跃，逐服务器语义上即单条目）；BT 任务无服务器概念返回空数组。
+    /// 汇总条目的 downloadSpeed/downloadLength 为任务级实时值。
+    pub fn get_servers(&self, gid: &Gid) -> Result<Value, String> {
+        let task = self.task_of(gid)?;
+        if task.bt_meta.lock().unwrap().is_some()
+            || task.bt_info_hash.lock().unwrap().is_some()
+        {
+            return Ok(Value::Array(vec![]));
+        }
+        let status = task.status();
+        if status.is_terminal() {
+            return Ok(Value::Array(vec![]));
+        }
+        let Some(uri) = task.uris.lock().unwrap().first().cloned() else {
+            return Ok(Value::Array(vec![]));
+        };
+        let entry = json!({
+            "index": 1,
+            "servers": [{
+                "index": 1,
+                "currentUri": uri.clone(),
+                "uri": uri,
+                "downloadSpeed": task.speed_live(),
+                "downloadLength": task.completed_live(),
+            }],
+        });
+        Ok(Value::Array(vec![entry]))
+    }
+
+    /// 查询 BT 任务的 tracker 列表。
+    pub fn get_trackers(&self, gid: &Gid) -> Result<Value, String> {        let task = self.task_of(gid)?;
         if task.bt_meta.lock().unwrap().is_none() && task.bt_info_hash.lock().unwrap().is_none() {
             return Err("非 BT 任务，无 tracker 信息".into());
         }
@@ -2631,32 +2929,33 @@ fn read_session_file(path: &std::path::Path) -> Option<Value> {
     }
 }
 
-/// 每秒广播进度事件（订阅方推送用，免轮询）；速度按 3s 窗口采样，
-/// 避免片级批量落盘导致 1s 窗口在 0 与尖峰间抖动。
+/// 每秒广播进度事件（订阅方推送用，免轮询）；速度按 3s 滑动窗口
+/// 计算且**每秒刷新一次**——窗口平均抹平片级批量落盘造成的 0↔尖峰
+/// 抖动，同时 UI 每秒都能读到新速度值（旧实现每 3s 才更新一次，
+/// 前端表现为速度数字长时间纹丝不动、不实时）。
 ///
 /// 全程无锁：进度读 [`Task::completed_live`]（原子优先），
 /// 速度写 `speed_atomic`（查询侧经 [`Task::speed_live`] 读取），
 /// 不与下载落盘热路径争抢任务锁。
 async fn speed_ticker(task: Arc<Task>, events: broadcast::Sender<EngineEvent>) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
-    let mut prev = task.completed_live();
-    let mut prev_uploaded = task.uploaded_live();
-    let mut sample_count = 1u64;
+    // 滑动窗口：每秒记录一次 (completed, uploaded) 累计快照，
+    // 速度 = (最新 - 窗口最早样本) / 跨越秒数。窗口 3 个样本
+    // （跨度 2-3s）；样本数未满窗口时按实际跨度折算。
+    const WINDOW_SECS: usize = 3;
+    let mut samples: VecDeque<(u64, u64)> = VecDeque::with_capacity(WINDOW_SECS + 1);
     loop {
         interval.tick().await;
-        sample_count += 1;
-        if sample_count >= 3 {
-            let cur = task.completed_live();
+        samples.push_back((task.completed_live(), task.uploaded_live()));
+        while samples.len() > WINDOW_SECS + 1 {
+            samples.pop_front();
+        }
+        if let (Some(&(c0, u0)), Some(&(c1, u1))) = (samples.front(), samples.back()) {
+            let span = (samples.len() - 1).max(1) as u64;
             task.speed_atomic
-                .store(cur.saturating_sub(prev) / sample_count, Ordering::Relaxed);
-            let cur_uploaded = task.uploaded_live();
-            task.upload_speed_atomic.store(
-                cur_uploaded.saturating_sub(prev_uploaded) / sample_count,
-                Ordering::Relaxed,
-            );
-            prev = cur;
-            prev_uploaded = cur_uploaded;
-            sample_count = 0;
+                .store(c1.saturating_sub(c0) / span, Ordering::Relaxed);
+            task.upload_speed_atomic
+                .store(u1.saturating_sub(u0) / span, Ordering::Relaxed);
         }
         let _ = events.send(("progress".to_string(), task.gid.0.clone()));
     }
@@ -2789,6 +3088,8 @@ async fn drive_bt_download(
         .lock()
         .unwrap()
         .insert(task.gid.clone(), engine.clone());
+    // 新引擎应用全局封禁名单（断开/拒绝名单内 IP 的连接）
+    _mgr.apply_bans_to_engine(&engine);
     // 记录数据路径：删除任务时据此清理控制文件与数据文件（磁力链接在元信息到手后补齐）
     if let Some(m) = &meta {
         let mut sh = task.shared.lock().unwrap();
@@ -2822,6 +3123,10 @@ async fn drive_bt_download(
                 task.connections_atomic.store(conn_count as u64, Ordering::Relaxed);
                 task.uploaded_atomic.store(engine.uploaded(), Ordering::Relaxed);
                 *task.bt_peers.lock().unwrap() = peers;
+                // 分片位图同步（分片展示用）：暂停后任务字段保留最后状态
+                if let Some(bf) = engine.bitfield() {
+                    *task.bt_bitfield.lock().unwrap() = bf;
+                }
                 // 磁力任务：元数据就绪即回填 bt_meta（文件列表/详情页立即可见）
                 if task.bt_meta.lock().unwrap().is_none() {
                     if let Some(m) = engine.meta() {
@@ -2869,6 +3174,10 @@ async fn drive_bt_download(
     task.completed_atomic.store(p.done, Ordering::Relaxed);
     task.uploaded_atomic.store(engine.uploaded(), Ordering::Relaxed);
     *task.bt_peers.lock().unwrap() = engine.peers_info();
+    // 停机后同步最终位图（完成/暂停时的快照，避免 1Hz ticker 末次采样缺失）
+    if let Some(bf) = engine.bitfield() {
+        *task.bt_bitfield.lock().unwrap() = bf;
+    }
     // 磁力链接补齐数据路径：引擎运行中拿到元信息后才能确定落盘路径
     {
         let mut sh = task.shared.lock().unwrap();
@@ -2921,7 +3230,10 @@ async fn drive_download(
 ) -> Result<(), TaskFailure> {
     let mut last_err: Option<TaskFailure> = None;
     let mut path_reset_done = false;
-    for (idx, uri) in task.uris.iter().enumerate() {
+    // URI 列表快照：驱动期间 changeUri 可能并发更新（仅 waiting/paused
+    // 可改，active 驱动中读取的是启动时列表），克隆避免跨 await 持锁
+    let uris_snapshot = task.uris.lock().unwrap().clone();
+    for (idx, uri) in uris_snapshot.iter().enumerate() {
         let mut attempt = 1u32;
         loop {
             let progress_before = task.completed_live();

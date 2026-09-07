@@ -648,6 +648,10 @@ pub struct PeerInfo {
     pub connected_secs: u64,
     /// 对端下载进度百分比（0-100）。磁力元数据未就绪、位图未知时为 None。
     pub progress: Option<f32>,
+    /// 对端已拥有片的位图（wire 语义十六进制：每片 1 bit，字节内
+    /// 高位在前，即 BEP 3 bitfield 的 hex 编码）。seed 为全 1；
+    /// 位图未知（磁力元数据未就绪）为空串。
+    pub bitfield: String,
 }
 
 struct PeerCell {
@@ -827,6 +831,9 @@ pub struct TorrentEngine {
     /// 本会话已断开 peer 的最后快照（getPeers 的 disconnected 分组），
     /// 上限 [`MAX_DISCONNECTED_PEERS`]，超出淘汰最旧。
     disconnected_peers: Mutex<Vec<PeerInfo>>,
+    /// 被封禁的对端 IP → 过期时刻（None = 永久）。封禁作用于
+    /// 拨号、TCP/uTP 入站两条路径，封禁时立即断开该 IP 现有连接。
+    banned: Mutex<HashMap<IpAddr, Option<Instant>>>,
     /// 续传控制文件上次写入时间（节流：片完成时最多 1s 写一次）。
     last_resume_save: Mutex<Instant>,
     /// 引擎级停机信号：暂停/取消/完成时置位，所有后台任务
@@ -957,6 +964,7 @@ impl TorrentEngine {
             optimistic_unchoke: Mutex::new(None),
             dial_failures: Mutex::new(HashMap::new()),
             disconnected_peers: Mutex::new(Vec::new()),
+            banned: Mutex::new(HashMap::new()),
             last_resume_save: Mutex::new(Instant::now() - Duration::from_secs(60)),
             shutdown: CancellationToken::new(),
             dht: Mutex::new(None),
@@ -1015,6 +1023,7 @@ impl TorrentEngine {
             optimistic_unchoke: Mutex::new(None),
             dial_failures: Mutex::new(HashMap::new()),
             disconnected_peers: Mutex::new(Vec::new()),
+            banned: Mutex::new(HashMap::new()),
             last_resume_save: Mutex::new(Instant::now() - Duration::from_secs(60)),
             shutdown: CancellationToken::new(),
             dht: Mutex::new(None),
@@ -1220,6 +1229,10 @@ impl TorrentEngine {
                 };
                 match accepted {
                     Ok((stream, addr)) => {
+                        if engine.is_banned(&addr.ip()) {
+                            tracing::debug!(peer = %addr, "拒绝来自封禁 IP 的入站连接");
+                            continue;
+                        }
                         configure_tcp_low_latency(&stream);
                         let e = engine.clone();
                         tokio::spawn(async move {
@@ -1387,6 +1400,11 @@ impl TorrentEngine {
                 continue;
             }
             let addr = stream.remote_addr();
+            // 封禁名单过滤（run_peer 内亦有兜底，这里提前丢弃省去任务开销）
+            if self.is_banned(&addr.ip()) {
+                tracing::debug!(peer = %addr, "拒绝来自封禁 IP 的 uTP 入站连接");
+                continue;
+            }
             let e = self.clone();
             tokio::spawn(async move {
                 if let Err(e2) = e.run_peer(addr, stream, false, None).await {
@@ -2009,6 +2027,8 @@ impl TorrentEngine {
                 return;
             }
             let mut pending = self.pending.lock().unwrap();
+            // 封禁名单内的地址：直接移除，避免占用连接名额被反复选中
+            pending.retain(|a, _| !self.is_banned(&a.ip()));
             // 从 pending 中取 need 个（跳过不可路由/0 端口地址）
             let taken: Vec<(SocketAddr, PeerSource)> = pending
                 .iter()
@@ -2152,6 +2172,7 @@ impl TorrentEngine {
             protocol: cell.transport.lock().unwrap().as_str().to_string(),
             connected_secs: st.connected_at.elapsed().as_secs(),
             progress: peer_progress(&st),
+            bitfield: peer_bitfield_hex(&st),
         };
         drop(st);
         let mut dc = self.disconnected_peers.lock().unwrap();
@@ -2312,6 +2333,86 @@ impl TorrentEngine {
         }
     }
 
+    /// 本端已完成片位图（wire 语义：每片 1 bit，字节内高位在前）。
+    /// 元数据未就绪（磁力解析阶段）返回 None。供 RPC 分片展示
+    /// （aria2 兼容 bitfield 字段）使用。
+    pub fn bitfield(&self) -> Option<Vec<u8>> {
+        let guard = self.store.lock().unwrap();
+        guard.as_ref().map(|s| s.bitfield())
+    }
+
+    /// 当前片数（元数据未就绪为 0）。
+    pub fn piece_count(&self) -> u32 {
+        self.store
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.piece_count())
+            .unwrap_or(0)
+    }
+
+    // ------------------------------------------------------------------
+    // IP 封禁
+    // ------------------------------------------------------------------
+
+    /// 封禁 IP：`expires` 为过期时刻（None = 永久）。立即断开该 IP 的
+    /// 现有连接并清出 pending；此后拨号与入站路径全部拒之门外。
+    /// 重复封禁以最后一次为准（可延长/缩短）。
+    pub fn ban_ip(&self, ip: IpAddr, expires: Option<Instant>) {
+        self.banned.lock().unwrap().insert(ip, expires);
+        // 断开该 IP 的现有连接（kill 令牌 → 会话循环退出 → 正常注销）
+        let victims: Vec<Arc<PeerCell>> = {
+            let peers = self.peers.read().unwrap();
+            peers
+                .iter()
+                .filter(|(a, _)| a.ip() == ip)
+                .map(|(_, c)| c.clone())
+                .collect()
+        };
+        let peer_count = victims.len();
+        for cell in victims {
+            cell.kill.cancel();
+        }
+        // pending 中同一 IP 的待连地址一并剔除
+        self.pending.lock().unwrap().retain(|a, _| a.ip() != ip);
+        tracing::info!(
+            ip = %ip,
+            permanent = expires.is_none(),
+            peers = peer_count,
+            "IP 已封禁"
+        );
+    }
+
+    /// 解封 IP。返回是否确有记录被移除。
+    pub fn unban_ip(&self, ip: &IpAddr) -> bool {
+        let removed = self.banned.lock().unwrap().remove(ip).is_some();
+        if removed {
+            tracing::info!(ip = %ip, "IP 已解封");
+        }
+        removed
+    }
+
+    /// IP 是否处于封禁状态（惰性清理：过期条目在读路径移除）。
+    pub fn is_banned(&self, ip: &IpAddr) -> bool {
+        let mut banned = self.banned.lock().unwrap();
+        match banned.get(ip).copied() {
+            None => false,
+            Some(Some(t)) if Instant::now() >= t => {
+                banned.remove(ip);
+                false
+            }
+            Some(_) => true,
+        }
+    }
+
+    /// 当前未过期的封禁名单（管理器侧全量同步名单时对比用）。
+    pub fn banned_ips(&self) -> Vec<IpAddr> {
+        let now = Instant::now();
+        let mut banned = self.banned.lock().unwrap();
+        banned.retain(|_, e| e.map(|t| t > now).unwrap_or(true));
+        banned.keys().copied().collect()
+    }
+
     /// 累计上传字节数（实际发出的 piece 数据）。
     pub fn uploaded(&self) -> u64 {
         self.uploaded_bytes.load(Ordering::Relaxed)
@@ -2387,6 +2488,14 @@ impl TorrentEngine {
 
     /// 对端列表（getPeers 用）：当前在线 + 本会话已断开的最后快照。
     pub fn peers_info(&self) -> Vec<PeerInfo> {
+        // store 片数先取（避免在 peers 读锁内再锁 store 的顺序耦合）
+        let store_pieces = self
+            .store
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.piece_count())
+            .unwrap_or(0);
         let mut out: Vec<PeerInfo> = self
             .peers
             .read()
@@ -2395,6 +2504,7 @@ impl TorrentEngine {
             .map(|c| {
                 let st = c.state.lock().unwrap();
                 let progress = peer_progress(&st);
+                let bitfield = peer_bitfield_hex_with(&st, store_pieces);
                 PeerInfo {
                     addr: c.addr.to_string(),
                     peer_id: st
@@ -2412,6 +2522,7 @@ impl TorrentEngine {
                     protocol: c.transport.lock().unwrap().as_str().to_string(),
                     connected_secs: st.connected_at.elapsed().as_secs(),
                     progress,
+                    bitfield,
                 }
             })
             .collect();
@@ -2673,6 +2784,12 @@ impl TorrentEngine {
             + Send
             + 'static,
     {
+        // 封禁名单过滤（出站拨号与 TCP/uTP 入站的统一关卡）：
+        // 主动连接在此拒连，被动连接直接丢弃流（socket 随 drop 关闭）。
+        if self.is_banned(&addr.ip()) {
+            tracing::debug!(peer = %addr, "拒绝来自封禁 IP 的连接");
+            return Err("IP 已封禁".into());
+        }
         match existing_cell {
             // 主动连接：cell 由调用方持有，收尾也由调用方执行
             Some(cell) => {
@@ -5045,6 +5162,34 @@ fn peer_progress(st: &PeerState) -> Option<f32> {
         return None;
     }
     Some(st.have.done_count() as f32 / total as f32 * 100.0)
+}
+
+/// 字节序列 → 小写十六进制（aria2 bitfield 兼容编码）。
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// 对端位图 → hex（seed 填全 1 位图；`store_pieces` 为本端已知片数，
+/// 用于 seed 在本端元数据尚未就绪时仍能产出正确长度的全 1 位图）。
+fn peer_bitfield_hex_with(st: &PeerState, store_pieces: u32) -> String {
+    if st.is_seed {
+        let count = st.have.count().max(store_pieces);
+        let mut full = PieceMap::new(count);
+        full.set_all();
+        return hex_encode(&full.to_bitfield());
+    }
+    hex_encode(&st.have.to_bitfield())
+}
+
+/// 对端位图 → hex（无本端片数上下文，seed 用对端自身位图长度）。
+fn peer_bitfield_hex(st: &PeerState) -> String {
+    peer_bitfield_hex_with(st, 0)
 }
 
 /// Azureus 前缀的版本段解析：`-qB4570-` → "4.5.7"。

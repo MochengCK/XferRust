@@ -137,6 +137,48 @@ impl NativeDispatcher {
             "task.getUris" => e.get_uris(&gid("gid")?),
             "task.getPeers" => e.get_peers(&gid("gid")?),
             "task.getTrackers" => e.get_trackers(&gid("gid")?),
+            "task.getServers" => e.get_servers(&gid("gid")?),
+            "task.changeUri" => {
+                let gid = gid("gid")?;
+                let file_index = obj
+                    .get("fileIndex")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1)
+                    .max(1) as usize;
+                let str_list = |v: Option<&Value>| -> Vec<String> {
+                    v.and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(|s| s.to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let del_uris = str_list(obj.get("delUris"));
+                let add_uris = str_list(obj.get("addUris"));
+                e.change_uri(&gid, file_index, del_uris, add_uris)
+            }
+            "task.banPeer" => {
+                let _gid = gid("gid")?;
+                let ip = obj
+                    .get("ip")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "参数 ip 缺失".to_string())?;
+                let duration = obj
+                    .get("duration")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(-1);
+                e.ban_peer_ip(ip, duration).map(|_| json!({"ok": true}))
+            }
+            "task.unbanPeer" => {
+                let _gid = gid("gid")?;
+                let ip = obj
+                    .get("ip")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "参数 ip 缺失".to_string())?;
+                e.unban_peer_ip(ip).map(|_| json!({"ok": true}))
+            }
             "task.addTrackers" => {
                 let gid = gid("gid")?;
                 let trackers: Vec<String> = obj
@@ -165,7 +207,7 @@ impl NativeDispatcher {
             "engine.getVersion" => Ok(json!({
                 "name": ENGINE_NAME,
                 "version": ENGINE_VERSION,
-                "features": ["http", "resume", "checksum", "bt", "events"],
+                "features": ["http", "resume", "checksum", "bt", "events", "bitfield", "ban-peer", "change-uri", "get-servers"],
             })),
             "engine.globalStat" => Ok(e.global_stat_native()),
             "engine.getOptions" => Ok(e.get_global_option()),

@@ -132,7 +132,8 @@ pub struct TaskShared {
 /// 一个下载任务。
 pub struct Task {
     pub gid: Gid,
-    pub uris: Vec<String>,
+    /// 任务 URI 列表（可经 task.changeUri 运行时更新，Mutex 保护）。
+    pub uris: Mutex<Vec<String>>,
     pub dir: PathBuf,
     /// out 选项指定的文件名（可选）。
     pub out: Option<String>,
@@ -150,6 +151,10 @@ pub struct Task {
     pub bt_trackers: Mutex<Vec<String>>,
     /// BT 任务当前连接 peer 列表（getPeers 查询用）。
     pub bt_peers: Mutex<Vec<PeerInfo>>,
+    /// BT 任务本端已完成片位图（wire 语义字节流，驱动侧 1Hz 同步；
+    /// status 查询时序列化为 aria2 兼容 hex 字符串）。任务暂停后保留
+    /// 最后已知状态供 UI 展示；非 BT 任务恒为空。
+    pub bt_bitfield: Mutex<Vec<u8>>,
     /// 磁力任务等待文件选择：元数据就绪后自动暂停，等用户在 TUI
     /// 勾选要下载的文件（`bt-file-selection` 任务选项置位）。
     pub awaiting_selection: AtomicBool,
@@ -195,7 +200,7 @@ impl Task {
         Self {
             uri_states: Mutex::new(vec![UriState::Waiting; uris.len()]),
             gid,
-            uris,
+            uris: Mutex::new(uris),
             dir,
             out,
             checksum,
@@ -204,6 +209,7 @@ impl Task {
             bt_info_hash: Mutex::new(None),
             bt_trackers: Mutex::new(Vec::new()),
             bt_peers: Mutex::new(Vec::new()),
+            bt_bitfield: Mutex::new(Vec::new()),
             awaiting_selection: AtomicBool::new(false),
             selected_files: Mutex::new(None),
             created_at: SystemTime::now(),
@@ -247,7 +253,7 @@ impl Task {
         Self {
             uri_states: Mutex::new(Vec::new()),
             gid,
-            uris: Vec::new(),
+            uris: Mutex::new(Vec::new()),
             dir,
             out: None,
             checksum: None,
@@ -256,6 +262,7 @@ impl Task {
             bt_info_hash: Mutex::new(None),
             bt_trackers: Mutex::new(Vec::new()),
             bt_peers: Mutex::new(Vec::new()),
+            bt_bitfield: Mutex::new(Vec::new()),
             awaiting_selection: AtomicBool::new(false),
             selected_files: Mutex::new(None),
             created_at: SystemTime::now(),
@@ -299,7 +306,7 @@ impl Task {
         Self {
             uri_states: Mutex::new(Vec::new()),
             gid,
-            uris: Vec::new(),
+            uris: Mutex::new(Vec::new()),
             dir,
             out: None,
             checksum: None,
@@ -308,6 +315,7 @@ impl Task {
             bt_info_hash: Mutex::new(Some(info_hash)),
             bt_trackers: Mutex::new(trackers),
             bt_peers: Mutex::new(Vec::new()),
+            bt_bitfield: Mutex::new(Vec::new()),
             awaiting_selection: AtomicBool::new(false),
             selected_files: Mutex::new(None),
             created_at: SystemTime::now(),
@@ -491,6 +499,8 @@ pub fn snapshot(task: &Task) -> TaskSnapshot {
         finished_at: task.finished_at.load(Ordering::Relaxed),
         uris: task
             .uris
+            .lock()
+            .unwrap()
             .iter()
             .enumerate()
             .map(|(i, u)| {
@@ -515,10 +525,21 @@ pub fn filter_keys(v: Value, keys: Option<&[String]>) -> Value {
     }
 }
 
+/// wire 位图字节流 → aria2 兼容 hex 字符串（每片 1 bit，字节内高位在前）。
+/// 空位图（非 BT 任务 / 元数据未就绪）返回空串。
+fn bitfield_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
 /// 计算 BT 任务的 info_hash 十六进制表示（None = 非 BT 任务）。
 /// .torrent 任务 bt_info_hash 不落盘，回退取 bt_meta 解析时计算的哈希。
-fn info_hash_hex(task: &Task) -> Option<String> {
-    if let Some(h) = &*task.bt_info_hash.lock().unwrap() {
+fn info_hash_hex(task: &Task) -> Option<String> {    if let Some(h) = &*task.bt_info_hash.lock().unwrap() {
         return Some(h.iter().map(|b| format!("{b:02x}")).collect());
     }
     task.bt_meta
@@ -620,7 +641,7 @@ pub fn status_json(task: &Task) -> Value {
     m.insert("uploadLength".into(), json!(s.uploaded.to_string()));
     m.insert("downloadSpeed".into(), json!(s.download_speed.to_string()));
     m.insert("uploadSpeed".into(), json!(s.upload_speed.to_string()));
-    m.insert("bitfield".into(), json!(""));
+    m.insert("bitfield".into(), json!(bitfield_hex(&task.bt_bitfield.lock().unwrap())));
     m.insert("connections".into(), json!(s.connections.to_string()));
     m.insert("errorCode".into(), json!(s.error_code.to_string()));
     m.insert("errorMessage".into(), json!(s.error_message));
@@ -717,7 +738,7 @@ pub fn status_json_native(task: &Task) -> Value {
         "uploadLength": s.uploaded,
         "downloadSpeed": s.download_speed,
         "uploadSpeed": s.upload_speed,
-        "bitfield": "",
+        "bitfield": bitfield_hex(&task.bt_bitfield.lock().unwrap()),
         "connections": s.connections,
         "errorCode": s.error_code,
         "errorMessage": s.error_message,
