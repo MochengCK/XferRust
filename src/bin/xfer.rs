@@ -725,6 +725,10 @@ enum SettingKey {
     BtSeedMode,
     /// BT 做种分享率上限（0 = 不限/持续做种）。
     BtSeedRatio,
+    /// BT 监听端口（0 = 随机分配）。
+    BtListenPort,
+    /// DHT 监听端口（0 = 随机分配）。
+    DhtListenPort,
 }
 
 /// 输入弹窗类型。
@@ -746,7 +750,8 @@ struct App {
     mgr: Arc<TaskManager>,
     view: MainView,
     selected: usize,
-    /// 设置视图当前选中项（0 并发 / 1 连接 / 2 BT连接 / 3 下载限速 / 4 上传限速 / 5 目录）。
+    /// 设置视图当前选中项（0..=17：并发/连接/BT/限速/目录/加密/协议/调度/做种/
+    /// 分享率/BT端口/DHT端口/LPD/端口映射/单服务器连接/分片大小/语言）。
     settings_sel: usize,
     /// 设置页焦点区域：0 = 参数，1 = Tracker 列表，2 = 订阅源列表。
     settings_area: u8,
@@ -812,6 +817,14 @@ struct App {
     bt_seed_mode: bool,
     /// BT 做种分享率上限（0 = 不限/持续做种到手动停止）。
     bt_seed_ratio: f64,
+    /// BT 监听端口（0 = 随机分配）。
+    bt_listen_port: u16,
+    /// DHT 监听端口（0 = 随机分配）。
+    dht_listen_port: u16,
+    /// 本地节点发现（LPD/LSD 组播）开关。
+    bt_enable_lpd: bool,
+    /// UPnP/NAT-PMP 自动端口映射开关。
+    bt_port_mapping: bool,
     /// 单服务器连接数（0 = 引擎默认）。
     max_conn_per_server: u64,
     /// 最小分片大小（字节，0 = 引擎默认）。
@@ -1160,6 +1173,10 @@ async fn app_loop(mgr: Arc<TaskManager>) -> i32 {
         bt_adaptive: true,
         bt_seed_mode: false,
         bt_seed_ratio: 0.0,
+        bt_listen_port: 0,
+        dht_listen_port: 0,
+        bt_enable_lpd: true,
+        bt_port_mapping: true,
         max_conn_per_server: 0,
         min_split_size: 0,
         add_task: None,
@@ -1282,6 +1299,23 @@ fn refresh_app(app: &mut App) {
         .as_str()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
+    // BT 监听端口（0 = 随机）与发现渠道开关（LPD/端口映射，引擎默认启用）
+    app.bt_listen_port = opts["bt-listen-port"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    app.dht_listen_port = opts["dht-listen-port"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    app.bt_enable_lpd = opts["bt-enable-lpd"]
+        .as_str()
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
+    app.bt_port_mapping = opts["bt-port-mapping"]
+        .as_str()
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
     // 未设置(0)即引擎默认：归一到引擎导出默认值，设置页直接显示数值
     app.max_conn_per_server = opts["max-connection-per-server"]
         .as_str()
@@ -1715,8 +1749,8 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                 }
             },
             KeyCode::Down | KeyCode::Char('j') => match app.settings_area {
-                // 参数区共 14 项（0..=13，末项为「界面语言」），上限必须到 13
-                0 => app.settings_sel = (app.settings_sel + 1).min(13),
+                // 参数区共 18 项（0..=17，末项为「界面语言」），上限必须到 17
+                0 => app.settings_sel = (app.settings_sel + 1).min(17),
                 1 => {
                     if app.tracker_sel + 1 < app.global_trackers.len() {
                         app.tracker_sel += 1;
@@ -1740,14 +1774,14 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
             }
             KeyCode::Enter => {
                 if app.settings_area == 0 {
-                    if app.settings_sel == 13 {
+                    if app.settings_sel == 17 {
                         // 界面语言：三个选项全部摆出，直接选择
                         app.lang_picker = Some(match lang() {
                             Lang::Zh => 0,
                             Lang::ZhTw => 1,
                             Lang::En => 2,
                         });
-                    } else if !matches!(app.settings_sel, 5 | 6 | 7 | 8 | 9) {
+                    } else if !matches!(app.settings_sel, 5 | 6 | 7 | 8 | 9 | 13 | 14) {
                         let (kind, init) = match app.settings_sel {
                             0 => (
                                 InputKind::EditSetting(SettingKey::MaxConcurrent),
@@ -1774,6 +1808,14 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                                 format!("{:.1}", app.bt_seed_ratio),
                             ),
                             11 => (
+                                InputKind::EditSetting(SettingKey::BtListenPort),
+                                app.bt_listen_port.to_string(),
+                            ),
+                            12 => (
+                                InputKind::EditSetting(SettingKey::DhtListenPort),
+                                app.dht_listen_port.to_string(),
+                            ),
+                            15 => (
                                 InputKind::EditSetting(SettingKey::MaxConnPerServer),
                                 app.max_conn_per_server.to_string(),
                             ),
@@ -2500,6 +2542,32 @@ fn submit_setting(app: &mut App, key: SettingKey, val: &str) {
             )
             .into(),
         },
+        SettingKey::BtListenPort => match val.trim().parse::<u16>() {
+            Ok(p) => apply_global_option(
+                app,
+                "bt-listen-port",
+                &p.to_string(),
+                tr("BT 监听端口", "BT listen port"),
+            ),
+            _ => tr(
+                "端口须为 0-65535 的整数（0 = 随机）",
+                "Port must be 0-65535 (0 = random)",
+            )
+            .into(),
+        },
+        SettingKey::DhtListenPort => match val.trim().parse::<u16>() {
+            Ok(p) => apply_global_option(
+                app,
+                "dht-listen-port",
+                &p.to_string(),
+                tr("DHT 监听端口", "DHT listen port"),
+            ),
+            _ => tr(
+                "端口须为 0-65535 的整数（0 = 随机）",
+                "Port must be 0-65535 (0 = random)",
+            )
+            .into(),
+        },
         // BtSeedMode 通过左右切换设置，不走输入框
         SettingKey::BtSeedMode => apply_global_option(
             app,
@@ -2676,7 +2744,30 @@ fn adjust_concurrency(app: &mut App, delta: i32) {
             );
             app.message = Some((msg, std::time::Instant::now()));
         }
-        11 => {
+        // 11/12（BT/DHT 监听端口）不支持步进，按 Enter 输入
+        13 => {
+            // 本地节点发现（LPD）开关
+            let next = !app.bt_enable_lpd;
+            let msg = apply_global_option(
+                app,
+                "bt-enable-lpd",
+                if next { "true" } else { "false" },
+                tr("本地节点发现", "local discovery"),
+            );
+            app.message = Some((msg, std::time::Instant::now()));
+        }
+        14 => {
+            // UPnP/NAT-PMP 端口映射开关
+            let next = !app.bt_port_mapping;
+            let msg = apply_global_option(
+                app,
+                "bt-port-mapping",
+                if next { "true" } else { "false" },
+                tr("端口映射", "port mapping"),
+            );
+            app.message = Some((msg, std::time::Instant::now()));
+        }
+        15 => {
             let n = (app.max_conn_per_server as i32 + delta).clamp(0, 128) as u64;
             if n == app.max_conn_per_server {
                 return;
@@ -2689,7 +2780,7 @@ fn adjust_concurrency(app: &mut App, delta: i32) {
             );
             app.message = Some((msg, std::time::Instant::now()));
         }
-        12 => {
+        16 => {
             // 最小分片大小步长 1 MiB
             let step = (1024 * 1024) as i64 * delta as i64;
             let n = ((app.min_split_size as i64 + step).max(0)) as u64;
@@ -3869,7 +3960,7 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
     // 分区卡片：参数 / Tracker 服务器 / 订阅源 / 引擎信息
     // （聚焦分区亮边框 + 黄色标题，替代旧的"◄ 焦点"文字标记）
     let areas = Layout::vertical([
-        Constraint::Length(17), // 参数（15 行 + 边框 2）
+        Constraint::Length(21), // 参数（19 行 + 边框 2）
         Constraint::Length(1),  // 空行
         Constraint::Min(5),     // Tracker 服务器列表
         Constraint::Length(1),  // 空行
@@ -3931,6 +4022,21 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
     } else {
         app.max_conn_per_server.to_string()
     };
+    let port_str = |p: u16| {
+        if p == 0 {
+            tr("随机", "random").to_string()
+        } else {
+            p.to_string()
+        }
+    };
+    let on_off = |on: bool| {
+        if on {
+            tr("开", "on")
+        } else {
+            tr("关", "off")
+        }
+        .to_string()
+    };
     let vals = [
         app.max_concurrent.to_string(),
         app.split_connections.to_string(),
@@ -3940,12 +4046,7 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
         truncate_head(&app.download_dir, val_w),
         enc_str.to_string(),
         proto_str.to_string(),
-        (if app.bt_adaptive {
-            tr("开", "on")
-        } else {
-            tr("关", "off")
-        })
-        .to_string(),
+        on_off(app.bt_adaptive),
         (if app.bt_seed_mode {
             tr("做种", "Seed")
         } else {
@@ -3957,6 +4058,10 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
         } else {
             tr("不限", "unlimited").to_string()
         },
+        port_str(app.bt_listen_port),
+        port_str(app.dht_listen_port),
+        on_off(app.bt_enable_lpd),
+        on_off(app.bt_port_mapping),
         conn_str,
         size_str(app.min_split_size),
         lang_display_name(lang()).to_string(),
@@ -3978,8 +4083,12 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
                 8 => tr("BT 智能调度", "BT adaptive"),
                 9 => tr("BT 完成行为", "BT on done"),
                 10 => tr("BT 做种分享率", "Seed ratio"),
-                11 => tr("单服务器连接数", "Conns per server"),
-                12 => tr("最小分片大小", "Min split size"),
+                11 => tr("BT 监听端口", "BT listen port"),
+                12 => tr("DHT 监听端口", "DHT listen port"),
+                13 => tr("本地节点发现", "Local discovery"),
+                14 => tr("端口映射", "Port mapping"),
+                15 => tr("单服务器连接数", "Conns per server"),
+                16 => tr("最小分片大小", "Min split size"),
                 _ => tr("界面语言", "Language"),
             };
             Line::from(vec![
@@ -4257,6 +4366,14 @@ fn draw_input_popup(f: &mut ratatui::Frame, app: &App) {
         InputKind::EditSetting(SettingKey::BtSeedRatio) => tr(
             " 做种分享率上限（0 = 不限/持续做种） ",
             " Seed ratio limit (0 = unlimited) ",
+        ),
+        InputKind::EditSetting(SettingKey::BtListenPort) => tr(
+            " BT 监听端口（0 = 随机，被占自动回退） ",
+            " BT listen port (0 = random, auto-fallback) ",
+        ),
+        InputKind::EditSetting(SettingKey::DhtListenPort) => tr(
+            " DHT 监听端口（0 = 随机，被占自动回退） ",
+            " DHT listen port (0 = random, auto-fallback) ",
         ),
         // BtSeedMode 通过左右切换设置，不走输入框——此处兜底
         InputKind::EditSetting(SettingKey::BtSeedMode) => "".to_string(),
@@ -4933,6 +5050,12 @@ mod tests {
             bt_encryption: "adaptive".to_string(),
             bt_protocol: "tcp+utp".to_string(),
             bt_adaptive: true,
+            bt_seed_mode: false,
+            bt_seed_ratio: 0.0,
+            bt_listen_port: 0,
+            dht_listen_port: 0,
+            bt_enable_lpd: true,
+            bt_port_mapping: true,
             max_conn_per_server: 0,
             min_split_size: 0,
             add_task: None,
@@ -5239,7 +5362,7 @@ mod tests {
         }
     }
 
-    /// 设置页第 12 行：界面语言行显示当前语言（三种名称），
+    /// 设置页末行：界面语言行显示当前语言（三种名称），
     /// 选中该行按 Enter 打开语言选择弹窗（三个选项全部摆出）。
     #[test]
     fn lang_setting_row_and_picker() {
@@ -5255,7 +5378,7 @@ mod tests {
         );
 
         // Enter 打开语言选择弹窗：三个语言全部出现在弹窗里
-        app.settings_sel = 11;
+        app.settings_sel = 17;
         app.view = MainView::Settings;
         let enter = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter,
@@ -5305,8 +5428,8 @@ mod tests {
         set_lang(Lang::Zh);
     }
 
-    /// 设置页向下导航必须能到第 12 项（界面语言），且不越过末项。
-    /// 回归：`min(10)` 曾把上限卡在第 11 项，导致「界面语言」行永远选不中。
+    /// 设置页向下导航必须能到末项（界面语言），且不越过末项。
+    /// 回归：导航上限曾落后于实际行数，导致「界面语言」行永远选不中。
     #[test]
     fn settings_down_reaches_language_row() {
         let mut app = app_with_peers(vec![]);
@@ -5319,18 +5442,18 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         );
 
-        for _ in 0..11 {
+        for _ in 0..17 {
             assert!(handle_key(&mut app, &down));
         }
         assert_eq!(
-            app.settings_sel, 11,
-            "连续下移 11 次应选中第 12 项（界面语言）"
+            app.settings_sel, 17,
+            "连续下移 17 次应选中末项（界面语言）"
         );
 
         // 已在末项，再下移不应越界
         assert!(handle_key(&mut app, &down));
         assert_eq!(
-            app.settings_sel, 11,
+            app.settings_sel, 17,
             "末项之后继续下移应保持在界面语言行"
         );
     }
@@ -5546,11 +5669,11 @@ mod tests {
     }
 
     fn render_settings(app: &App) -> String {
-        let backend = TestBackend::new(100, 36);
+        let backend = TestBackend::new(100, 42);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw_settings(f, app)).unwrap();
         let buf = term.backend().buffer().clone();
-        (0..36)
+        (0..42)
             .map(|y| {
                 (0..100)
                     .map(|x| buf[(x, y)].symbol().to_string())
@@ -5604,6 +5727,100 @@ mod tests {
             app.min_split_size,
             xfer_engine::DEFAULT_MIN_SPLIT_SIZE,
             "显式 0 应继续显示默认值"
+        );
+    }
+
+    /// 设置页 BT 网络四行（BT/DHT 监听端口、本地节点发现、端口映射）：
+    /// 默认值渲染（端口随机、开关开）、左右切换写回引擎、端口输入校验。
+    #[test]
+    fn bt_network_setting_rows() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+        refresh_app(&mut app);
+
+        // 渲染：四个新行 + 默认值（端口 0 显示「随机」，开关默认开）
+        let text = render_settings(&app);
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("BT监听端口随机"),
+            "BT 监听端口默认应显示「随机」:\n{compact}"
+        );
+        assert!(
+            compact.contains("DHT监听端口随机"),
+            "DHT 监听端口默认应显示「随机」:\n{compact}"
+        );
+        assert!(
+            compact.contains("本地节点发现开") && compact.contains("端口映射开"),
+            "LPD 与端口映射默认应显示「开」:\n{compact}"
+        );
+
+        // 选中「本地节点发现」行（13），← 切换为关并写回引擎
+        app.view = MainView::Settings;
+        app.settings_area = 0;
+        app.settings_sel = 13;
+        let left = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Left,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert!(handle_key(&mut app, &left));
+        assert_eq!(
+            app.mgr.get_global_option()["bt-enable-lpd"].as_str(),
+            Some("false"),
+            "← 应把本地节点发现切换为关"
+        );
+        refresh_app(&mut app);
+        assert!(!app.bt_enable_lpd, "刷新后本地状态应同步为关");
+
+        // → 切换回开
+        let right = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Right,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert!(handle_key(&mut app, &right));
+        assert_eq!(
+            app.mgr.get_global_option()["bt-enable-lpd"].as_str(),
+            Some("true"),
+            "→ 应把本地节点发现切换为开"
+        );
+
+        // 端口行（11）按 Enter 打开输入框，预填当前值
+        app.settings_sel = 11;
+        let enter = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert!(handle_key(&mut app, &enter));
+        match &app.input {
+            Some((InputKind::EditSetting(SettingKey::BtListenPort), init)) => {
+                assert_eq!(init, "0", "输入框应预填当前 BT 监听端口");
+            }
+            _ => panic!("Enter 应打开 BT 监听端口输入框"),
+        }
+        app.input = None;
+
+        // 提交合法端口：写回引擎并回显
+        submit_setting(&mut app, SettingKey::BtListenPort, "21401");
+        refresh_app(&mut app);
+        assert_eq!(app.bt_listen_port, 21401, "刷新后应回读 BT 监听端口");
+        assert_eq!(
+            app.mgr.get_global_option()["bt-listen-port"].as_str(),
+            Some("21401"),
+        );
+        assert!(
+            render_settings(&app)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+                .contains("BT监听端口21401"),
+            "设置页应显示新端口号"
+        );
+
+        // 非法端口：报错且不写引擎
+        submit_setting(&mut app, SettingKey::BtListenPort, "70000");
+        assert_eq!(
+            app.mgr.get_global_option()["bt-listen-port"].as_str(),
+            Some("21401"),
+            "非法端口不应写回引擎"
         );
     }
 

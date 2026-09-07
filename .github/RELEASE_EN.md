@@ -21,6 +21,7 @@
 - Automatic UPnP / NAT-PMP port mapping: when a BT task starts, the engine sets up a TCP + UDP dual mapping on the router (2-hour lease, renewed every 1/3 of the lease, automatic retry next cycle after a single failure) and best-effort removes the mapping on shutdown — better connectability, no more manual router port forwarding
 - Configurable BT / DHT listen ports: new global options `bt-listen-port` / `dht-listen-port` (`0` = random port), applied when a BT task is created; if the listen port or DHT port is taken, the engine falls back to an ephemeral port with a warning instead of disabling listening entirely
 - New switches `bt-enable-lpd` / `bt-port-mapping` (both on by default) to disable either feature independently; `engine.getOptions` exposes the new options and `changeGlobalOption` validates port values (0–65535)
+- The TUI settings page gains the four matching rows: BT / DHT listen port (Enter to edit, validated 0–65535, `0` shown as "random") plus Local discovery and Port mapping toggles (←/→ to switch); conns-per-server, min split size and language shift below them
 
 ### Android Engine-Core Build
 
