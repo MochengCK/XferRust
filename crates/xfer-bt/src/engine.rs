@@ -27,7 +27,9 @@ use xfer_bencode::TorrentMeta;
 use xfer_dht::{Dht, DhtConfig};
 use xfer_discovery::lsd::{LSD_ANNOUNCE_INTERVAL, LSD_LISTEN_TIMEOUT};
 use xfer_discovery::{Lsd, LsdConfig, PortMappingProtocol, UpnpClient, UdpTracker};
-use xfer_storage::{PieceLayout, PieceMap, PieceStore};
+use xfer_storage::{
+    PieceLayout, PieceMap, PieceStore, verify_piece,
+};
 use xfer_transport::{UtpManager, UtpManagerHandle, UtpStream};
 use xfer_types::{InfoHash, PeerId, ENGINE_NAME, ENGINE_VERSION};
 
@@ -123,8 +125,23 @@ impl PeerStream {
     }
 }
 
-/// 流水线起始深度（§7.8）。
+/// BT 的控制消息（interested/request/cancel）很小且依赖 RTT 驱动；关闭
+/// TCP Nagle，避免它们在已有未确认数据时被额外延迟。请求本身仍会在
+/// [`TorrentEngine::fill_pipeline`] 中合并写入，因而不会退化为大量小包。
+fn configure_tcp_low_latency(stream: &TcpStream) {
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(error = %error, "无法为 BT TCP 连接启用 TCP_NODELAY");
+    }
+}
+
+/// 流水线保底深度（§7.8）。
 const PIPELINE_MIN: usize = 16;
+/// 自适应流水线冷启动深度。
+///
+/// 16 个标准块只有 256KiB 在途；在 100ms 以上 RTT 或高速 seed 上，首个
+/// 窗口还没来得及按反馈扩张就已经浪费了一轮甚至多轮 RTT。以 256 个块（4MiB）
+/// 起步仍远低于上限，却能在连接刚 unchoke 时立即覆盖常见的带宽时延积。
+const PIPELINE_INITIAL: usize = 256;
 /// 流水线最大深度（§7.8）。
 const PIPELINE_MAX: usize = 256;
 /// 单 peer 片队列容量下限：多片并行才能填满带宽延迟积
@@ -149,6 +166,9 @@ const COLD_START_RAMP: Duration = Duration::from_secs(1);
 /// 慢速节点淘汰周期。
 const SLOW_PEER_INTERVAL: Duration = Duration::from_secs(10);
 /// 慢速节点淘汰阈值（bytes/s，低于此速率且有空闲候选时淘汰）。
+/// 慢速 peer 绝对阈值：低于此速率且有候选时可能被淘汰。
+/// 真实网络下 1KB/s 太低（正常低速 peer 也有 10-50KB/s），
+/// 但作为"完全无贡献"的判据应稍高一些以避免误杀。
 const SLOW_PEER_THRESHOLD: u64 = 1024;
 /// peer 无活动超时（比 KEEPALIVE_INTERVAL 多 60s 余量，避免误杀正常 peer）。
 const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -182,6 +202,9 @@ const ALLOWED_FAST_SET_SIZE: usize = 10;
 /// 同一地址连续拨号/会话失败的重试上限——超过后不再回填 pending，
 /// 等 tracker/PEX/DHT 重新发现该地址时清零计数。
 const MAX_DIAL_RETRIES: u32 = 3;
+
+/// 一条 request 的 wire 长度：4 字节长度前缀 + 1 字节消息 ID + 3 个 u32。
+const REQUEST_WIRE_LEN: usize = 17;
 
 // ---- ut_metadata（BEP 9） ----
 /// 本端为 ut_metadata 分配的扩展消息 ID（BEP 10 扩展握手 "m" 字典）。
@@ -425,7 +448,7 @@ pub struct TorrentConfig {
     pub announce_urls: Vec<String>,
     /// UDP tracker URL 列表（udp:// 前缀）。
     pub udp_announce_urls: Vec<String>,
-    /// 单 peer 在途请求流水线深度（0 = 自适应 16→256）。
+    /// 单 peer 在途请求流水线深度（0 = 自适应 256）。
     pub pipeline: usize,
     /// 是否启用 DHT（磁力链接冷启动需要）。
     pub enable_dht: bool,
@@ -874,6 +897,9 @@ impl TorrentEngine {
             &mut store,
         );
         if !restored {
+            // 完整性按「逻辑长度 + 磁盘占用」双口径判定：BT 随机写产生
+            // 稀疏文件，逻辑长度（含空洞）达标而磁盘占用不足说明数据
+            // 并未真正落盘，绝不能整文件标记完成（否则以坏数据做种）。
             let complete = meta.info.files.iter().all(|f| {
                 let path = if meta.info.files.len() == 1 {
                     config.dir.join(&meta.info.name)
@@ -883,9 +909,8 @@ impl TorrentEngine {
                         .join(&meta.info.name)
                         .join(f.path.iter().collect::<PathBuf>())
                 };
-                std::fs::metadata(&path)
-                    .map(|m| m.len() >= f.length)
-                    .unwrap_or(false)
+                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= f.length
+                    && xfer_storage::size_on_disk(&path).is_some_and(|d| d >= f.length)
             });
             if complete {
                 store.mark_all_done();
@@ -1042,6 +1067,8 @@ impl TorrentEngine {
             &mut store,
         );
         if !restored {
+            // 双口径判定，理由同 TorrentEngine::new：稀疏文件的逻辑
+            // 长度不可信，磁盘占用不足不得整文件标记完成。
             let complete = meta.info.files.iter().all(|f| {
                 let path = if meta.info.files.len() == 1 {
                     self.config.dir.join(&meta.info.name)
@@ -1051,9 +1078,8 @@ impl TorrentEngine {
                         .join(&meta.info.name)
                         .join(f.path.iter().collect::<PathBuf>())
                 };
-                std::fs::metadata(&path)
-                    .map(|m| m.len() >= f.length)
-                    .unwrap_or(false)
+                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= f.length
+                    && xfer_storage::size_on_disk(&path).is_some_and(|d| d >= f.length)
             });
             if complete {
                 store.mark_all_done();
@@ -1194,6 +1220,7 @@ impl TorrentEngine {
                 };
                 match accepted {
                     Ok((stream, addr)) => {
+                        configure_tcp_low_latency(&stream);
                         let e = engine.clone();
                         tokio::spawn(async move {
                             if let Err(e2) = e.run_peer(addr, stream, false, None).await {
@@ -1529,8 +1556,8 @@ impl TorrentEngine {
                     }
                     self.connect_pending().await;
 
-                    // 速度采样 + 慢速节点淘汰 / 智能调度
-                    if speed_sample_timer.elapsed() >= Duration::from_secs(5) {
+                    // 速度采样（10s 窗口）+ 慢速节点淘汰 / 智能调度
+                    if speed_sample_timer.elapsed() >= Duration::from_secs(10) {
                         self.sample_peer_speeds();
                         speed_sample_timer = Instant::now();
                     }
@@ -2062,7 +2089,14 @@ impl TorrentEngine {
             uploaded: AtomicU64::new(0),
             prev_downloaded: Mutex::new(0),
             queued: Mutex::new(Vec::new()),
-            pipeline: Mutex::new(self.config.pipeline.max(PIPELINE_MIN)),
+            // `pipeline = 0` 才表示自适应：不能从 16 个块开始，否则高 RTT
+            // 链路在窗口反馈到来前就被 256KiB 的初始在途量卡住。显式配置
+            // 则保持用户指定的固定窗口，并钳制到协议安全范围内。
+            pipeline: Mutex::new(if self.config.pipeline == 0 {
+                PIPELINE_INITIAL
+            } else {
+                self.config.pipeline.clamp(PIPELINE_MIN, PIPELINE_MAX)
+            }),
             last_block_at: Mutex::new(now),
             source,
             transport: Mutex::new(TransportKind::Tcp),
@@ -2154,8 +2188,9 @@ impl TorrentEngine {
             let mut prev = c.prev_downloaded.lock().unwrap();
             let delta = downloaded.saturating_sub(*prev);
             *prev = downloaded;
-            // 5 秒采样窗口 → bytes/s
-            c.state.lock().unwrap().recent_speed = delta / 5;
+            // 10 秒采样窗口（原 5s 波动太大：BT 突发式传输在 5s 窗口内
+            // 可能恰好赶上空闲间隙 → recent_speed=0 → 调度器误判为死节点）
+            c.state.lock().unwrap().recent_speed = delta / 10;
         }
     }
 
@@ -2228,8 +2263,9 @@ impl TorrentEngine {
         let evict_count = (active / 10).max(1).min(candidates.len().saturating_sub(1));
         let now = Instant::now();
         for (addr, cell, speed, connected_at) in candidates.iter().take(evict_count) {
-            // 新连接给 15s 宽限期
-            if now.duration_since(*connected_at) < Duration::from_secs(15) {
+            // 新连接给 40s 宽限期（与调度器 grace_period 一致）：
+            // 真实网络下 peer 从连接到首个块到达需要 20-40s
+            if now.duration_since(*connected_at) < Duration::from_secs(40) {
                 continue;
             }
             if *speed < SLOW_PEER_THRESHOLD {
@@ -2405,15 +2441,10 @@ impl TorrentEngine {
             return;
         };
         let wanted = self.wanted.lock().unwrap().clone();
-        let mut n = 0u64;
-        for i in 0..store.piece_count() {
-            let wanted_i = wanted.as_ref().is_none_or(|m| m.is_set(i));
-            if wanted_i && store.have_piece(i) {
-                n += store.piece_len(i);
-            }
-        }
+        let n = done_bytes_of(store, wanted.as_ref());
         self.done_bytes.store(n, Ordering::Relaxed);
     }
+
 
     // ------------------------------------------------------------------
     // seed 模式
@@ -2576,6 +2607,7 @@ impl TorrentEngine {
         if proto.allows_tcp() {
             match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
                 Ok(Ok(stream)) => {
+                    configure_tcp_low_latency(&stream);
                     if !self.shutdown.is_cancelled() {
                         if let Err(err) = self.clone().run_peer(addr, stream, true, Some(cell)).await {
                             tracing::debug!(peer = %addr, error = %err, "TCP 出站连接结束");
@@ -2746,7 +2778,10 @@ impl TorrentEngine {
                         // 强制加密模式不重连，直接失败
                         tracing::debug!(peer = %addr, error = %e, "MSE 协商失败，尝试明文重连");
                         match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-                            Ok(Ok(s)) => (PeerStream::Plain(s), None, false),
+                            Ok(Ok(s)) => {
+                                configure_tcp_low_latency(&s);
+                                (PeerStream::Plain(s), None, false)
+                            }
                             Ok(Err(e2)) => return Err(format!("明文重连失败: {e2}")),
                             Err(_) => return Err("明文重连超时".into()),
                         }
@@ -4350,6 +4385,11 @@ impl TorrentEngine {
     /// peer_message_loop 的 choke tick 检测（那里才可能观察到
     /// 长时间无新块——本函数被调用本身就意味着刚收到了块）。
     fn adjust_pipeline(&self, ctx: &mut PeerCtx) {
+        // 非零配置是用户显式指定的固定窗口；不能在运行时悄悄把它扩到
+        // PIPELINE_MAX，否则既违背配置语义，也可能让低内存设备意外积压数据。
+        if self.config.pipeline != 0 {
+            return;
+        }
         let mut pl = ctx.cell.pipeline.lock().unwrap();
         let current = *pl;
         if ctx.in_flight.len() * 4 >= current * 3 {
@@ -4363,6 +4403,9 @@ impl TorrentEngine {
     /// 在途，再由超时机制补发。仅在 choke tick 调用——那里才能
     /// 观察到「长时间无新块」。
     fn shrink_stalled_pipeline(&self, ctx: &mut PeerCtx) {
+        if self.config.pipeline != 0 {
+            return;
+        }
         if ctx.in_flight.is_empty() {
             return;
         }
@@ -4539,26 +4582,48 @@ impl TorrentEngine {
     }
 
     /// 校验并落盘一片（成功时更新进度）。
+    ///
+    /// SHA-1 校验在全局 store 锁外执行：哈希是 CPU 密集操作（每片
+    /// 256KiB-1MiB），锁内计算会阻塞所有其他 peer 的 fill_pipeline /
+    /// assign_piece。落盘仍需锁（独占文件句柄），但写入走 OS 页缓存，
+    /// 耗时远小于哈希。语义与 PieceStore::accept_piece 一致：
+    /// 校验失败不落盘、不标记。
     fn accept_piece(&self, index: u32, data: &[u8], expected: &[u8; 20]) -> bool {
+        {
+            // 快速去重（锁内 O(1) 位查询）：同片已被其他连接完成时跳过，
+            // 也避免为已拥有片白白计算一次 SHA-1。
+            let guard = self.store.lock().unwrap();
+            if guard.as_ref().unwrap().have_piece(index) {
+                return false;
+            }
+        }
+        // 锁外校验哈希（纯函数，只依赖 data 与 expected）
+        if !verify_piece(data, expected) {
+            tracing::warn!(piece = index, "片哈希校验失败，重新下载");
+            return false;
+        }
         let mut guard = self.store.lock().unwrap();
         let store = guard.as_mut().unwrap();
-        // 重复完成去重（淘汰换血后同片被双路下载等竞态）：
+        // 双检去重（淘汰换血后同片被双路下载等竞态，含哈希计算窗口）：
         // 不去重会让 done_bytes 双计、进度虚高甚至提前报完成。
         if store.have_piece(index) {
             return false;
         }
-        match store.accept_piece(index, data, expected) {
-            Ok(true) => {
-                let n = store.piece_len(index);
+        match store.write_piece(index, data) {
+            Ok(()) => {
+                store.mark_done(index);
+                // 进度严格镜像位图（真相源）：位图置位前必经 SHA-1 校验
+                // + 落盘，store 而非 fetch_add 从结构上杜绝计数器与
+                // 位图/磁盘背离（进度虚报）。
+                let done = {
+                    let wanted = self.wanted.lock().unwrap();
+                    done_bytes_of(store, wanted.as_ref())
+                };
                 drop(guard);
-                self.done_bytes.fetch_add(n, Ordering::Relaxed);
+                self.done_bytes.store(done, Ordering::Relaxed);
                 tracing::debug!(piece = index, "片完成");
                 self.save_resume(false);
                 true
-            }
-            Ok(false) => {
-                tracing::warn!(piece = index, "片哈希校验失败，重新下载");
-                false
             }
             Err(e) => {
                 tracing::warn!(piece = index, error = %e, "片落盘失败");
@@ -4670,6 +4735,15 @@ impl TorrentEngine {
         for (p, blocks) in &pieces {
             ctx.block_need.entry(*p).or_insert(blocks.len() as u32);
         }
+        // 把同一轮 request 合并为一次写入。逐条 `write_all` 会产生几十到
+        // 数百次小写；TCP 的 Nagle/延迟确认以及中间代理会把这些小包拆成多轮
+        // 传输，首个窗口实际上填不满，吞吐退化为“每轮只走几个块”。
+        //
+        // 批量编码还能避免每条 Request 单独分配一个临时 Vec。in_flight 在写前
+        // 先登记；写失败时会话随即退出，unregister_peer 会统一释放对应片，
+        // 因此不会留下不可恢复的请求状态。
+        let mut request_batch =
+            Vec::with_capacity((pipeline - ctx.in_flight.len()) * REQUEST_WIRE_LEN);
         let mut sent = false;
         loop {
             if ctx.in_flight.len() >= pipeline {
@@ -4716,22 +4790,21 @@ impl TorrentEngine {
                     continue;
                 }
             };
-            stream
-                .write_all(
-                    &Message::Request {
-                        index: piece,
-                        begin,
-                        length: len,
-                    }
-                    .encode(),
-                )
-                .await
-                .map_err(|e| format!("request 发送失败: {e}"))?;
+            // Request: len=13, id=6, index/begin/length 三个 u32。
+            request_batch.extend_from_slice(&13u32.to_be_bytes());
+            request_batch.push(6);
+            request_batch.extend_from_slice(&piece.to_be_bytes());
+            request_batch.extend_from_slice(&begin.to_be_bytes());
+            request_batch.extend_from_slice(&len.to_be_bytes());
             ctx.in_flight.insert((piece, begin));
-            ctx.last_request_at = Some(Instant::now());
             sent = true;
         }
         if sent {
+            stream
+                .write_all(&request_batch)
+                .await
+                .map_err(|e| format!("request 批量发送失败: {e}"))?;
+            ctx.last_request_at = Some(Instant::now());
             tokio::task::yield_now().await;
         }
         Ok(())
@@ -4787,6 +4860,35 @@ impl TorrentEngine {
 /// 只信任「片的字节区间被磁盘现有长度完全覆盖」的位——
 /// 防御控制文件写入后文件被截断/部分删除的情形。
 /// 成功恢复（至少一片）时应用到 store 并返回 true。
+/// 按位图统计已完成字节（可选按所需片掩码收缩口径）。
+///
+/// 进度上报的唯一真相源是 piece 位图（每位置位前必经 SHA-1 校验 +
+/// 落盘）；`done_bytes` 只做位图的缓存镜像，由落盘/续传/选片路径
+/// 用本函数重算。此前用 `fetch_add` 逐片累加的计数器曾观测到与
+/// 位图/磁盘实测背离（进度虚报，见 ANALYSIS_BT_SPEED.md 第六节）。
+fn done_bytes_of(store: &PieceStore, wanted: Option<&PieceMap>) -> u64 {
+    let count = store.piece_count();
+    if count == 0 {
+        return 0;
+    }
+    // 非末片长度恒等于 piece_length，只有末片需查布局（避免每片
+    // 重算 total_length 的 O(片数×文件数) 开销）。
+    let piece_length = store.layout().piece_length;
+    let last = count - 1;
+    let mut n = 0u64;
+    for i in 0..count {
+        let wanted_i = wanted.is_none_or(|m| m.is_set(i));
+        if wanted_i && store.have_piece(i) {
+            n += if i == last {
+                store.piece_len(i)
+            } else {
+                piece_length
+            };
+        }
+    }
+    n
+}
+
 fn restore_resume(
     ctrl: &Path,
     info_hash: &[u8; 20],
@@ -4815,6 +4917,47 @@ fn restore_resume(
             std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
         })
         .collect();
+    // 全局健全性（unix）：位图隐含的已完成字节不得显著超过磁盘实际
+    // 占用。稀疏/被外部替换的数据文件逻辑长度虚高，若磁盘占用远低于
+    // 位图隐含字节，说明这些片的数据并未真正在盘上（崩溃未回写、
+    // 文件被外部替换），整份位图作废、按全量重下处理（宁多下不播坏）。
+    #[cfg(unix)]
+    {
+        let piece_length = store.layout().piece_length;
+        let last = count.saturating_sub(1);
+        let mut implied = 0u64;
+        for idx in 0..count {
+            if bf[idx as usize / 8] & (0x80u8 >> (idx % 8)) != 0 {
+                implied += if idx == last {
+                    store.piece_len(idx)
+                } else {
+                    piece_length
+                };
+            }
+        }
+        if implied > 0 {
+            let on_disk: u64 = layout
+                .files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let path = if single && i == 0 {
+                        base.clone()
+                    } else {
+                        base.join(f.path.iter().collect::<PathBuf>())
+                    };
+                    xfer_storage::size_on_disk(&path).unwrap_or(0)
+                })
+                .sum();
+            if (on_disk as f64) < implied as f64 * 0.85 {
+                tracing::warn!(
+                    implied, on_disk, count,
+                    "续传控制文件与磁盘占用不符（数据可能稀疏或被替换），放弃恢复改为全量重下"
+                );
+                return false;
+            }
+        }
+    }
     // 掩码：未完全覆盖的位清除
     let mut restored = 0u32;
     for idx in 0..count {
@@ -5425,4 +5568,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

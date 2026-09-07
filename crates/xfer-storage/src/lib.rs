@@ -34,6 +34,25 @@ pub fn ctrl_dir() -> PathBuf {
         .join("ctrl")
 }
 
+/// 文件在磁盘上的实际占用字节数（稀疏文件 ≠ 逻辑长度）。
+///
+/// unix 取 `st_blocks × 512`（实际分配块），其他平台退回逻辑长度。
+/// BT 数据文件按片随机写、天然稀疏：逻辑长度（空洞读为零）会虚高，
+/// 「文件是否已完整」类判定必须以磁盘占用为下限依据，否则会把
+/// 空洞文件误判为完整并播种坏数据。
+pub fn size_on_disk(path: &Path) -> Option<u64> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(meta.blocks() * 512)
+    }
+    #[cfg(not(unix))]
+    {
+        Some(meta.len())
+    }
+}
+
 /// 控制文件路径：`<ctrl_dir>/<目标文件路径 SHA-256 前 24 hex>.xfer`。
 /// 以目标路径字符串为键——同一目标续传命中，不同目标互不冲突。
 /// 注意不能用 canonicalize：macOS 上 /tmp 是符号链接，目标文件创建

@@ -43,11 +43,29 @@ impl Default for PeerSchedulerConfig {
             min_peers: 2,
             expand_step: 4,
             gain_ratio: 0.10,
-            stagnant_rounds: 2,
-            slow_ratio: 0.25,
-            slow_floor: 1024,
-            grace_period: Duration::from_secs(15),
-            evict_ratio: 0.2,
+            // 真实网络下 peer 从连接到被 unchoke 再到出数据
+            // 通常需要 20-40s（TCP 握手 + BT 握手 + 等对端 choking 轮次）。
+            // 原来 2 轮（20s）太激进：peer 刚开始出数据就被换血淘汰，
+            // 导致「连了断、断了连」的恶性循环，速度永远上不去。
+            // 6 轮（60s）给足时间让 peer 稳定贡献数据后再评估。
+            stagnant_rounds: 6,
+            // 0.25 在高速 seed 场景下会误杀正常 peer：
+            // 中位数可能高达 500KB/s，25% = 125KB/s，
+            // 100KB/s 的 peer 被淘汰——但 100KB/s 已经是有贡献的 peer。
+            // 0.1 只淘汰几乎无贡献的 peer。
+            slow_ratio: 0.1,
+            // 1KB/s 作为绝对下限过于激进：正常 BT 中一个被 choke
+            // 但偶尔出数据的 peer 可能在 5s 采样窗口内为 0。
+            // 提到 10KB/s 避免误杀低速但仍在工作的 peer。
+            slow_floor: 10_240,
+            // 真实网络 peer 从连接到首个块到达需要
+            // 握手 + 等待 unchoke + 首批块传输，通常 20-40s。
+            // 15s 宽限期在真实环境下不够。
+            grace_period: Duration::from_secs(40),
+            // 0.2 在多 peer 场景下一次淘汰 10 个 peer，
+            // 这些 peer 的片被释放、重新分配，造成大量无效开销。
+            // 0.1 更保守，减少震荡。
+            evict_ratio: 0.1,
         }
     }
 }
@@ -268,10 +286,10 @@ mod tests {
     fn stops_expanding_and_replaces_when_stagnant() {
         let mut s = PeerScheduler::new(cfg(6));
         // 稳定在 6 个连接、吞吐几乎不变（停滞），其中有慢 peer
-        let mut peers: Vec<PeerSample> = (0..5).map(|i| sample(20 + i, 100_000, 60)).collect();
-        peers.push(sample(25, 100, 60)); // 明显慢的节点
+        let mut peers: Vec<PeerSample> = (0..5).map(|i| sample(20 + i, 100_000, 120)).collect();
+        peers.push(sample(25, 100, 120)); // 明显慢的节点
         let mut replaced = false;
-        for _ in 0..5 {
+        for _ in 0..10 {
             if let ScheduleAction::Replace(v) = s.evaluate(&peers, 10) {
                 assert!(
                     v.contains(&addr(25)),
@@ -287,9 +305,9 @@ mod tests {
     #[test]
     fn respects_grace_period_for_new_peers() {
         let mut s = PeerScheduler::new(cfg(6));
-        // 全部是新连接（未过 15s 宽限期），即使很慢也不应立刻淘汰
+        // 全部是新连接（未过 40s 宽限期），即使很慢也不应立刻淘汰
         let peers: Vec<PeerSample> = (0..6).map(|i| sample(30 + i, 0, 2)).collect();
-        for _ in 0..5 {
+        for _ in 0..10 {
             let action = s.evaluate(&peers, 10);
             assert!(
                 !matches!(action, ScheduleAction::Replace(_)),

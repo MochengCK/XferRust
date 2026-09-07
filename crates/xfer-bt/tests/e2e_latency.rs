@@ -241,6 +241,8 @@ async fn latency_link_throughput_requires_multipiece_window() {
         pipeline: 0,
         enable_dht: false,
         dht_port: 0,
+        enable_lpd: false,
+        enable_port_mapping: false,
         encryption: xfer_bt::EncryptionMode::PlaintextOnly,
         // 测的是多片在途窗口的吞吐，seed 为纯 TCP：
         // 默认 TcpAndUtp 会先等 5s uTP 拨号超时再回退 TCP，污染计时。
@@ -259,6 +261,7 @@ async fn latency_link_throughput_requires_multipiece_window() {
         .expect("下载超时（30s）");
     r.expect("下载失败");
     let elapsed = start.elapsed();
+    eprintln!("latency regression elapsed: {elapsed:?}");
 
     // 文件逐字节一致
     let out = std::fs::read(dir.join("data.bin")).unwrap();

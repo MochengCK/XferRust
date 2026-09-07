@@ -107,6 +107,8 @@ fn make_config(
         pipeline: 0,
         enable_dht: false,
         dht_port: 0,
+        enable_lpd: false,
+        enable_port_mapping: false,
         encryption,
         bt_protocol,
         download_limit: 0,
