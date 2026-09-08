@@ -75,12 +75,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TOOLCHAIN_DIR="$RUNNER_TEMP/aarch64-linux-musl-cross"
-          curl -fsSL -o "$RUNNER_TEMP/musl-cross.tgz" https://musl.cc/aarch64-linux-musl-cross.tgz
-          tar -xzf "$RUNNER_TEMP/musl-cross.tgz" -C "$RUNNER_TEMP"
-          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
-          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$TOOLCHAIN_DIR/bin/aarch64-linux-musl-gcc"
-          cargo build --release --bin xfer --bin xferrust --target aarch64-unknown-linux-musl
+          # cargo-zigbuild 交叉编译：zig cc 兼任 C 编译器与链接器（ring 的 C 源码可直接编）。
+          # 仅依赖 PyPI，不用时好时坏的 musl.cc 工具链下载源（曾多次连不上导致 CI 失败）。
+          VENV="$RUNNER_TEMP/zigbuild-venv"
+          python3 -m venv "$VENV"
+          "$VENV/bin/pip" install --quiet cargo-zigbuild
+          export PATH="$VENV/bin:$PATH"
+          cargo zigbuild --release --bin xfer --bin xferrust --target aarch64-unknown-linux-musl
           mkdir -p dist
           cp target/aarch64-unknown-linux-musl/release/xfer dist/xfer
           cp target/aarch64-unknown-linux-musl/release/xferrust dist/xferrust
