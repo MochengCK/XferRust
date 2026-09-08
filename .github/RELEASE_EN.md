@@ -51,6 +51,11 @@
 - CI adds a `build-android` job: cross-compiles with NDK r27c + API 24 (Android 7.0+); artifact `xferrust-android-arm64-v8a.tar.gz` is included in releases
 - New local build script `scripts/build-android.sh`: auto-detects NDK host-tag (macOS / Linux), sets CC/CXX/AR/Linker env vars and invokes `cargo build --no-default-features --bin xferrust`
 
+### Linux ARM64 build
+
+- CI build matrix adds `linux-arm64` (aarch64-unknown-linux-musl): cross-compiled on an ubuntu x64 runner with the musl toolchain; artifacts `xfer-tui-linux-arm64.tar.gz` / `xferrust-linux-arm64.tar.gz` are included in releases
+- Statically linked against musl: no glibc version dependency, no bundled lib/ directory needed — extract and run
+
 ### TUI Redesign
 
 - Redesigned add-task dialog: URL + directory fields; an empty directory falls back to the global download directory (per task only). The directory can be typed manually or picked with the native system folder dialog by pressing Enter (macOS / Windows / Linux)

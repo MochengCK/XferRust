@@ -36,6 +36,12 @@ jobs:
           - os: ubuntu-latest
             artifact: linux-x86_64
             targets: ""
+          # linux-arm64 交叉编译：musl 静态链接（rustls 依赖 ring，无 OpenSSL，
+          # 可静态化），产物免带 lib/ 依赖目录。x64 runner 无法运行 aarch64，
+          # 跳过冒烟运行，仅做 file 架构校验。
+          - os: ubuntu-latest
+            artifact: linux-arm64
+            targets: "aarch64-unknown-linux-musl"
           - os: windows-latest
             artifact: windows-x86_64
             targets: ""
@@ -52,8 +58,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build + smoke test (Linux / Windows)
-        if: matrix.os != 'macos-latest'
+      - name: Build + smoke test (Linux x86_64 / Windows)
+        if: matrix.os != 'macos-latest' && matrix.artifact != 'linux-arm64'
         shell: bash
         run: |
           EXT=; [ "$RUNNER_OS" = "Windows" ] && EXT=.exe
@@ -63,6 +69,22 @@ jobs:
           cp "target/release/xferrust$EXT" "dist/xferrust$EXT"
           "dist/xfer$EXT" --version
           "dist/xferrust$EXT" --version
+
+      - name: "Cross build linux-arm64 (musl 静态，无法在 x64 runner 冒烟运行)"
+        if: matrix.artifact == 'linux-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOOLCHAIN_DIR="$RUNNER_TEMP/aarch64-linux-musl-cross"
+          curl -fsSL -o "$RUNNER_TEMP/musl-cross.tgz" https://musl.cc/aarch64-linux-musl-cross.tgz
+          tar -xzf "$RUNNER_TEMP/musl-cross.tgz" -C "$RUNNER_TEMP"
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$TOOLCHAIN_DIR/bin/aarch64-linux-musl-gcc"
+          cargo build --release --bin xfer --bin xferrust --target aarch64-unknown-linux-musl
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-musl/release/xfer dist/xfer
+          cp target/aarch64-unknown-linux-musl/release/xferrust dist/xferrust
+          file dist/xfer dist/xferrust
 
       - name: "Build + smoke test (macOS universal: Intel + Apple Silicon)"
         if: matrix.os == 'macos-latest'

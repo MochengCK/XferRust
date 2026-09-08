@@ -51,6 +51,11 @@
 - CI 新增 `build-android` 作业：使用 NDK r27c + API 24（Android 7.0+）交叉编译，产物 `xferrust-android-arm64-v8a.tar.gz` 随 Release 发布
 - 新增本地构建脚本 `scripts/build-android.sh`：自动检测 NDK host-tag（macOS / Linux），设置 CC/CXX/AR/Linker 环境变量并调用 `cargo build --no-default-features --bin xferrust`
 
+### Linux ARM64 构建
+
+- CI 构建矩阵新增 `linux-arm64`（aarch64-unknown-linux-musl）：在 ubuntu x64 runner 上用 musl 交叉工具链编译，产物 `xfer-tui-linux-arm64.tar.gz` / `xferrust-linux-arm64.tar.gz` 随 Release 发布
+- musl 静态链接：无 glibc 版本依赖，无需随包附带 lib/ 动态库目录，解压即可运行
+
 ### TUI 改版
 
 - 新建任务弹窗重做：地址 + 目录两个字段，目录留空使用全局下载目录（仅对当前任务生效）；目录可手动输入，按回车直接调用系统目录选择框选择（macOS / Windows / Linux）
