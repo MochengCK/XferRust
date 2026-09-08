@@ -6,7 +6,9 @@ mod adaptive;
 mod split;
 
 pub use adaptive::{AdaptiveConfig, AdaptiveScheduler, ConnPerf, ScheduleAction};
-pub use split::{ctrl_path, download_split, SplitDone, SplitOptions, SplitStats};
+pub use split::{
+    ctrl_path, download_split, PieceSnapshot, PieceTrack, SplitDone, SplitOptions, SplitStats,
+};
 
 use std::time::Duration;
 

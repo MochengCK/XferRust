@@ -155,6 +155,10 @@ pub struct Task {
     /// status 查询时序列化为 aria2 兼容 hex 字符串）。任务暂停后保留
     /// 最后已知状态供 UI 展示；非 BT 任务恒为空。
     pub bt_bitfield: Mutex<Vec<u8>>,
+    /// HTTP 任务实时分片位图（下载启动时挂接，写线程按落盘区间增量
+    /// 维护；BT 任务不使用——分片信息来自 bt_meta）。暂停后保留最后
+    /// 已知状态供 UI 展示；未知总长或不支持 Range 的任务为 None。
+    pub http_pieces: RwLock<Option<Arc<xfer_http::PieceTrack>>>,
     /// 磁力任务等待文件选择：元数据就绪后自动暂停，等用户在 TUI
     /// 勾选要下载的文件（`bt-file-selection` 任务选项置位）。
     pub awaiting_selection: AtomicBool,
@@ -210,6 +214,7 @@ impl Task {
             bt_trackers: Mutex::new(Vec::new()),
             bt_peers: Mutex::new(Vec::new()),
             bt_bitfield: Mutex::new(Vec::new()),
+            http_pieces: RwLock::new(None),
             awaiting_selection: AtomicBool::new(false),
             selected_files: Mutex::new(None),
             created_at: SystemTime::now(),
@@ -263,6 +268,7 @@ impl Task {
             bt_trackers: Mutex::new(Vec::new()),
             bt_peers: Mutex::new(Vec::new()),
             bt_bitfield: Mutex::new(Vec::new()),
+            http_pieces: RwLock::new(None),
             awaiting_selection: AtomicBool::new(false),
             selected_files: Mutex::new(None),
             created_at: SystemTime::now(),
@@ -316,6 +322,7 @@ impl Task {
             bt_trackers: Mutex::new(trackers),
             bt_peers: Mutex::new(Vec::new()),
             bt_bitfield: Mutex::new(Vec::new()),
+            http_pieces: RwLock::new(None),
             awaiting_selection: AtomicBool::new(false),
             selected_files: Mutex::new(None),
             created_at: SystemTime::now(),
@@ -618,9 +625,22 @@ pub fn status_json(task: &Task) -> Value {
             "uris": uris,
         })]
     };
-    let (num_pieces, piece_length) = match &*task.bt_meta.lock().unwrap() {
-        Some(m) => (m.info.piece_count(), m.info.piece_length),
-        None => (0, 0),
+    // 分片信息：BT 来自元信息；HTTP 来自分片跟踪（写线程按落盘区间
+    // 增量维护），未知总长或不支持 Range 时为空。
+    let (num_pieces, piece_length, status_bitfield) = {
+        let meta = task.bt_meta.lock().unwrap();
+        if let Some(m) = &*meta {
+            (
+                m.info.piece_count() as u64,
+                m.info.piece_length,
+                task.bt_bitfield.lock().unwrap().clone(),
+            )
+        } else {
+            match task.http_pieces.read().unwrap().as_ref() {
+                Some(p) => (p.num_pieces() as u64, p.piece_len(), p.bitfield()),
+                None => (0, 0, Vec::new()),
+            }
+        }
     };
     let num_seeders = task
         .bt_peers
@@ -641,7 +661,7 @@ pub fn status_json(task: &Task) -> Value {
     m.insert("uploadLength".into(), json!(s.uploaded.to_string()));
     m.insert("downloadSpeed".into(), json!(s.download_speed.to_string()));
     m.insert("uploadSpeed".into(), json!(s.upload_speed.to_string()));
-    m.insert("bitfield".into(), json!(bitfield_hex(&task.bt_bitfield.lock().unwrap())));
+    m.insert("bitfield".into(), json!(bitfield_hex(&status_bitfield)));
     m.insert("connections".into(), json!(s.connections.to_string()));
     m.insert("errorCode".into(), json!(s.error_code.to_string()));
     m.insert("errorMessage".into(), json!(s.error_message));
@@ -716,9 +736,22 @@ pub fn status_json_native(task: &Task) -> Value {
             "uris": uris,
         })]
     };
-    let (num_pieces, piece_length) = match &*task.bt_meta.lock().unwrap() {
-        Some(m) => (m.info.piece_count(), m.info.piece_length),
-        None => (0, 0),
+    // 分片信息：BT 来自元信息；HTTP 来自分片跟踪（写线程按落盘区间
+    // 增量维护），未知总长或不支持 Range 时为空。
+    let (num_pieces, piece_length, status_bitfield) = {
+        let meta = task.bt_meta.lock().unwrap();
+        if let Some(m) = &*meta {
+            (
+                m.info.piece_count() as u64,
+                m.info.piece_length,
+                task.bt_bitfield.lock().unwrap().clone(),
+            )
+        } else {
+            match task.http_pieces.read().unwrap().as_ref() {
+                Some(p) => (p.num_pieces() as u64, p.piece_len(), p.bitfield()),
+                None => (0, 0, Vec::new()),
+            }
+        }
     };
     let num_seeders = task
         .bt_peers
@@ -738,7 +771,7 @@ pub fn status_json_native(task: &Task) -> Value {
         "uploadLength": s.uploaded,
         "downloadSpeed": s.download_speed,
         "uploadSpeed": s.upload_speed,
-        "bitfield": bitfield_hex(&task.bt_bitfield.lock().unwrap()),
+        "bitfield": bitfield_hex(&status_bitfield),
         "connections": s.connections,
         "errorCode": s.error_code,
         "errorMessage": s.error_message,

@@ -3338,6 +3338,11 @@ async fn try_uri(
         }
         let opts = mgr.split_options(task);
         let stats = xfer_http::SplitStats::new(existing);
+        // HTTP 分片原生跟踪：片长 = min-split-size（与分段粒度一致）。
+        // 位图挂到任务后由分片写线程增量维护，状态查询直接读真实落盘。
+        let pieces = xfer_http::PieceTrack::new(total, opts.min_split_size);
+        stats.attach_pieces(pieces.clone());
+        *task.http_pieces.write().unwrap() = Some(pieces);
         let sampler = spawn_split_sampler(task, &stats);
         let r = xfer_http::download_split(client, uri, &path, total, &opts, cancel, stats.clone())
             .await;
@@ -3383,6 +3388,17 @@ async fn try_uri(
     } else {
         (0, SinkMode::Fresh)
     };
+    // 单连接路径分片位图（总长已知时）：顺序前缀写同样映射到分片；
+    // 未知总长无法定义分片，保持为空。NotSplittable 回退重下时在此
+    // 重建位图，作废分片路径的残留状态。
+    if let Some(t) = probe.total_len.filter(|t| *t > 0) {
+        let opts = mgr.split_options(task);
+        let pieces = xfer_http::PieceTrack::new(t, opts.min_split_size);
+        if start > 0 {
+            pieces.add_range(0, start);
+        }
+        *task.http_pieces.write().unwrap() = Some(pieces);
+    }
 
     let mut sink = ResumeSink::new(task.clone(), path, mode);
     let done = xfer_http::download(client, uri, start, cancel, &mut sink).await?;
@@ -3518,6 +3534,8 @@ impl ResumeSink {
 impl xfer_http::TransferSink for ResumeSink {
     fn begin(&mut self, restarted: bool) -> std::io::Result<u64> {
         let sink = if restarted {
+            // 服务器无视 Range 重发全量：基线归零，分片位图随之作废。
+            *self.task.http_pieces.write().unwrap() = None;
             FileSink::create(&self.path)?
         } else {
             match self.mode {
@@ -3540,7 +3558,12 @@ impl xfer_http::TransferSink for ResumeSink {
 
     fn write_chunk(&mut self, data: &[u8]) -> std::io::Result<()> {
         let sink = self.sink.as_mut().expect("begin 未调用");
+        let start = sink.position();
         sink.write(data)?;
+        // 分片位图增量记账（单连接顺序写，区间互不重叠）。
+        if let Some(p) = self.task.http_pieces.read().unwrap().as_ref() {
+            p.add_range(start, data.len() as u64);
+        }
         // 无锁进度：每块一次原子 store（原先每块一次 Mutex 获取，
         // 高吞吐下与查询/速度路径激烈竞争）。
         self.task

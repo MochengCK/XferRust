@@ -27,7 +27,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -100,6 +100,8 @@ pub struct SplitStats {
     pub completed: AtomicU64,
     /// 当前活跃连接数。
     pub connections: AtomicUsize,
+    /// 实时分片位图（下载启动时挂接一次，写线程增量维护）。
+    pieces: OnceLock<Arc<PieceTrack>>,
 }
 
 impl SplitStats {
@@ -107,7 +109,117 @@ impl SplitStats {
         Arc::new(Self {
             completed: AtomicU64::new(baseline),
             connections: AtomicUsize::new(0),
+            pieces: OnceLock::new(),
         })
+    }
+
+    /// 挂接分片位图（下载启动时一次；重复调用忽略后续）。
+    pub fn attach_pieces(&self, track: Arc<PieceTrack>) {
+        let _ = self.pieces.set(track);
+    }
+
+    /// 已挂接的分片位图。
+    pub fn piece_track(&self) -> Option<Arc<PieceTrack>> {
+        self.pieces.get().cloned()
+    }
+
+    /// 当前位图快照（未挂接返回 None）。
+    pub fn piece_snapshot(&self) -> Option<PieceSnapshot> {
+        self.pieces.get().map(|t| t.snapshot())
+    }
+}
+
+/// 分片位图快照：查询侧读取的一致视图。
+#[derive(Debug, Clone)]
+pub struct PieceSnapshot {
+    /// 片长（字节；末片为总长余数）。
+    pub piece_len: u64,
+    /// 片数。
+    pub num_pieces: u32,
+    /// wire 语义位图（MSB-first，片 0 = 首字节最高位），与 BT 位图编码一致。
+    pub bitfield: Vec<u8>,
+}
+
+/// HTTP 下载的实时分片位图。
+///
+/// 片长取 min-split-size——与分段粒度一致，重启恢复后按控制文件水位
+/// 重放（[`Self::add_range`]），位图与真实落盘天然自洽。写侧单线程
+/// 串行调用（分片写线程 / 单连接顺序写），各区间互不重叠，增量计数
+/// 无双重计入；查询侧无锁快照。
+pub struct PieceTrack {
+    total: u64,
+    piece_len: u64,
+    /// 每片已落盘字节。
+    done: Vec<AtomicU64>,
+    /// wire 语义位图（MSB-first）。
+    bf: Mutex<Vec<u8>>,
+}
+
+impl PieceTrack {
+    pub fn new(total: u64, piece_len: u64) -> Arc<Self> {
+        let piece_len = piece_len.max(1);
+        let n = total.div_ceil(piece_len);
+        Arc::new(Self {
+            total,
+            piece_len,
+            done: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            bf: Mutex::new(vec![0u8; n.div_ceil(8) as usize]),
+        })
+    }
+
+    /// 片长（字节）。
+    pub fn piece_len(&self) -> u64 {
+        self.piece_len
+    }
+
+    /// 片数。
+    pub fn num_pieces(&self) -> u32 {
+        self.done.len() as u32
+    }
+
+    /// 记录 [offset, offset+len) 已落盘。各写入区间互不重叠。
+    pub fn add_range(&self, offset: u64, len: u64) {
+        if len == 0 || self.done.is_empty() {
+            return;
+        }
+        let end = offset.saturating_add(len).min(self.total);
+        let mut offset = offset.min(end);
+        let mut i = (offset / self.piece_len) as usize;
+        while offset < end {
+            let ps = i as u64 * self.piece_len;
+            let pe = ps + self.len_at(i);
+            let lo = offset.max(ps);
+            let hi = end.min(pe);
+            if hi > lo {
+                let d = &self.done[i];
+                d.fetch_add(hi - lo, Ordering::Relaxed);
+                if d.load(Ordering::Relaxed) >= self.len_at(i) {
+                    self.bf.lock().unwrap()[i / 8] |= 0x80 >> (i % 8);
+                }
+            }
+            offset = hi;
+            i += 1;
+        }
+    }
+
+    /// 片长（末片为余数）。
+    fn len_at(&self, i: usize) -> u64 {
+        let start = i as u64 * self.piece_len;
+        (start + self.piece_len).min(self.total) - start
+    }
+
+    /// 一致性位图快照。
+    pub fn snapshot(&self) -> PieceSnapshot {
+        PieceSnapshot {
+            piece_len: self.piece_len,
+            num_pieces: self.num_pieces(),
+            bitfield: self.bitfield(),
+        }
+    }
+
+    /// wire 语义位图副本。
+    pub fn bitfield(&self) -> Vec<u8> {
+        self.bf.lock().unwrap().clone()
     }
 }
 
@@ -210,6 +322,13 @@ pub async fn download_split(
     } else {
         None
     };
+
+    // 分片位图：引擎预挂接（同步到任务状态查询）；独立调用（测试等）
+    // 未挂接时就地创建。片长 = min-split-size，与分段粒度一致。
+    // Writer::bootstrap 经 stats 取位图并按控制文件水位预填。
+    if stats.piece_track().is_none() {
+        stats.attach_pieces(PieceTrack::new(total, opts.min_split_size));
+    }
 
     // 写线程启动回执：携带应启动的工作协程数。
     let (ready_tx, ready_rx) = oneshot::channel::<io::Result<usize>>();
@@ -538,6 +657,8 @@ struct Writer {
     /// 控制文件同步器：周期性保存时把「数据文件 fsync + 控制文件
     /// 原子写入」整体委托给独立线程，写线程不因磁盘同步停摆。
     syncer: CtrlSyncer,
+    /// 实时分片位图（来自 stats，写线程按落盘区间增量维护）。
+    pieces: Option<Arc<PieceTrack>>,
 }
 
 impl Writer {
@@ -655,6 +776,19 @@ impl Writer {
 
         let todo: u64 = segs.iter().map(|s| s.end - s.start - s.written).sum();
         let done = todo == 0;
+        // 分片位图：按控制文件水位预填已完成区间（连续前缀基线 + 各段
+        // 已写部分），与后续增量写入衔接——恢复后位图与真实落盘一致。
+        let pieces = stats.piece_track();
+        if let Some(p) = &pieces {
+            if base > 0 {
+                p.add_range(0, base);
+            }
+            for s in &segs {
+                if s.written > 0 {
+                    p.add_range(s.start, s.written);
+                }
+            }
+        }
         stats.completed.store(
             base + (total - base).saturating_sub(todo),
             Ordering::Relaxed,
@@ -683,6 +817,7 @@ impl Writer {
             last_progress: Instant::now(),
             ctrl_buf: Vec::new(),
             syncer: CtrlSyncer::start(file, ctrl.to_path_buf()),
+            pieces,
         };
         w.rebuild_queue();
         Ok(w)
@@ -742,6 +877,9 @@ impl Writer {
         }
         seg.written = offset + n as u64 - seg.start;
         self.stats.completed.fetch_add(n as u64, Ordering::Relaxed);
+        if let Some(p) = &self.pieces {
+            p.add_range(offset, n as u64);
+        }
         self.todo -= n as u64;
         self.last_progress = Instant::now();
         if seg.written == seg.end - seg.start && !seg.done {
