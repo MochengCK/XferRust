@@ -801,3 +801,162 @@ async fn magnet_select_flow_pauses_then_completes() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 回归（应用端「选择文件」链路）：
+/// 应用端经 `task.changeOption { "select-file": "2" }`（aria2 select-file
+/// 语义，1 起算；空 = 全选）下发文件选择。曾有缺陷：change_option 仅把
+/// select-file 存入任务选项、从不应用，且原生编码 files[].selected 硬编码
+/// true——用户勾选后重开详情页全部显示未选、选择也从未真正生效。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn change_option_select_file_applies_and_reports() {
+    let dir = std::env::temp_dir().join(format!("xfer-engine-chgopt-sel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    init_tracing();
+
+    // 多文件种子：dl/a.bin(64K) + dl/sub/b.bin(64K+1) + dl/sub/c.bin(64K)
+    const L0: usize = PIECE_LEN;
+    const L1: usize = PIECE_LEN + 1;
+    const L2: usize = PIECE_LEN;
+    let file_data: Vec<Vec<u8>> = vec![
+        (0..L0).map(|i| (i % 97) as u8).collect(),
+        (0..L1).map(|i| (i % 251) as u8).collect(),
+        (0..L2).map(|i| (i % 89) as u8).collect(),
+    ];
+    let data: Vec<u8> = file_data.concat();
+    let pieces: Vec<u8> = data.chunks(PIECE_LEN).flat_map(sha1_of).collect();
+    let info = dict(BTreeMap::from([
+        (b"name".to_vec(), bytes("dl")),
+        (b"piece length".to_vec(), int(PIECE_LEN as i64)),
+        (
+            b"files".to_vec(),
+            Value::List(vec![
+                Value::Dict(BTreeMap::from([
+                    (b"length".to_vec(), int(L0 as i64)),
+                    (b"path".to_vec(), Value::List(vec![bytes("a.bin")])),
+                ])),
+                Value::Dict(BTreeMap::from([
+                    (b"length".to_vec(), int(L1 as i64)),
+                    (
+                        b"path".to_vec(),
+                        Value::List(vec![bytes("sub"), bytes("b.bin")]),
+                    ),
+                ])),
+                Value::Dict(BTreeMap::from([
+                    (b"length".to_vec(), int(L2 as i64)),
+                    (
+                        b"path".to_vec(),
+                        Value::List(vec![bytes("sub"), bytes("c.bin")]),
+                    ),
+                ])),
+            ]),
+        ),
+        (b"pieces".to_vec(), bytes(pieces)),
+    ]));
+    let info_bytes = encode(&info);
+    let info_hash = sha1_of(&info_bytes);
+
+    let (sl, saddr) = bind_random().await;
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = sl.accept().await else {
+                return;
+            };
+            let (d, ib) = (data.clone(), info_bytes.clone());
+            tokio::spawn(async move {
+                let _ = handle_ut_seed_peer(
+                    stream,
+                    &d,
+                    &ib,
+                    InfoHash::from_bytes(&info_hash),
+                    PeerId::azureus_prefix(&[0x55; 12]),
+                )
+                .await;
+            });
+        }
+    });
+
+    let (taddr, seed_ref) = start_tracker().await;
+    *seed_ref.write().unwrap() = Some(saddr);
+    let tracker_url = format!("http://{taddr}/announce");
+    let ih_hex: String = info_hash.iter().map(|b| format!("{b:02x}")).collect();
+    let magnet = format!("magnet:?xt=urn:btih:{ih_hex}&tr={tracker_url}");
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = mgr
+        .add_uri(
+            vec![magnet],
+            &serde_json::json!({"bt-file-selection": "true"}),
+            None,
+        )
+        .expect("添加磁力任务应成功");
+
+    // 等待"取到元数据 → 自动暂停（等待勾选）"
+    let mut paused = false;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let st = mgr.tell_status_native(&gid, None).unwrap();
+        if st["status"] == "error" {
+            panic!("解析阶段进入 error: {st:?}");
+        }
+        if st["status"] == "paused" && st["files"].as_array().is_some_and(|a| !a.is_empty()) {
+            paused = true;
+            break;
+        }
+    }
+    assert!(paused, "元数据就绪后任务应自动暂停等待文件选择");
+
+    // 应用端路径：changeOption select-file 勾选第 2 个文件（sub/b.bin）
+    mgr.change_option(&gid, &serde_json::json!({"select-file": "2"}))
+        .expect("changeOption select-file 应成功");
+
+    // 原生编码 selected 必须上报真实选择（布尔）
+    let files = mgr.tell_status_native(&gid, None).unwrap()["files"]
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert_eq!(files.len(), 3);
+    assert_eq!(files[0]["selected"], serde_json::json!(false));
+    assert_eq!(files[1]["selected"], serde_json::json!(true));
+    assert_eq!(files[2]["selected"], serde_json::json!(false));
+
+    // 空 = 全选：全部文件 selected 应为 true
+    mgr.change_option(&gid, &serde_json::json!({"select-file": ""}))
+        .expect("changeOption select-file 空值应恢复全选");
+    let files = mgr.tell_status_native(&gid, None).unwrap()["files"]
+        .as_array()
+        .cloned()
+        .unwrap();
+    assert!(
+        files.iter().all(|f| f["selected"] == serde_json::json!(true)),
+        "空 select-file 应恢复全选: {files:?}"
+    );
+
+    // 再次勾选第 2 个文件并恢复，验证选择真正参与下载
+    mgr.change_option(&gid, &serde_json::json!({"select-file": "2"}))
+        .expect("changeOption select-file 应成功");
+    mgr.unpause(&gid).expect("恢复应成功");
+
+    let mut done = false;
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let st = mgr.tell_status_native(&gid, None).unwrap();
+        match st["status"].as_str() {
+            Some("complete") => {
+                done = true;
+                break;
+            }
+            Some("error") => panic!("恢复后进入 error: {st:?}"),
+            _ => {}
+        }
+    }
+    assert!(done, "勾选并恢复后任务未完成");
+    assert!(dir.join("dl").join("sub").join("b.bin").exists());
+    assert!(!dir.join("dl").join("a.bin").exists(), "未选文件不应被创建");
+    assert!(
+        !dir.join("dl").join("sub").join("c.bin").exists(),
+        "未选文件不应被创建"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -1,4 +1,4 @@
-**摘要**：本版本在 v0.3.0 基础上继续演进，围绕「HTTP 能力补齐、前端协议对接、可观测性」三条主线。HTTP 下载获得与 BT 同级的真实分片位图（`numPieces` / `pieceLength` / `bitfield`，随落盘实时推进）与全局限速执行（跨任务共享令牌桶，`1M`/`500K` 单位直通，运行时热生效）；`task.getTrackers` 升级为带 per-tracker announce 状态（协议 / 工作状态 / 做种数 / 下次 announce 时间）。协议对接侧：任务状态新增 aria2 风格 `bittorrent` 对象与 `infoHash` 字段（前端 BT 识别与任务命名依赖）、命令行运行时选项直通（`--key=value`，含 `--enable-upnp` 等应用侧开关自动映射）、`engine.changeOptions` 支持全局 tracker 全量替换（`bt-trackers`）与订阅自动更新开关。可观测性侧：下载速度改为每秒刷新的 3 秒滑动窗口、暴露 BT 分片位图与逐对端位图、新增 BT 对端 IP 封禁（限时/永久），以及 `task.changeUri` / `task.getServers` 两个 aria2 兼容 RPC。CI 新增 linux-arm64（aarch64 musl 静态）构建矩阵。
+**摘要**：本版本在 v0.3.0 基础上继续演进，围绕「HTTP 能力补齐、前端协议对接、可观测性」三条主线。HTTP 下载获得与 BT 同级的真实分片位图（`numPieces` / `pieceLength` / `bitfield`，随落盘实时推进）与全局限速执行（跨任务共享令牌桶，`1M`/`500K` 单位直通，运行时热生效）；`task.getTrackers` 升级为带 per-tracker announce 状态（协议 / 工作状态 / 做种数 / 下次 announce 时间）。协议对接侧：任务状态新增 aria2 风格 `bittorrent` 对象与 `infoHash` 字段（前端 BT 识别与任务命名依赖）、命令行运行时选项直通（`--key=value`，含 `--enable-upnp` 等应用侧开关自动映射）、`engine.changeOptions` 支持全局 tracker 全量替换（`bt-trackers`）与订阅自动更新开关。可观测性侧：下载速度改为每秒刷新的 3 秒滑动窗口、暴露 BT 分片位图与逐对端位图、新增 BT 对端 IP 封禁（限时/永久），以及 `task.changeUri` / `task.getServers` 两个 aria2 兼容 RPC。本轮还补齐任务级平均速度（`averageSpeed`，活动阶段累计、随会话持久化）、细化 HTTP 分片粒度（几 MB 的小文件也能及时点亮分片）、修复并扩展文件选择链路（`task.changeOption` 真正应用 `select-file`、`files[].selected` 按真实选择上报、HTTP/HTTPS 任务支持选择文件），单文件磁力元数据就绪后自动全量续下。CI 新增 linux-arm64（aarch64 musl 静态）构建矩阵。
 
 ## 新功能
 
@@ -27,9 +27,22 @@
 - HTTP 任务改 URI：新增 RPC `task.changeUri`（aria2 兼容语义：waiting/paused 状态下按 `fileIndex` 删除 `delUris`、追加 `addUris`；active 状态拒绝，由应用端回退为「重建任务」）
 - 服务器列表：新增 RPC `task.getServers`（HTTP 任务返回 aria2 兼容的服务器条目 `currentUri` / `downloadSpeed` / `downloadLength`，BT 任务返回空数组）
 
+### 任务平均速度（averageSpeed）
+
+- 任务状态响应（`task.tell` / `task.list`，aria2 风格与原生数值两种编码）新增 `averageSpeed` 字段（字节/秒）：驱动侧 1Hz ticker 在活动下载阶段逐秒累计「完成字节增量 + 活动时长」，均值 = 累计字节 / 活动秒数；做种与暂停阶段不累计、不稀释
+- 累计数据随会话持久化，重启续传后平均速度不漂移；应用端进度窗口与任务详情直取该字段实时刷新，无需前端自行采样估算
+
+### 文件选择（select-file）全链路
+
+- `task.changeOption` 真正应用 `select-file`（aria2 语义：1 起算的逗号分隔文件序号，空 = 全选）：此前该键只被存入任务选项、从未应用，用户勾选保存后重开详情页显示「一个未选」，选择也从未生效。现即时应用：BT 运行中热生效（重算所需片位图与总量），暂停/等待中的任务在下次启动时生效
+- `files[].selected` 按真实选择上报：原生编码此前硬编码 `true`，aria2 兼容编码同步输出 `"true"` / `"false"` 字符串
+- 选择文件扩展到 HTTP/HTTPS 任务：单文件布局（文件数恒为 1），选择状态持久化并在下次启动时生效；磁力元数据未就绪时仍返回错误
+- `task.add`（`addUri` / `addTorrent`）支持 `select-file` 预选文件；无效/越界取值降级为告警，不中断任务添加
+- 单文件磁力自动续下：磁力元数据就绪后若为单文件布局（无选择意义），自动清除等待标记并以重启意图重新入队、按全量选择直接续下，无需用户手动恢复；多文件磁力维持「元数据就绪 → 自动暂停等待勾选」流程
+
 ### HTTP 分片位图与全局限速
 
-- HTTP 任务分片位图：`task.tell` / `task.list`（aria2 风格 + 原生数值两种编码）对 HTTP 任务输出真实分片数据——`numPieces` / `pieceLength` / `bitfield`（aria2 兼容 hex 编码）。片长取 `min-split-size`（与分段粒度一致），写侧按落盘区间增量记账：多连接分片写线程与单连接顺序写两条路径均覆盖；服务器无视 Range 重发全量时位图作废重建；控制文件水位预填保证重启恢复后位图与真实落盘自洽；未知总长或不支持 Range 时不输出；任务暂停后保留最后已知状态。此前 HTTP 任务恒为 `numPieces=0` / `bitfield` 空，桌面任务列表与详情页分片图无法显示
+- HTTP 任务分片位图：`task.tell` / `task.list`（aria2 风格 + 原生数值两种编码）对 HTTP 任务输出真实分片数据——`numPieces` / `pieceLength` / `bitfield`（aria2 兼容 hex 编码）。片长 = 进度显示粒度，与分段粒度（`min-split-size`）解耦：取 `min(min-split-size, max(total/2048, 64KB))`——几 MB 的小文件也能及时点亮分片（此前片长固定取 `min-split-size`，一片 = 整个分段，下载几 MB 位图仍全零），大文件按 `min-split-size` 保持既有粒度。写侧按落盘区间增量记账：多连接分片写线程与单连接顺序写两条路径均覆盖；服务器无视 Range 重发全量时位图作废重建；控制文件水位预填保证重启恢复后位图与真实落盘自洽；未知总长或不支持 Range 时不输出；任务暂停后保留最后已知状态。此前 HTTP 任务恒为 `numPieces=0` / `bitfield` 空，桌面任务列表与详情页分片图无法显示
 - HTTP 全局限速执行：新增跨任务共享的异步令牌桶限速器（`RateLimiter`），注入每条下载连接——多连接在读循环、单连接在逐块落盘前消费令牌，令牌不足时异步等待，TCP 背压自然收敛；`engine.changeOptions` 运行时热更新立即生效。此前限速只下发到 BT 引擎，HTTP 下载完全不受限速约束
 - 限速值解析升级：`max-overall-download-limit` / `max-overall-upload-limit` 接受 aria2 风格单位（`1M` / `500K` / 纯整数字节），与桌面端配置格式兼容（此前仅接受纯整数，带单位的值被拒绝或静默当作不限速）
 - 单键错误不再中断整批设置：`changeOptions` 中限速值 / `bt-encryption` / `bt-protocol` / 端口类选项取值非法时降级为告警并跳过该键，其余设置项照常生效——此前一个非法键导致整批 changeOptions 返回错误、用户改一处限速会把所有系统设置一起弄失效
@@ -37,6 +50,8 @@
 
 ## 问题修复
 
+- 修复「选择文件」保存后不生效且重开详情页全部显示未选：`changeOption` 的 `select-file` 此前只被存储、从未应用，且原生编码 `files[].selected` 硬编码 `true`，详见「文件选择（select-file）全链路」
+- 修复几 MB 的小文件 HTTP 分片位图恒为零：片长曾固定取 `min-split-size`，小文件整个下载量尚不足以点亮一片，详见「HTTP 分片位图与全局限速」
 - 修复 HTTP 任务完成后误报 `seeder=true`：`seeder` 语义修正为「本端为 BT 任务且已完整」，此前按「completed ≥ total」对所有任务类型计算，HTTP 任务下载完成即误报，应用端据此把普通任务标成“做种中”并补发 BT 完成事件
 - 修复 HTTP 任务分片数据恒为空（`numPieces=0` / `bitfield` 空串），详见「HTTP 分片位图与全局限速」
 - 修复限速设置不生效：带单位的限速值（如 `1M`）此前被引擎拒绝或静默按不限速处理，且 HTTP 下载路径完全没有限速执行，详见「HTTP 分片位图与全局限速」

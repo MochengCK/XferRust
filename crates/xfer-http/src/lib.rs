@@ -507,6 +507,7 @@ mod tests {
             512,
             &cancel,
             &mut sink,
+            None,
         )
         .await
         .unwrap();
@@ -526,6 +527,7 @@ mod tests {
             512,
             &cancel,
             &mut sink,
+            None,
         )
         .await
         .unwrap();
@@ -542,7 +544,8 @@ mod tests {
                 &format!("http://{addr}/file.bin"),
                 0,
                 &cancel2,
-                &mut VecSink { buf: vec![] }
+                &mut VecSink { buf: vec![] },
+                None,
             )
             .await,
             Err(HttpError::Cancelled)

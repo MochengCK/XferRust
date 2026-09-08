@@ -145,8 +145,9 @@ pub struct PieceSnapshot {
 
 /// HTTP 下载的实时分片位图。
 ///
-/// 片长取 min-split-size——与分段粒度一致，重启恢复后按控制文件水位
-/// 重放（[`Self::add_range`]），位图与真实落盘天然自洽。写侧单线程
+/// 片长 = 进度显示粒度（调用方决定，通常细于 min-split-size，见
+/// [`split_download`]），重启恢复后按控制文件水位重放
+/// （[`Self::add_range`]），位图与真实落盘天然自洽。写侧单线程
 /// 串行调用（分片写线程 / 单连接顺序写），各区间互不重叠，增量计数
 /// 无双重计入；查询侧无锁快照。
 pub struct PieceTrack {
@@ -327,10 +328,17 @@ pub async fn download_split(
     };
 
     // 分片位图：引擎预挂接（同步到任务状态查询）；独立调用（测试等）
-    // 未挂接时就地创建。片长 = min-split-size，与分段粒度一致。
+    // 未挂接时就地创建。片长 = 进度显示粒度，与分段粒度（min-split-size）
+    // 解耦：取 min-split-size 与 max(total/2048, 64KB) 的较小者——
+    // 几 MB 的小文件也能及时点亮分片（否则一片 = 整个 min-split 段，
+    // 下载几 MB 位图仍全零）；大文件按 min-split-size 保持既有粒度。
     // Writer::bootstrap 经 stats 取位图并按控制文件水位预填。
     if stats.piece_track().is_none() {
-        stats.attach_pieces(PieceTrack::new(total, opts.min_split_size));
+        let display_piece_len = opts
+            .min_split_size
+            .min((total / 2048).max(64 * 1024))
+            .max(1);
+        stats.attach_pieces(PieceTrack::new(total, display_piece_len));
     }
 
     // 写线程启动回执：携带应启动的工作协程数。
@@ -1878,6 +1886,7 @@ mod tests {
             connections,
             min_split_size: min_split,
             adaptive: None, // 测试默认不启用自适应
+            limiter: None,
         }
     }
 
@@ -2292,6 +2301,7 @@ mod tests {
             sink.buf.len() as u64,
             &cancel,
             &mut sink,
+            None,
         )
         .await
         .unwrap();
@@ -2482,6 +2492,7 @@ mod tests {
                 eval_interval: Duration::from_millis(500),
                 ..Default::default()
             }),
+            limiter: None,
         };
 
         let done = download_split(
@@ -2528,6 +2539,7 @@ mod tests {
                 eval_interval: Duration::from_millis(300),
                 ..Default::default()
             }),
+            limiter: None,
         };
 
         download_split(
@@ -2557,6 +2569,7 @@ mod tests {
             connections: 4,
             min_split_size: 64 * 1024,
             adaptive: None, // 显式禁用
+            limiter: None,
         };
 
         download_split(
@@ -2587,6 +2600,7 @@ mod tests {
             connections: 4,
             min_split_size: 20 * 1024 * 1024,
             adaptive: None,
+            limiter: None,
         };
 
         // 常规模式（todo > 阈值）：段剩余 25MB < 2×20MB 下限 → 不可窃取
@@ -2657,6 +2671,7 @@ mod tests {
             connections: 2,
             min_split_size: 1024,
             adaptive: None,
+            limiter: None,
         };
         let path = dir.join("s.bin");
         let mut w = Writer::bootstrap(
@@ -2726,6 +2741,7 @@ mod tests {
             connections: 1,
             min_split_size: 1024,
             adaptive: None,
+            limiter: None,
         };
         let path = dir.join("g.bin");
         let mut w = Writer::bootstrap(
@@ -2781,6 +2797,7 @@ mod tests {
             connections: 2,
             min_split_size: 1024,
             adaptive: None,
+            limiter: None,
         };
         let path = dir.join("w.bin");
         let mut w = Writer::bootstrap(
@@ -2831,6 +2848,7 @@ mod tests {
             connections: 2,
             min_split_size: 1024,
             adaptive: None,
+            limiter: None,
         };
         let path = dir.join("c.bin");
         let ctrl = ctrl_path(&path);
@@ -2918,6 +2936,7 @@ mod tests {
             connections: 2,
             min_split_size: 1024 * 1024,
             adaptive: None,
+            limiter: None,
         };
         // 8MB / min_split 1MB → by_min=8，上限 2×workers=4 → 4 段 × 2MB
         let path = dir.join("t.bin");
@@ -2978,6 +2997,7 @@ mod tests {
                 eval_interval: Duration::from_millis(300),
                 ..Default::default()
             }),
+            limiter: None,
         };
 
         download_split(

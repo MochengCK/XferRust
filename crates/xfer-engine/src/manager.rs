@@ -591,6 +591,11 @@ impl TaskManager {
                 // 恢复完成/错误时间戳（仅终态任务有意义；重新入队时保持 0）
                 task.finished_at
                     .store(t["finishedAt"].as_u64().unwrap_or(0), Ordering::Relaxed);
+                // 恢复平均速度累计（active 阶段字节与时长）
+                task.avg_active_ms
+                    .store(t["avgActiveMs"].as_u64().unwrap_or(0), Ordering::Relaxed);
+                task.avg_bytes
+                    .store(t["avgBytes"].as_u64().unwrap_or(0), Ordering::Relaxed);
                 match t["status"].as_str().unwrap_or("waiting") {
                     "paused" => sh.status = Status::Paused,
                     "complete" => sh.status = Status::Complete,
@@ -671,6 +676,9 @@ impl TaskManager {
                     "totalLength": s.total_len.unwrap_or(0),
                     "elapsedMs": s.elapsed_ms,
                     "finishedAt": s.finished_at,
+                    // 平均速度累计（active 阶段字节与时长），重启续传后均值不漂移
+                    "avgActiveMs": t.avg_active_ms.load(Ordering::Relaxed),
+                    "avgBytes": t.avg_bytes.load(Ordering::Relaxed),
                     "path": s.path,
                     "errorCode": s.error_code,
                     "errorMessage": s.error_message,
@@ -879,6 +887,13 @@ impl TaskManager {
                             sh.status = Status::Paused;
                             ("pause", false)
                         }
+                        Intent::Restart => {
+                            // 磁力单文件自动续下：无需用户选择，转回
+                            // Waiting 重新入队（下方统一处理入队），
+                            // 下次启动 selected_files=None 即全量下载
+                            sh.status = Status::Waiting;
+                            ("pause", false)
+                        }
                         Intent::StopSeeding => {
                             // 做种中用户手动停止 → 任务转完成
                             sh.status = Status::Complete;
@@ -922,6 +937,19 @@ impl TaskManager {
                 inner.stopped_order.retain(|g| g != &task.gid);
                 if let Some(p) = task.shared.lock().unwrap().path.clone() {
                     inner.claims.remove(&p);
+                }
+            } else if task.status() == Status::Waiting {
+                // Intent::Restart（磁力单文件自动续下）：确认意图未被
+                // 并发的用户暂停覆盖后，替换取消令牌并重新入队
+                let restart = matches!(*task.intent.lock().unwrap(), Intent::Restart);
+                if restart {
+                    *task.intent.lock().unwrap() = Intent::None;
+                    *task.cancel.write().unwrap() = CancellationToken::new();
+                    inner.queue.push_back(task.gid.clone());
+                } else {
+                    // 意图被并发用户暂停覆盖：按暂停收尾，避免遗留
+                    // 不在队列中的游离 Waiting 任务
+                    task.set_status(Status::Paused);
                 }
             } else if terminal {
                 inner.stopped_order.push(task.gid.clone());
@@ -1018,6 +1046,40 @@ impl TaskManager {
             Arc::new(meta),
             collect_task_options(&opts),
         ));
+        // select-file：新增时预选文件（aria2 语义，1 起算的逗号分隔序号；
+        // 空 = 全选即默认，无需处理）。无效/越界取值降级为告警，不中断添加。
+        if let Some(v) = opts.get("select-file").or_else(|| opts.get("selectFile")) {
+            let raw = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let indices: Vec<usize> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse::<usize>().ok())
+                .filter(|n| *n >= 1)
+                .map(|n| n - 1)
+                .collect();
+            if !indices.is_empty() {
+                let count = task
+                    .bt_meta
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|m| m.info.files.len())
+                    .unwrap_or(0);
+                let mut sel: Vec<usize> =
+                    indices.into_iter().filter(|i| *i < count).collect();
+                if sel.is_empty() {
+                    tracing::warn!(%raw, "select-file 全部越界，按全选处理");
+                } else {
+                    sel.sort_unstable();
+                    sel.dedup();
+                    *task.selected_files.lock().unwrap() = Some(sel);
+                }
+            }
+        }
         {
             let mut inner = self.inner.lock().unwrap();
             inner.tasks.insert(gid.clone(), task);
@@ -1987,22 +2049,25 @@ impl TaskManager {
         Ok(Value::Array(arr))
     }
 
-    /// 设置 BT 任务的文件选择（磁力解析流程：用户勾选要下载的文件）。
+    /// 设置任务的文件选择（磁力解析流程：用户勾选要下载的文件）。
     ///
-    /// - 仅接受已就绪文件列表的 BT 任务；索引越界自动过滤，去重排序；
-    /// - 运行中引擎实时热生效（重算所需片位图与总量）；
+    /// - BT 任务文件数来自元信息；HTTP/HTTPS 单文件任务恒为 1（仅
+    ///   持久化选择状态，无多文件布局）；磁力元数据未就绪时报错；
+    /// - 索引越界自动过滤，去重排序；
+    /// - BT 运行中引擎实时热生效（重算所需片位图与总量）；
     /// - 暂停/等待中的任务在下次启动（unpause/调度）时生效。
     ///
     /// 索引为 `files[].index - 1`（0 起算的文件序号）。
     pub fn select_files(&self, gid: &Gid, indices: &[usize]) -> Result<(), String> {
         let task = self.task_of(gid)?;
-        let count = task
-            .bt_meta
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|m| m.info.files.len())
-            .ok_or_else(|| "文件列表未就绪（磁力元数据解析中或非 BT 任务）".to_string())?;
+        let count = match task.bt_meta.lock().unwrap().as_ref().map(|m| m.info.files.len()) {
+            Some(c) => c,
+            None if task.bt_info_hash.lock().unwrap().is_some() => {
+                return Err("文件列表未就绪（磁力元数据解析中）".to_string());
+            }
+            // 非 BT 任务（HTTP/HTTPS）：单文件布局
+            None => 1,
+        };
         let mut sel: Vec<usize> = indices
             .iter()
             .copied()
@@ -2845,12 +2910,57 @@ impl TaskManager {
         if task.status().is_terminal() {
             return Err("任务已结束，无法修改选项".into());
         }
+        // select-file：BT 文件选择热更新（动作键，不进 options 存储）。
+        // aria2 select-file 语义：1 起算的逗号分隔文件序号；空 = 全选。
+        // 应用端「选择文件」弹窗经 changeOption 下发（kebab 化后为
+        // select-file），此前只被存储、从未应用，导致选择重开后丢失。
+        if let Some(v) = opts.get("select-file").or_else(|| opts.get("selectFile")) {
+            let raw = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            if raw.trim().is_empty() {
+                // 空 = 全部文件（Some(全部索引) 与 None 下载语义等价）；
+                // 文件数：BT 来自元信息，HTTP/HTTPS 单文件任务恒为 1
+                let count = match task
+                    .bt_meta
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|m| m.info.files.len())
+                {
+                    Some(c) => c,
+                    None if task.bt_info_hash.lock().unwrap().is_some() => {
+                        return Err("文件列表未就绪（磁力元数据解析中）".into());
+                    }
+                    None => 1,
+                };
+                let all: Vec<usize> = (0..count).collect();
+                self.select_files(gid, &all)?;
+            } else {
+                let indices: Vec<usize> = raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse::<usize>().ok())
+                    .filter(|n| *n >= 1)
+                    .map(|n| n - 1)
+                    .collect();
+                if indices.is_empty() {
+                    return Err(format!("select-file 取值无效: {raw}"));
+                }
+                self.select_files(gid, &indices)?;
+            }
+        }
         {
             let mut t = task.options.lock().unwrap();
             for (k, v) in opts {
                 if k == "dir" || k == "out" || k == "checksum" {
                     tracing::debug!(gid = %gid, option = %k, "该选项暂不支持热修改");
                     continue;
+                }
+                if k == "select-file" || k == "selectFile" {
+                    continue; // 动作键，已在上方应用
                 }
                 let v = match v {
                     Value::String(s) => s.clone(),
@@ -3005,9 +3115,13 @@ async fn speed_ticker(task: Arc<Task>, events: broadcast::Sender<EngineEvent>) {
     // （跨度 2-3s）；样本数未满窗口时按实际跨度折算。
     const WINDOW_SECS: usize = 3;
     let mut samples: VecDeque<(u64, u64)> = VecDeque::with_capacity(WINDOW_SECS + 1);
+    // 平均速度累计的基准：前次采样完成字节（本 ticker 随一次下载运行
+    // 启停，None = 尚未采样）。
+    let mut last_completed: Option<u64> = None;
     loop {
         interval.tick().await;
-        samples.push_back((task.completed_live(), task.uploaded_live()));
+        let completed = task.completed_live();
+        samples.push_back((completed, task.uploaded_live()));
         while samples.len() > WINDOW_SECS + 1 {
             samples.pop_front();
         }
@@ -3018,6 +3132,17 @@ async fn speed_ticker(task: Arc<Task>, events: broadcast::Sender<EngineEvent>) {
             task.upload_speed_atomic
                 .store(u1.saturating_sub(u0) / span, Ordering::Relaxed);
         }
+        // 平均速度数据累计：仅活动下载阶段（Status::Active，做种/暂停
+        // 不计不稀释）每秒记一次 active_ms，字节增量取与前次采样的差值
+        // （resume 基线已含在首次采样里，不会重复计入）。
+        if task.status() == Status::Active {
+            task.avg_active_ms.fetch_add(1000, Ordering::Relaxed);
+            if let Some(prev) = last_completed {
+                task.avg_bytes
+                    .fetch_add(completed.saturating_sub(prev), Ordering::Relaxed);
+            }
+        }
+        last_completed = Some(completed);
         let _ = events.send(("progress".to_string(), task.gid.0.clone()));
     }
 }
@@ -3197,13 +3322,29 @@ async fn drive_bt_download(
                 }
                 // 磁力解析流程：元数据到手后暂停任务，等用户在 TUI 勾选文件。
                 // 借用 pause 语义（intent=Pause + cancel）复用现有状态机。
+                // 单文件布局（info.files 为 1 项）没有选择意义：清标记后
+                // 以 Restart 意图重启，自动以全量选择续下（占位引擎按
+                // 创建时选择打开句柄，热切换不安全，必须走重启）。
                 if task.awaiting_selection.load(Ordering::SeqCst)
                     && task.bt_meta.lock().unwrap().is_some()
                 {
+                    let file_count = task
+                        .bt_meta
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|m| m.info.files.len())
+                        .unwrap_or(0);
                     let mut intent = task.intent.lock().unwrap();
                     if matches!(*intent, Intent::None) {
-                        tracing::info!(gid = %task.gid, "等待文件选择，自动暂停");
-                        *intent = Intent::Pause;
+                        if file_count <= 1 {
+                            tracing::info!(gid = %task.gid, "单文件磁力无需选择文件，重启引擎续下");
+                            task.awaiting_selection.store(false, Ordering::SeqCst);
+                            *intent = Intent::Restart;
+                        } else {
+                            tracing::info!(gid = %task.gid, "等待文件选择，自动暂停");
+                            *intent = Intent::Pause;
+                        }
                         drop(intent);
                         cancel.cancel();
                         break;

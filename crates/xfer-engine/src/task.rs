@@ -69,6 +69,9 @@ pub enum Intent {
     Remove,
     /// 停止做种：seed 模式运行中用户手动结束 → 任务转完成。
     StopSeeding,
+    /// 磁力单文件自动续下：元数据就绪后发现单文件布局，无需用户
+    /// 选择——工作者重启后转回 Waiting 重新入队，以全量选择续下。
+    Restart,
 }
 
 /// 引擎侧任务失败分类（映射任务错误码）。
@@ -190,6 +193,12 @@ pub struct Task {
     /// 完成/错误时刻（Unix 毫秒；0 = 未知）。终态转移时设置，
     /// 会话持久化保存，重启恢复后客户端仍可显示完成时间。
     pub finished_at: AtomicU64,
+    /// 平均速度累计——活动下载阶段（Status::Active，不含做种）每秒
+    /// 记一次：avg_active_ms += 1000、avg_bytes += 完成字节增量。
+    /// averageSpeed = avg_bytes / (avg_active_ms / 1000)，随会话持久化，
+    /// 重启续传后均值不漂移。
+    pub avg_active_ms: AtomicU64,
+    pub avg_bytes: AtomicU64,
 }
 
 impl Task {
@@ -243,6 +252,8 @@ impl Task {
             uploaded_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
             finished_at: AtomicU64::new(0),
+            avg_active_ms: AtomicU64::new(0),
+            avg_bytes: AtomicU64::new(0),
         }
     }
 
@@ -297,6 +308,8 @@ impl Task {
             uploaded_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
             finished_at: AtomicU64::new(0),
+            avg_active_ms: AtomicU64::new(0),
+            avg_bytes: AtomicU64::new(0),
         }
     }
 
@@ -351,6 +364,8 @@ impl Task {
             uploaded_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
             finished_at: AtomicU64::new(0),
+            avg_active_ms: AtomicU64::new(0),
+            avg_bytes: AtomicU64::new(0),
         }
     }
 
@@ -576,6 +591,16 @@ fn bittorrent_json(task: &Task, hash: Option<&str>) -> Value {
     }
 }
 
+/// 平均速度（字节/秒）：活动下载阶段累计字节 / 活动时长。
+/// 两者均随会话持久化（重启续传后均值不漂移），做种期不累计不稀释。
+fn average_speed_of(task: &Task) -> u64 {
+    let ms = task.avg_active_ms.load(Ordering::Relaxed);
+    if ms < 1000 {
+        return 0;
+    }
+    task.avg_bytes.load(Ordering::Relaxed) / (ms / 1000)
+}
+
 /// 任务状态 → 前端兼容协议 JSON（数值以字符串承载）。
 pub fn status_json(task: &Task) -> Value {
     let s = snapshot(task);
@@ -621,7 +646,7 @@ pub fn status_json(task: &Task) -> Value {
             "path": s.path,
             "length": s.file_len.to_string(),
             "completedLength": s.completed.to_string(),
-            "selected": "true",
+            "selected": is_selected(0).to_string(),
             "uris": uris,
         })]
     };
@@ -663,6 +688,11 @@ pub fn status_json(task: &Task) -> Value {
     m.insert("uploadLength".into(), json!(s.uploaded.to_string()));
     m.insert("downloadSpeed".into(), json!(s.download_speed.to_string()));
     m.insert("uploadSpeed".into(), json!(s.upload_speed.to_string()));
+    // 平均速度（应用端进度窗口/任务详情直取引擎，1Hz 刷新）
+    m.insert(
+        "averageSpeed".into(),
+        json!(average_speed_of(task).to_string()),
+    );
     m.insert("bitfield".into(), json!(bitfield_hex(&status_bitfield)));
     m.insert("connections".into(), json!(s.connections.to_string()));
     m.insert("errorCode".into(), json!(s.error_code.to_string()));
@@ -697,6 +727,12 @@ pub fn status_json(task: &Task) -> Value {
 /// 任务状态 → 原生协议 JSON（数值字段为真实 JSON 数值）。
 pub fn status_json_native(task: &Task) -> Value {
     let s = snapshot(task);
+    // 文件选择状态（aria2 兼容编码同源）：None = 全选
+    let sel = task.selected_files.lock().unwrap().clone();
+    let is_selected = |i: usize| match &sel {
+        None => true,
+        Some(v) => v.contains(&i),
+    };
     let files = if let Some(meta) = &*task.bt_meta.lock().unwrap() {
         let total_done = s.completed;
         meta.info
@@ -715,7 +751,7 @@ pub fn status_json_native(task: &Task) -> Value {
                     "path": format!("{}/{}", meta.info.name, f.path.join("/")),
                     "length": f.length,
                     "completedLength": frac,
-                    "selected": true,
+                    "selected": is_selected(i),
                     "uris": [],
                 })
             })
@@ -734,7 +770,7 @@ pub fn status_json_native(task: &Task) -> Value {
             "path": s.path,
             "length": s.file_len,
             "completedLength": s.completed,
-            "selected": true,
+            "selected": is_selected(0),
             "uris": uris,
         })]
     };
@@ -775,6 +811,8 @@ pub fn status_json_native(task: &Task) -> Value {
         "uploadLength": s.uploaded,
         "downloadSpeed": s.download_speed,
         "uploadSpeed": s.upload_speed,
+        // 平均速度（应用端进度窗口/任务详情直取引擎，1Hz 刷新）
+        "averageSpeed": average_speed_of(task),
         "bitfield": bitfield_hex(&status_bitfield),
         "connections": s.connections,
         "errorCode": s.error_code,
