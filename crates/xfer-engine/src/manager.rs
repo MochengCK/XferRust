@@ -192,10 +192,8 @@ struct Inner {
     /// 全局 BT 封禁名单：IP → 过期时刻（None = 永久）。作用于所有
     /// BT 任务（aria2 banPeer 的全局语义），随会话持久化。
     bt_bans: HashMap<IpAddr, Option<Instant>>,
-    /// HTTP 下载全局限速器（max-overall-download-limit 语义 = 所有
-    /// HTTP 任务合计；BT 任务由各 TorrentEngine 自带限速器执行）。
-    /// 注入每条下载连接，运行时经 changeOptions 热更新。
-    http_dl_limiter: Arc<xfer_http::RateLimiter>,
+    // 全局下载限速不再用共享令牌桶承载：每个任务持有自己的限速器，
+    // rate 由 apply_task_rate_limits 按 min(单任务, 全局) 合成同步。
 }
 
 /// Tracker 订阅源：远程 URL 返回纯文本（每行一个 tracker URL）。
@@ -262,7 +260,6 @@ impl TaskManager {
                 tracker_subscriptions: Vec::new(),
                 auto_update_trackers: true,
                 bt_bans: HashMap::new(),
-                http_dl_limiter: xfer_http::RateLimiter::new(0),
             }),
             bt_engines: Mutex::new(HashMap::new()),
             kick: Notify::new(),
@@ -1046,6 +1043,16 @@ impl TaskManager {
             Arc::new(meta),
             collect_task_options(&opts),
         ));
+        // 种子文件流程：元数据随添加即刻可得，置位后由 1Hz ticker
+        // 自动暂停等 UI 勾选要下载的文件（与磁力流程同一状态机）。
+        if opts
+            .get("bt-file-selection")
+            .and_then(Value::as_str)
+            .map(|v| v == "true")
+            .unwrap_or(false)
+        {
+            task.awaiting_selection.store(true, Ordering::SeqCst);
+        }
         // select-file：新增时预选文件（aria2 语义，1 起算的逗号分隔序号；
         // 空 = 全选即默认，无需处理）。无效/越界取值降级为告警，不中断添加。
         if let Some(v) = opts.get("select-file").or_else(|| opts.get("selectFile")) {
@@ -1498,7 +1505,7 @@ impl TaskManager {
             connections,
             min_split_size: min_split,
             adaptive,
-            limiter: Some(self.inner.lock().unwrap().http_dl_limiter.clone()),
+            limiter: Some(task.http_task_limiter()),
         }
     }
 
@@ -1861,17 +1868,33 @@ impl TaskManager {
     }
 
     /// 将当前全局限速下发到所有活动 BT 引擎与 HTTP 共享限速器
-    /// （运行时立即生效）。
+    /// （运行时立即生效）。任务级限速在 [`Self::apply_task_rate_limits`]
+    /// 中与全局值合成，全局变更后逐任务重新同步。
     fn apply_rate_limits(&self) {
-        let (dl, ul) = self.rate_limits();
-        for engine in self.bt_engines.lock().unwrap().values() {
-            engine.set_rate_limits(dl, ul);
-        }
-        self.inner
+        let tasks: Vec<Arc<Task>> = self
+            .inner
             .lock()
             .unwrap()
-            .http_dl_limiter
-            .set_rate(dl);
+            .tasks
+            .values()
+            .cloned()
+            .collect();
+        for t in tasks {
+            self.apply_task_rate_limits(&t);
+        }
+    }
+
+    /// 把某任务的实际生效限速（min(单任务, 全局)，0 = 不限）同步到
+    /// 该任务的 HTTP 限速器与活动 BT 引擎。任务无活动传输路径时为
+    /// 无操作（下次启动时会在驱动入口重新同步）。
+    fn apply_task_rate_limits(&self, task: &Arc<Task>) {
+        let (gdl, gul) = self.rate_limits();
+        let eff_dl = eff_limit(task.task_dl_limit.load(Ordering::Relaxed), gdl);
+        let eff_ul = eff_limit(task.task_ul_limit.load(Ordering::Relaxed), gul);
+        task.http_task_limiter().set_rate(eff_dl);
+        if let Some(engine) = self.bt_engines.lock().unwrap().get(&task.gid) {
+            engine.set_rate_limits(eff_dl, eff_ul);
+        }
     }
 
     /// 把当前全局 `bt-encryption` / `bt-protocol` 热下发到所有活动 BT 引擎。
@@ -2910,6 +2933,18 @@ impl TaskManager {
         if task.status().is_terminal() {
             return Err("任务已结束，无法修改选项".into());
         }
+        // 单任务限速：值必须是合法大小字符串（"1M"/"500K"/纯数字，空 = 跟随全局）
+        for k in ["max-download-limit", "max-upload-limit"] {
+            if let Some(v) = opts.get(k) {
+                let s = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                if !s.trim().is_empty() && parse_size_bytes(&s).is_none() {
+                    return Err(format!("{k} 取值无效: {s}"));
+                }
+            }
+        }
         // select-file：BT 文件选择热更新（动作键，不进 options 存储）。
         // aria2 select-file 语义：1 起算的逗号分隔文件序号；空 = 全选。
         // 应用端「选择文件」弹窗经 changeOption 下发（kebab 化后为
@@ -2969,6 +3004,9 @@ impl TaskManager {
                 t.insert(k.clone(), v);
             }
         }
+        // 单任务限速热生效：重建原子镜像并同步到活动传输路径
+        task.sync_task_limits();
+        self.apply_task_rate_limits(&task);
         self.save_session_now();
         Ok(())
     }
@@ -3269,13 +3307,15 @@ async fn drive_bt_download(
         (None, Some(ih)) => TorrentEngine::new_magnet(ih, cfg).map_err(TaskFailure::Bt)?,
         _ => return Err(TaskFailure::Bt("BT 任务缺少元信息或磁力 info_hash".into())),
     };
-    // 注册活动引擎：全局限速变更时据此下发（任务结束在下方移除）
+    // 注册活动引擎：全局/任务级限速变更时据此下发（任务结束在下方移除）
     _mgr.bt_engines
         .lock()
         .unwrap()
         .insert(task.gid.clone(), engine.clone());
     // 新引擎应用全局封禁名单（断开/拒绝名单内 IP 的连接）
     _mgr.apply_bans_to_engine(&engine);
+    // 应用该任务的实际生效限速（min(单任务, 全局)）
+    _mgr.apply_task_rate_limits(&task);
     // 记录数据路径：删除任务时据此清理控制文件与数据文件（磁力链接在元信息到手后补齐）
     if let Some(m) = &meta {
         let mut sh = task.shared.lock().unwrap();
@@ -3510,6 +3550,9 @@ async fn try_uri(
     uri_idx: usize,
     cancel: &CancellationToken,
 ) -> Result<(), TaskFailure> {
+    // 任务级限速器同步（rate = min(单任务, 全局)）：新任务/选项变更后
+    // 的首次下载都在这里对齐，split 与单连接两条路径共用该限速器
+    mgr.apply_task_rate_limits(task);
     let probe = xfer_http::probe(client, uri, cancel).await?;
     task.mark_uri_used(uri_idx);
 
@@ -3603,7 +3646,8 @@ async fn try_uri(
     }
 
     let mut sink = ResumeSink::new(task.clone(), path, mode);
-    let limiter = mgr.inner.lock().unwrap().http_dl_limiter.clone();
+    // 任务级限速器（rate = min(单任务, 全局)，启动时同步一次）
+    let limiter = task.http_task_limiter();
     let done = xfer_http::download(client, uri, start, cancel, &mut sink, Some(&limiter)).await?;
 
     // 总长度以传输响应为准（重定向后可能不同）
@@ -3651,8 +3695,17 @@ async fn finish_http_task(task: &Arc<Task>, path: &Path) -> Result<(), TaskFailu
     Ok(())
 }
 
+/// 合成任务实际生效限速：单任务与全局取较严值（0 = 不限不参与约束）。
+fn eff_limit(task_v: u64, global_v: u64) -> u64 {
+    match (task_v, global_v) {
+        (0, g) => g,
+        (t, 0) => t,
+        (t, g) => t.min(g),
+    }
+}
+
 /// 解析带单位的大小字符串："4M"/"512k"/"1G"/"1048576"。
-fn parse_size_bytes(v: &str) -> Option<u64> {
+pub(crate) fn parse_size_bytes(v: &str) -> Option<u64> {
     let v = v.trim();
     let (num, mult) = match v.as_bytes().last()? {
         b'k' | b'K' => (&v[..v.len() - 1], 1024u64),

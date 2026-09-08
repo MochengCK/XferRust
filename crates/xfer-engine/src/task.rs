@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Instant, SystemTime};
 
 use serde_json::{json, Map, Value};
@@ -12,6 +12,7 @@ use xfer_bencode::TorrentMeta;
 use xfer_bt::PeerInfo;
 use xfer_storage::HashAlgo;
 use xfer_types::Gid;
+use crate::manager::parse_size_bytes;
 
 /// 任务状态（协议字段值）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +191,17 @@ pub struct Task {
     pub uploaded_atomic: AtomicU64,
     /// 无锁上传速度计数器：speed_ticker 按上传字节差值 store。
     pub upload_speed_atomic: AtomicU64,
+    /// 单任务下载限速（bytes/s，0 = 跟随全局）：`max-download-limit`
+    /// 任务选项的原子镜像。构造/恢复/changeOption 时由
+    /// [`Task::sync_task_limits`] 从 options 重建；实际生效值由
+    /// Manager 按 min(单任务, 全局) 合成后下发。
+    pub task_dl_limit: AtomicU64,
+    /// 单任务上传限速（bytes/s，0 = 跟随全局）：`max-upload-limit`
+    /// 任务选项的原子镜像（仅 BT 任务的传输路径消费）。
+    pub task_ul_limit: AtomicU64,
+    /// 任务级 HTTP 下载限速器：所有连接（单连接 + split 多连接）共享，
+    /// rate = min(单任务, 全局)。驱动启动与限速变更时由 Manager 同步。
+    pub http_limiter: OnceLock<Arc<xfer_http::RateLimiter>>,
     /// 完成/错误时刻（Unix 毫秒；0 = 未知）。终态转移时设置，
     /// 会话持久化保存，重启恢复后客户端仍可显示完成时间。
     pub finished_at: AtomicU64,
@@ -210,6 +222,7 @@ impl Task {
         checksum: Option<(HashAlgo, String)>,
         options: HashMap<String, String>,
     ) -> Self {
+        let (dl0, ul0) = limits_from_options(&options);
         Self {
             uri_states: Mutex::new(vec![UriState::Waiting; uris.len()]),
             gid,
@@ -251,6 +264,9 @@ impl Task {
             speed_atomic: AtomicU64::new(0),
             uploaded_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
+            task_dl_limit: AtomicU64::new(dl0),
+            task_ul_limit: AtomicU64::new(ul0),
+            http_limiter: OnceLock::new(),
             finished_at: AtomicU64::new(0),
             avg_active_ms: AtomicU64::new(0),
             avg_bytes: AtomicU64::new(0),
@@ -266,6 +282,7 @@ impl Task {
     ) -> Self {
         let total = meta.info.total_length();
         let name = meta.info.name.clone();
+        let (dl0, ul0) = limits_from_options(&options);
         Self {
             uri_states: Mutex::new(Vec::new()),
             gid,
@@ -307,6 +324,9 @@ impl Task {
             speed_atomic: AtomicU64::new(0),
             uploaded_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
+            task_dl_limit: AtomicU64::new(dl0),
+            task_ul_limit: AtomicU64::new(ul0),
+            http_limiter: OnceLock::new(),
             finished_at: AtomicU64::new(0),
             avg_active_ms: AtomicU64::new(0),
             avg_bytes: AtomicU64::new(0),
@@ -322,6 +342,7 @@ impl Task {
         display_name: Option<String>,
         options: HashMap<String, String>,
     ) -> Self {
+        let (dl0, ul0) = limits_from_options(&options);
         Self {
             uri_states: Mutex::new(Vec::new()),
             gid,
@@ -363,6 +384,9 @@ impl Task {
             speed_atomic: AtomicU64::new(0),
             uploaded_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
+            task_dl_limit: AtomicU64::new(dl0),
+            task_ul_limit: AtomicU64::new(ul0),
+            http_limiter: OnceLock::new(),
             finished_at: AtomicU64::new(0),
             avg_active_ms: AtomicU64::new(0),
             avg_bytes: AtomicU64::new(0),
@@ -409,6 +433,29 @@ impl Task {
 
     /// 实时已完成字节：高频写路径（下载落盘）直接更新原子值，
     /// 查询侧无锁读取；原子值为 0（任务未开始/会话恢复）回退共享状态。
+    /// 从任务 options 重建单任务限速原子镜像（构造/恢复/changeOption
+    /// 后调用）。取值非法时按 0（跟随全局）处理。
+    pub fn sync_task_limits(&self) {
+        let opts = self.options.lock().unwrap();
+        let dl = opts
+            .get("max-download-limit")
+            .and_then(|v| parse_size_bytes(v))
+            .unwrap_or(0);
+        let ul = opts
+            .get("max-upload-limit")
+            .and_then(|v| parse_size_bytes(v))
+            .unwrap_or(0);
+        self.task_dl_limit.store(dl, Ordering::Relaxed);
+        self.task_ul_limit.store(ul, Ordering::Relaxed);
+    }
+
+    /// 任务级 HTTP 限速器（惰性创建，rate 由 Manager 同步维护）。
+    pub fn http_task_limiter(&self) -> Arc<xfer_http::RateLimiter> {
+        self.http_limiter
+            .get_or_init(|| xfer_http::RateLimiter::new(0))
+            .clone()
+    }
+
     pub fn completed_live(&self) -> u64 {
         let v = self.completed_atomic.load(Ordering::Relaxed);
         if v > 0 {
@@ -457,6 +504,19 @@ impl Task {
             self.shared.lock().unwrap().uploaded
         }
     }
+}
+
+/// 从任务选项解析单任务限速初值（bytes/s，0 = 跟随全局）。
+fn limits_from_options(options: &HashMap<String, String>) -> (u64, u64) {
+    let dl = options
+        .get("max-download-limit")
+        .and_then(|v| parse_size_bytes(v))
+        .unwrap_or(0);
+    let ul = options
+        .get("max-upload-limit")
+        .and_then(|v| parse_size_bytes(v))
+        .unwrap_or(0);
+    (dl, ul)
 }
 
 /// 状态快照（一次性提取，供两种序列化使用，避免反复加锁）。

@@ -106,10 +106,13 @@ mod tests {
         let limiter = RateLimiter::new(0);
         limiter.set_rate(0);
         limiter.acquire(1).await;
-        limiter.set_rate(1024);
-        // 1KB/s 下取大块必须等待（不会立即返回）
+        limiter.set_rate(512 * 1024);
+        // 512KB/s 下取 512KB（超出 64KB 突发余量）必须等待，不会立即返回；
+        // 预期 ~0.9s（(512-64)KB / 512KB/s），断言上限防回归为不限速
         let start = Instant::now();
-        limiter.acquire(2 * 1024 * 1024).await;
-        assert!(start.elapsed() >= Duration::from_millis(100));
+        limiter.acquire(512 * 1024).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(100), "elapsed={elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "elapsed={elapsed:?}");
     }
 }
