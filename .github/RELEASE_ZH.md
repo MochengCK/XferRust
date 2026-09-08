@@ -1,33 +1,21 @@
-**摘要**：本版本围绕「磁力下载体验、BT 真实网络稳定性」两条主线。磁力链接解析完成后以表格勾选要下载的文件（确认后才开始下载），引擎内置 Tracker 订阅源与 BT 做种完整生命周期管理（分享率自动停止、持续做种）；补齐 BT 网络可发现性——本地节点发现（LPD）、UPnP/NAT-PMP 自动端口映射与 BT/DHT 监听端口可配置；修复入站会话泄漏、低限速死循环、uTP 流损坏、路径穿越与元数据投毒等一批协议正确性问题，修复 HTTP/HTTPS 下载收尾卡在 99% 的停顿，并按真实网络实测调优 BT 调度参数。TUI 全面改版：新建任务弹窗支持独立下载目录与磁力即时解析，主界面重构为融入背景的现代布局。同时补齐一批协议与查询能力：下载速度改为每秒刷新的 3 秒滑动窗口、BT 分片位图（bitfield）与逐对端位图暴露、BT 对端 IP 封禁（限时/永久）、任务移除可连带删除文件、命令行运行时选项直通，以及 `task.changeUri` / `task.getServers` 两个 aria2 兼容 RPC。新增 Android（arm64-v8a）平台引擎内核交叉编译支持。
+**摘要**：本版本在 v0.3.0 基础上继续演进，围绕「HTTP 能力补齐、前端协议对接、可观测性」三条主线。HTTP 下载获得与 BT 同级的真实分片位图（`numPieces` / `pieceLength` / `bitfield`，随落盘实时推进）与全局限速执行（跨任务共享令牌桶，`1M`/`500K` 单位直通，运行时热生效）；`task.getTrackers` 升级为带 per-tracker announce 状态（协议 / 工作状态 / 做种数 / 下次 announce 时间）。协议对接侧：任务状态新增 aria2 风格 `bittorrent` 对象与 `infoHash` 字段（前端 BT 识别与任务命名依赖）、命令行运行时选项直通（`--key=value`，含 `--enable-upnp` 等应用侧开关自动映射）、`engine.changeOptions` 支持全局 tracker 全量替换（`bt-trackers`）与订阅自动更新开关。可观测性侧：下载速度改为每秒刷新的 3 秒滑动窗口、暴露 BT 分片位图与逐对端位图、新增 BT 对端 IP 封禁（限时/永久），以及 `task.changeUri` / `task.getServers` 两个 aria2 兼容 RPC。CI 新增 linux-arm64（aarch64 musl 静态）构建矩阵。
 
 ## 新功能
 
-- 磁力链接文件选择：输入磁力链接后引擎立即解析元数据，解析完成自动暂停并弹出文件表格（勾选 + 文件大小 + 已选汇总），确认后只下载勾选的文件；跨选/未选文件边界的片按 BT 语义整体下载
-- 磁力任务的会话可恢复：未确认的等待选择任务重启后重新弹出文件表格，不会跳过选择直接全量下载
+### 任务状态 BT 标识（bittorrent / infoHash）
 
-### Tracker 订阅源
+- 任务状态响应（`task.tell` / `task.list`，aria2 风格与原生数值两种编码）新增 `bittorrent` 对象与 `infoHash` 字段：非 BT 任务 `bittorrent` 为 `null`（前端判 BT 依据 `task.bittorrent` 真值）；元数据就绪（.torrent / 磁力已取回元信息）为 `{"info": {"name", "hash"}}`；磁力元数据获取中为 `{}`（前端据此显示「获取元数据中」）
+- `infoHash` 为 info 字典哈希的十六进制表示：.torrent 任务取解析元信息时计算的哈希，磁力任务取握手/元数据交换得到的 `bt_info_hash`
 
-- 新增 Tracker 订阅源：订阅远程 URL（返回每行一个 tracker 的纯文本），按 TTL（24 小时）自动刷新，刷新立即生效并注入所有 BT 任务
-- 多订阅源同步语义：某订阅源曾贡献而远程已移除的 tracker 会被剔除，其他订阅源或手动添加仍提供的保留；`engine.getOptions`/订阅 API 完整暴露来源信息
-- 全局 tracker 全量替换：`engine.changeOptions` 的 `bt-tracker` 支持数组或换行/逗号分隔字符串，增量同步到所有活动任务
-- 订阅可增删、启停、手动刷新（单个/全部）；订阅源与 tracker 来源随会话持久化
-- 新增开关 `auto-update-trackers` 控制订阅自动更新
+### 全局 tracker 与订阅开关直通
 
-### BT 做种生命周期管理
+- `engine.changeOptions` 新增 `bt-trackers`：支持字符串数组或换行/逗号分隔字符串，全量替换语义（应用端每次推送完整列表），与手动增删相同的增量语义同步到所有活动 BT 任务（新增注入、移除剔除），来源记为 `manual`
+- 新增开关 `auto-update-trackers` 控制订阅源自动更新（布尔语义，`"false"` / `"0"` 均视为关闭）
 
-- BT 任务下载完成后可配置进入做种状态（而非直接结束），通过全局选项 `bt-seed-mode`（`true`/`false`）控制
-- 做种任务实时显示分享率（上传量 / 下载量），支持设置目标分享率 `bt-seed-ratio`（如 `1.5`、`2.0`），达到后自动结束做种
-- 做种中的任务可暂停与恢复，也可手动停止做种（RPC `task.stopSeed` / TUI `S` 键）
-- 可设置持续做种直到手动停止（`bt-seed-ratio` 为 `0` 时不自动停止）
-- TUI 设置页新增做种模式与目标分享率选项，任务列表/详情页对做种状态显示上传速度与分享率
+### 命令行运行时选项直通
 
-### BT 网络发现与端口配置
-
-- 本地节点发现（LPD / BEP 14）：每个 BT 任务加入 LSD 组播组，周期向局域网 announce 并监听其他客户端的通告，同一内网内的节点无需 tracker 即可互相发现；发现的 peer 以 `lpd` 来源进入调度
-- UPnP / NAT-PMP 自动端口映射：BT 任务启动时自动在路由器上建立 TCP + UDP 双映射（租约 2 小时，按租期 1/3 周期续期，单次失败下个周期自动重试），任务停机时尽力撤销映射——提升可连接性，不再依赖手动在路由器开端口
-- BT / DHT 监听端口可配置：新增全局选项 `bt-listen-port` / `dht-listen-port`（`0` = 随机端口），创建 BT 任务时生效；监听端口或 DHT 端口被占用时自动回退临时端口并记录告警，不再直接降级为不监听
-- 新增开关 `bt-enable-lpd` / `bt-port-mapping`（默认均开启）可分别关闭上述两项；`engine.getOptions` 展示新选项，`changeGlobalOption` 校验端口取值（0–65535）
-- TUI 设置页同步新增四项：BT 监听端口 / DHT 监听端口（回车输入，0–65535 校验，`0` 显示「随机」）、本地节点发现与端口映射开关（←→ 切换）；单服务器连接数、最小分片大小与界面语言顺移至其后
+- 引擎命令行支持 `--key=value` 形式的运行时全局选项直通注入（与 `engine.changeOptions` 同一存储，CLI 传值覆盖会话恢复的同名旧值）：`split`、`max-connection-per-server`、`min-split-size`、全局限速、`bt-max-peers`、`bt-adaptive`、`bt-seed-mode`、`bt-seed-ratio`、`bt-encryption`、`bt-protocol`、`bt-listen-port`、`dht-listen-port`、`bt-enable-lpd`、`bt-port-mapping`
+- 应用侧开关自动映射：`--enable-upnp` / `--enable-nat-pmp` → `bt-port-mapping`，`--enable-utp` → `bt-protocol`（`tcp+utp` / `tcp`），宿主应用启动引擎时无需再通过 RPC 二次下发
 
 ### 分片展示、速度实时化与对端管理
 
@@ -39,64 +27,22 @@
 - HTTP 任务改 URI：新增 RPC `task.changeUri`（aria2 兼容语义：waiting/paused 状态下按 `fileIndex` 删除 `delUris`、追加 `addUris`；active 状态拒绝，由应用端回退为「重建任务」）
 - 服务器列表：新增 RPC `task.getServers`（HTTP 任务返回 aria2 兼容的服务器条目 `currentUri` / `downloadSpeed` / `downloadLength`，BT 任务返回空数组）
 
-### 命令行运行时选项直通
+### HTTP 分片位图与全局限速
 
-- 引擎命令行支持 `--key=value` 形式的运行时全局选项直通注入（与 `engine.changeOptions` 同一存储）：`split`、`max-connection-per-server`、`min-split-size`、全局限速、`bt-max-peers`、`bt-adaptive`、`bt-seed-mode`、`bt-seed-ratio`、`bt-encryption`、`bt-protocol`、`bt-listen-port`、`dht-listen-port`、`bt-enable-lpd`、`bt-port-mapping`
-- 应用侧开关自动映射：`--enable-upnp` / `--enable-nat-pmp` → `bt-port-mapping`，`--enable-utp` → `bt-protocol`（`tcp+utp` / `tcp`），宿主应用启动引擎时无需再通过 RPC 二次下发
-
-### Android 引擎内核构建
-
-- 新增 Android（aarch64-linux-android / arm64-v8a）交叉编译支持，仅构建引擎内核（`xferrust`），不包含 TUI
-- `Cargo.toml` 将 TUI 依赖（crossterm、ratatui 等）改为 `tui` feature 下的可选依赖，`default = ["tui"]`，`xfer` 二进制标记 `required-features = ["tui"]`
-- CI 新增 `build-android` 作业：使用 NDK r27c + API 24（Android 7.0+）交叉编译，产物 `xferrust-android-arm64-v8a.tar.gz` 随 Release 发布
-- 新增本地构建脚本 `scripts/build-android.sh`：自动检测 NDK host-tag（macOS / Linux），设置 CC/CXX/AR/Linker 环境变量并调用 `cargo build --no-default-features --bin xferrust`
-
-### Linux ARM64 构建
-
-- CI 构建矩阵新增 `linux-arm64`（aarch64-unknown-linux-musl）：在 ubuntu x64 runner 上用 musl 交叉工具链编译，产物 `xfer-tui-linux-arm64.tar.gz` / `xferrust-linux-arm64.tar.gz` 随 Release 发布
-- musl 静态链接：无 glibc 版本依赖，无需随包附带 lib/ 动态库目录，解压即可运行
-
-### TUI 改版
-
-- 新建任务弹窗重做：地址 + 目录两个字段，目录留空使用全局下载目录（仅对当前任务生效）；目录可手动输入，按回车直接调用系统目录选择框选择（macOS / Windows / Linux）
-- 磁力链接输入后立即解析元数据，无需二次确认，弹窗内实时显示解析进度（连接数 / 等待调度 / 已耗时）；元数据就绪后任务弹窗向下扩展为文件勾选表格：空格勾选、A 全选/反选、回车确认开始下载所选文件
-- 设置页的下载目录同样调用系统目录选择框选择
-- 任务详情页（BT / 非 BT）顶部保留全局信息栏（品牌 logo + 全局速率/任务计数），不再切换即消失
+- HTTP 任务分片位图：`task.tell` / `task.list`（aria2 风格 + 原生数值两种编码）对 HTTP 任务输出真实分片数据——`numPieces` / `pieceLength` / `bitfield`（aria2 兼容 hex 编码）。片长取 `min-split-size`（与分段粒度一致），写侧按落盘区间增量记账：多连接分片写线程与单连接顺序写两条路径均覆盖；服务器无视 Range 重发全量时位图作废重建；控制文件水位预填保证重启恢复后位图与真实落盘自洽；未知总长或不支持 Range 时不输出；任务暂停后保留最后已知状态。此前 HTTP 任务恒为 `numPieces=0` / `bitfield` 空，桌面任务列表与详情页分片图无法显示
+- HTTP 全局限速执行：新增跨任务共享的异步令牌桶限速器（`RateLimiter`），注入每条下载连接——多连接在读循环、单连接在逐块落盘前消费令牌，令牌不足时异步等待，TCP 背压自然收敛；`engine.changeOptions` 运行时热更新立即生效。此前限速只下发到 BT 引擎，HTTP 下载完全不受限速约束
+- 限速值解析升级：`max-overall-download-limit` / `max-overall-upload-limit` 接受 aria2 风格单位（`1M` / `500K` / 纯整数字节），与桌面端配置格式兼容（此前仅接受纯整数，带单位的值被拒绝或静默当作不限速）
+- 单键错误不再中断整批设置：`changeOptions` 中限速值 / `bt-encryption` / `bt-protocol` / 端口类选项取值非法时降级为告警并跳过该键，其余设置项照常生效——此前一个非法键导致整批 changeOptions 返回错误、用户改一处限速会把所有系统设置一起弄失效
+- tracker announce 状态：`task.getTrackers` 从仅返回 URL 升级为带 per-tracker 状态——`protocol`（http / https / udp / ws）、`status`（working / not-working / waiting）、`seeders` / `leechers`（tracker 报告的 complete / incomplete）、`peers`、`lastAnnounceTime` / `nextAnnounceTime`（成功响应 interval 推算）、`error`（最近一次失败原因）；BT 引擎在每轮 announce 聚合时逐 URL 记录，未 announce 过的 URL 保持 waiting
 
 ## 问题修复
 
-- 修复磁力任务下载过程中文件列表恒为空：元数据就绪后即时回填，任务详情/状态里的 `files`、`numPieces` 不再显示为 0
-- 修复磁力任务元数据重启后丢失：会话持久化 info 字典，恢复时按 info 解析重建，不必重新向 peer 拉取
-- 修复入站 peer 会话泄漏：被动连接结束后未注销，占住的片最长停滞 180 秒
-- 修复限速死循环：令牌桶容量保底一个最大块，低于 16 KiB/s 的限速不再卡死连接
-- 修复 uTP 流损坏：读路径按通道容量背压，写路径缓存未接受完的字节，不再丢弃数据
-- 清洗种子内路径（name / path 段），防路径穿越写到下载目录外
-- 修复调度器把 0→0 吞吐当「下滑 100%」——冷启动期目标连接数不再崩塌
-- 修复 choking 算法：墙钟轮次全局一致、乐观 unchoke 真正送达 lucky peer、做种上传轮转
-- 修复 tracker announce 上报上传字节数恒为 0（私有 tracker 分享率可正常统计）
-- 修复 UDP tracker 收不到 stopped/completed 事件
-- 修复 TUI 订阅源刷新后任务侧 tracker 列表不更新的问题
-- 修复 HTTP/HTTPS 下载收尾卡在 99% 停顿十余秒：
-  - 尾段短读（响应体短于请求区间）改用独立退避曲线（250ms 起、1s 封顶），不再与硬错误共用 0.5–2s 退避——短读从水位续传必然推进，重试风暴下旧退避累积拖长收尾
-  - 新增 10 秒读空闲看门狗：连接静默停摆（对端假死 / 半开连接）时立即从水位重连续传，不再干等 30 秒读超时
-  - 读超时归类为可再生瞬态：不再消耗 4 次失败预算，避免尾段重试被提前判死
+- 修复 HTTP 任务完成后误报 `seeder=true`：`seeder` 语义修正为「本端为 BT 任务且已完整」，此前按「completed ≥ total」对所有任务类型计算，HTTP 任务下载完成即误报，应用端据此把普通任务标成“做种中”并补发 BT 完成事件
+- 修复 HTTP 任务分片数据恒为空（`numPieces=0` / `bitfield` 空串），详见「HTTP 分片位图与全局限速」
+- 修复限速设置不生效：带单位的限速值（如 `1M`）此前被引擎拒绝或静默按不限速处理，且 HTTP 下载路径完全没有限速执行，详见「HTTP 分片位图与全局限速」
 
-## BT 调度真实网络调优
+## 构建与发布
 
-- 停滞判定从 2 轮（20s）放宽到 6 轮（60s）：真实网络 peer 从连接到出数据通常需要 20–40s（握手 + 等 choking 轮次），原参数导致「连了断、断了连」的恶性循环
-- 慢速淘汰阈值收紧：相对中位数比例 0.25 → 0.1，绝对下限 1 KB/s → 10 KB/s——只淘汰几乎无贡献的 peer，不再误杀低速但仍在工作的对端
-- 宽限期 15s → 40s，单轮淘汰比例下调：避免一次换血释放大量片造成无效重分配开销
-- 新增 BT 速度分析与公网实测脚本（`ANALYSIS_BT_SPEED.md`、`scripts/bt_public_test.py`、`scripts/bt_real_test.py`），调度参数以实测数据为依据
-
-## 其他变更
-
-- 任务移除支持连带删除已下载文件与控制文件：`task.remove` 新增可选 `deleteFiles` 参数（默认 `false`，保持原语义）
-- 新增文件选择 API：`select_files(gid, 文件索引)` / `get_selected_files(gid)`，运行中任务热生效；`add_uri` 传 `bt-file-selection` 选项可让磁力任务解析后暂停等待选择
-- 任务状态新增 `awaitingSelection` 字段，`files[].selected` 反映真实勾选
-- 新增做种状态 `seeding` 与 `seedRatio` 字段；RPC 新增 `task.stopSeed` 方法；会话保存/恢复正确处理做种任务（序列化为 `waiting` 以便重启后重新下载）
-- 「文件是否已完整」类判定改以磁盘实际占用（`st_blocks × 512`）为下限依据：BT 随机写天然产生稀疏文件，逻辑长度会把空洞文件误判为完整并播种坏数据
-- 拨号/会话失败的地址有限次回填重试，不再干等下一轮 announce
-- 短读风暴超出连续 8 次容忍后折算为一次正常失败，由常规失败预算收敛——退避放宽不影响恒坏服务器的报错速度
-- 新增 HTTP 尾部截断 + 暂停/恢复回归测试（短读风暴、静默停摆、取消续传场景）
-- DHT 加固：已知 peer 表总量上限（FIFO 淘汰）、收包处理并发限制
-- 新增 27 项 TUI 渲染回归测试（边框几何、列对齐、弹窗流程、详情页顶栏等）
+- CI 构建矩阵新增 `linux-arm64`（aarch64-unknown-linux-musl）：产物 `xfer-tui-linux-arm64.tar.gz` / `xferrust-linux-arm64.tar.gz` 随 Release 发布
+- musl 静态链接：无 glibc 版本依赖，无需随包附带 lib/ 动态库目录，解压即可运行
+- linux-arm64 交叉编译改用 cargo-zigbuild，替换不稳定的 musl.cc 下载源

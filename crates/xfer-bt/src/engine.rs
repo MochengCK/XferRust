@@ -778,6 +778,51 @@ impl RateLimiter {
 }
 
 /// BT 下载引擎。
+/// 单个 tracker 的最近一次 announce 状态快照（`task.getTrackers` 输出，
+/// 供任务详情 tracker 表展示）。
+#[derive(Debug, Clone)]
+pub struct TrackerStat {
+    pub url: String,
+    /// "http" / "https" / "udp" / "ws"（按 URL 前缀推导）。
+    pub protocol: String,
+    /// "working" / "not-working" / "waiting"（尚未 announce 过）。
+    pub status: &'static str,
+    /// tracker 报告的做种数（complete）。
+    pub seeders: u64,
+    /// tracker 报告的下载人数（incomplete）。
+    pub leechers: u64,
+    /// 最近一次 announce 尝试时刻（epoch 毫秒；从未尝试为 0）。
+    pub last_announce_ms: u64,
+    /// 预计下次 announce 时刻（epoch 毫秒；成功响应 interval 推算）。
+    pub next_announce_ms: u64,
+    /// 最近一次失败原因（正常响应被 tracker 拒绝也记入）。
+    pub error: Option<String>,
+}
+
+impl TrackerStat {
+    /// 按 URL 前缀推导协议名。
+    pub fn protocol_of(url: &str) -> String {
+        let lower = url.to_ascii_lowercase();
+        if lower.starts_with("udp") {
+            "udp".into()
+        } else if lower.starts_with("https://") {
+            "https".into()
+        } else if lower.starts_with("wss://") || lower.starts_with("ws://") {
+            "ws".into()
+        } else {
+            "http".into()
+        }
+    }
+}
+
+/// 当前 Unix 时间（epoch 毫秒）；系统时钟早于 epoch 时为 0。
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub struct TorrentEngine {
     /// 元数据（磁力模式在 ut_metadata 获取后从 None 变为 Some）。
     meta: RwLock<Option<TorrentMeta>>,
@@ -853,6 +898,9 @@ pub struct TorrentEngine {
     /// 列表被克隆进配置快照，若无此机制，新增 tracker 只能等
     /// 暂停/恢复重建引擎后才生效。
     dynamic_announces: Mutex<DynamicAnnounces>,
+    /// 各 tracker 最近一次 announce 的状态（getTrackers 输出；
+    /// announce_all 聚合结果的同时逐 URL 记录）。
+    tracker_stats: Mutex<Vec<TrackerStat>>,
     /// 运行时文件选择（None = 全部文件；Some = 仅下载这些文件索引）。
     /// 初始值来自 [`TorrentConfig::selected_files`]，可经
     /// [`Self::set_selected_files`] 热更新。
@@ -972,6 +1020,7 @@ impl TorrentEngine {
             encryption_mode: std::sync::atomic::AtomicU8::new(encryption_code),
             bt_protocol_mode: std::sync::atomic::AtomicU8::new(protocol_code),
             dynamic_announces: Mutex::new(DynamicAnnounces::default()),
+            tracker_stats: Mutex::new(Vec::new()),
             selected_files: Mutex::new(selected_files_init),
             seeding: AtomicBool::new(false),
             wanted: Mutex::new(None),
@@ -1031,6 +1080,7 @@ impl TorrentEngine {
             encryption_mode: std::sync::atomic::AtomicU8::new(encryption_code),
             bt_protocol_mode: std::sync::atomic::AtomicU8::new(protocol_code),
             dynamic_announces: Mutex::new(DynamicAnnounces::default()),
+            tracker_stats: Mutex::new(Vec::new()),
             selected_files: Mutex::new(selected_files_init),
             seeding: AtomicBool::new(false),
             wanted: Mutex::new(None),
@@ -1703,8 +1753,9 @@ impl TorrentEngine {
 
         // 并发 announce 全部 tracker（HTTP + UDP 同一 JoinSet，总超时 15 秒）。
         // UDP 原先串行（每个最长 ~10s），多 tracker 时冷启动被逐个阻塞。
-        let mut join_set: tokio::task::JoinSet<Result<AnnounceResponse, (String, String)>> =
-            tokio::task::JoinSet::new();
+        let mut join_set: tokio::task::JoinSet<
+            Result<(String, AnnounceResponse), (String, String)>,
+        > = tokio::task::JoinSet::new();
 
         for url in &http_urls {
             let url = url.clone();
@@ -1728,7 +1779,7 @@ impl TorrentEngine {
                     numwant,
                 };
                 match announce(&client, &url, &req).await {
-                    Ok(r) => Ok(r),
+                    Ok(r) => Ok((url, r)),
                     Err(e) => Err((url, e)),
                 }
             });
@@ -1775,14 +1826,17 @@ impl TorrentEngine {
                     numwant,
                 };
                 match tracker.announce(addr, &req).await {
-                    Ok(r) => Ok(AnnounceResponse {
-                        interval: r.interval as u64,
-                        min_interval: None,
-                        peers: r.peers,
-                        failure: None,
-                        complete: Some(r.seeders as u64),
-                        incomplete: Some(r.leechers as u64),
-                    }),
+                    Ok(r) => Ok((
+                        url,
+                        AnnounceResponse {
+                            interval: r.interval as u64,
+                            min_interval: None,
+                            peers: r.peers,
+                            failure: None,
+                            complete: Some(r.seeders as u64),
+                            incomplete: Some(r.leechers as u64),
+                        },
+                    )),
                     Err(e) => Err((url, format!("announce 失败: {e}"))),
                 }
             });
@@ -1811,13 +1865,14 @@ impl TorrentEngine {
             };
             match tokio::time::timeout_at(deadline, join_set.join_next()).await {
                 Ok(Some(task_result)) => match task_result {
-                    Ok(Ok(r)) => {
+                    Ok(Ok((url, r))) => {
                         if r.failure.is_none() {
                             tracing::debug!(
                                 peers = r.peers.len(),
                                 interval = r.interval,
                                 "tracker announce 成功"
                             );
+                            self.record_tracker_success(&url, &r);
                             self.last_interval
                                 .store(r.interval.max(1), Ordering::Relaxed);
                             if r.interval > best_interval {
@@ -1829,11 +1884,13 @@ impl TorrentEngine {
                             }
                             all_peers.extend(r.peers);
                         } else {
-                            tracing::warn!(reason = %r.failure.unwrap_or_default(), "tracker 拒绝");
+                            tracing::warn!(reason = %r.failure.clone().unwrap_or_default(), "tracker 拒绝");
+                            self.record_tracker_failure(&url, r.failure.clone());
                         }
                     }
                     Ok(Err((url, e))) => {
                         tracing::warn!(url, error = %e, "tracker announce 失败");
+                        self.record_tracker_failure(&url, Some(e));
                     }
                     Err(join_err) => {
                         tracing::warn!(error = %join_err, "tracker announce 任务异常");
@@ -1885,6 +1942,72 @@ impl TorrentEngine {
                 tracing::debug!(error = %e, "DHT get_peers 失败");
             }
         }
+    }
+
+    /// 记录一次 announce 成功（tracker_stats 表，getTrackers 输出）。
+    fn record_tracker_success(&self, url: &str, r: &AnnounceResponse) {
+        let now = epoch_ms();
+        let next = now + r.interval.max(1) * 1000;
+        let mut stats = self.tracker_stats.lock().unwrap();
+        match stats.iter_mut().find(|s| s.url == url) {
+            Some(s) => {
+                s.status = "working";
+                if let Some(c) = r.complete {
+                    s.seeders = c;
+                }
+                if let Some(i) = r.incomplete {
+                    s.leechers = i;
+                }
+                s.last_announce_ms = now;
+                s.next_announce_ms = next;
+                s.error = None;
+            }
+            None => {
+                stats.push(TrackerStat {
+                    url: url.to_string(),
+                    protocol: TrackerStat::protocol_of(url),
+                    status: "working",
+                    seeders: r.complete.unwrap_or(0),
+                    leechers: r.incomplete.unwrap_or(0),
+                    last_announce_ms: now,
+                    next_announce_ms: next,
+                    error: None,
+                });
+            }
+        }
+    }
+
+    /// 记录一次 announce 失败（网络错误或 tracker 拒绝）。
+    fn record_tracker_failure(&self, url: &str, error: Option<String>) {
+        let now = epoch_ms();
+        // 失败后按引擎当前 interval 保守安排重试时刻
+        let next = now + self.last_interval.load(Ordering::Relaxed).max(60) * 1000;
+        let mut stats = self.tracker_stats.lock().unwrap();
+        match stats.iter_mut().find(|s| s.url == url) {
+            Some(s) => {
+                s.status = "not-working";
+                s.last_announce_ms = now;
+                s.next_announce_ms = next;
+                s.error = error;
+            }
+            None => {
+                stats.push(TrackerStat {
+                    url: url.to_string(),
+                    protocol: TrackerStat::protocol_of(url),
+                    status: "not-working",
+                    seeders: 0,
+                    leechers: 0,
+                    last_announce_ms: now,
+                    next_announce_ms: next,
+                    error,
+                });
+            }
+        }
+    }
+
+    /// 各 tracker 最近一次 announce 状态快照（引擎管理器 getTrackers 合并）。
+    pub fn tracker_stats(&self) -> Vec<TrackerStat> {
+        self.tracker_stats.lock().unwrap().clone()
     }
 
     /// 异步派发的 stopped/completed announce（run 结束后尽力通知）。

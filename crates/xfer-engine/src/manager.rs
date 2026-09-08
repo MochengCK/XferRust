@@ -192,6 +192,10 @@ struct Inner {
     /// 全局 BT 封禁名单：IP → 过期时刻（None = 永久）。作用于所有
     /// BT 任务（aria2 banPeer 的全局语义），随会话持久化。
     bt_bans: HashMap<IpAddr, Option<Instant>>,
+    /// HTTP 下载全局限速器（max-overall-download-limit 语义 = 所有
+    /// HTTP 任务合计；BT 任务由各 TorrentEngine 自带限速器执行）。
+    /// 注入每条下载连接，运行时经 changeOptions 热更新。
+    http_dl_limiter: Arc<xfer_http::RateLimiter>,
 }
 
 /// Tracker 订阅源：远程 URL 返回纯文本（每行一个 tracker URL）。
@@ -258,6 +262,7 @@ impl TaskManager {
                 tracker_subscriptions: Vec::new(),
                 auto_update_trackers: true,
                 bt_bans: HashMap::new(),
+                http_dl_limiter: xfer_http::RateLimiter::new(0),
             }),
             bt_engines: Mutex::new(HashMap::new()),
             kick: Notify::new(),
@@ -1431,6 +1436,7 @@ impl TaskManager {
             connections,
             min_split_size: min_split,
             adaptive,
+            limiter: Some(self.inner.lock().unwrap().http_dl_limiter.clone()),
         }
     }
 
@@ -1639,28 +1645,38 @@ impl TaskManager {
                 k.as_str(),
                 "max-overall-download-limit" | "max-overall-upload-limit"
             ) {
-                // 全局限速（bytes/s，0 = 不限制）：校验后存储，并立即
-                // 下发到活动 BT 引擎（aria2 changeGlobalOption 语义）
-                if v.trim().parse::<u64>().is_err() {
-                    return Err(format!("限速值必须是非负整数（字节/秒）: {k}={v}"));
+                // 全局限速（bytes/s，0 = 不限制）：接受 aria2 风格值
+                // （纯整数或 K/M/G 后缀，如 "1M"/"512K"），校验后存储
+                // 并立即下发到活动 BT 引擎与 HTTP 共享限速器。
+                // 非法值降级为告警并跳过该键：避免单键错误中断整批
+                // changeOptions，导致其余设置项全部失效。
+                match parse_size_bytes(&v) {
+                    Some(_) => rate_changed = true,
+                    None => {
+                        tracing::warn!(option = %k, value = %v, "限速值无效，已忽略该键");
+                        continue;
+                    }
                 }
-                rate_changed = true;
             } else if k == "bt-encryption" {
                 // 加密模式：adaptive（优先加密）/ force（强制）/ plain（仅明文）
+                // 非法值告警跳过，不中断整批（语义同上）
                 if xfer_bt::EncryptionMode::parse(&v).is_none() {
-                    return Err(format!("bt-encryption 取值无效: {v}（可选 adaptive/force/plain）"));
+                    tracing::warn!(value = %v, "bt-encryption 取值无效，已忽略该键");
+                    continue;
                 }
                 bt_modes_changed = true;
             } else if k == "bt-protocol" {
                 // 传输协议：tcp+utp / tcp / utp（uTP 就绪前切 utp 会被引擎拒绝）
                 if xfer_bt::BtProtocol::parse(&v).is_none() {
-                    return Err(format!("bt-protocol 取值无效: {v}（可选 tcp+utp/tcp/utp）"));
+                    tracing::warn!(value = %v, "bt-protocol 取值无效，已忽略该键");
+                    continue;
                 }
                 bt_modes_changed = true;
             } else if k == "bt-listen-port" || k == "dht-listen-port" {
                 // BT/DHT 监听端口：0 = 系统分配；存储后在下载时生效
                 if v.trim().parse::<u16>().is_err() {
-                    return Err(format!("{k} 必须是 0-65535 的端口号: {v}"));
+                    tracing::warn!(option = %k, value = %v, "端口号无效，已忽略该键");
+                    continue;
                 }
             } else if matches!(
                 k.as_str(),
@@ -1772,22 +1788,28 @@ impl TaskManager {
         let dl = inner
             .global_options
             .get("max-overall-download-limit")
-            .and_then(|v| v.trim().parse().ok())
+            .and_then(|v| parse_size_bytes(v))
             .unwrap_or(0);
         let ul = inner
             .global_options
             .get("max-overall-upload-limit")
-            .and_then(|v| v.trim().parse().ok())
+            .and_then(|v| parse_size_bytes(v))
             .unwrap_or(0);
         (dl, ul)
     }
 
-    /// 将当前全局限速下发到所有活动 BT 引擎（运行时立即生效）。
+    /// 将当前全局限速下发到所有活动 BT 引擎与 HTTP 共享限速器
+    /// （运行时立即生效）。
     fn apply_rate_limits(&self) {
         let (dl, ul) = self.rate_limits();
         for engine in self.bt_engines.lock().unwrap().values() {
             engine.set_rate_limits(dl, ul);
         }
+        self.inner
+            .lock()
+            .unwrap()
+            .http_dl_limiter
+            .set_rate(dl);
     }
 
     /// 把当前全局 `bt-encryption` / `bt-protocol` 热下发到所有活动 BT 引擎。
@@ -2301,7 +2323,46 @@ impl TaskManager {
                 urls.push(url.clone());
             }
         }
-        let arr: Vec<Value> = urls.iter().map(|t| json!({ "url": t })).collect();
+        let arr: Vec<Value> = {
+            // per-tracker announce 状态：活动 BT 引擎持有的最近一次
+            // 结果（未 announce 过的 URL 保持 waiting）
+            let stats = self
+                .bt_engines
+                .lock()
+                .unwrap()
+                .get(gid)
+                .map(|e| e.tracker_stats())
+                .unwrap_or_default();
+            urls.iter()
+                .map(|t| {
+                    match stats.iter().find(|s| s.url == *t) {
+                        Some(s) => json!({
+                            "url": s.url,
+                            "protocol": s.protocol,
+                            "status": s.status,
+                            "seeders": s.seeders,
+                            "leechers": s.leechers,
+                            "peers": s.seeders + s.leechers,
+                            "downloadCount": 0,
+                            "lastAnnounceTime": s.last_announce_ms,
+                            "nextAnnounceTime": s.next_announce_ms,
+                            "error": s.error,
+                        }),
+                        None => json!({
+                            "url": t,
+                            "protocol": xfer_bt::TrackerStat::protocol_of(t),
+                            "status": "waiting",
+                            "seeders": 0,
+                            "leechers": 0,
+                            "peers": 0,
+                            "downloadCount": 0,
+                            "lastAnnounceTime": 0,
+                            "nextAnnounceTime": 0,
+                        }),
+                    }
+                })
+                .collect()
+        };
         Ok(Value::Array(arr))
     }
 
@@ -3401,7 +3462,8 @@ async fn try_uri(
     }
 
     let mut sink = ResumeSink::new(task.clone(), path, mode);
-    let done = xfer_http::download(client, uri, start, cancel, &mut sink).await?;
+    let limiter = mgr.inner.lock().unwrap().http_dl_limiter.clone();
+    let done = xfer_http::download(client, uri, start, cancel, &mut sink, Some(&limiter)).await?;
 
     // 总长度以传输响应为准（重定向后可能不同）
     {

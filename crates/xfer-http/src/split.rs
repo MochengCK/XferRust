@@ -37,6 +37,7 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::adaptive::{AdaptiveConfig, AdaptiveScheduler, ConnPerf, ScheduleAction};
+use crate::rate::RateLimiter;
 use crate::HttpError;
 
 /// 段失败重试预算（超出即任务失败，交给镜像切换兜底）。
@@ -92,6 +93,8 @@ pub struct SplitOptions {
     pub min_split_size: u64,
     /// 自适应调度配置（None = 固定连接数传统模式）。
     pub adaptive: Option<AdaptiveConfig>,
+    /// 全局限速器（None = 不限速）：所有连接共享，读循环消费令牌。
+    pub limiter: Option<Arc<RateLimiter>>,
 }
 
 /// 引擎轮询的进度句柄（无锁原子）。
@@ -380,6 +383,7 @@ pub async fn download_split(
             stats: stats.clone(),
             stop: stop.clone(),
             perf_tx: adaptive_tx.clone(),
+            limiter: opts.limiter.clone(),
         };
         tokio::spawn(run_worker_guarded(ctx))
     };
@@ -1341,6 +1345,8 @@ struct WorkerCtx {
     stop: CancellationToken,
     /// 自适应性能上报通道（None = 自适应未启用）。
     perf_tx: Option<mpsc::UnboundedSender<ConnPerf>>,
+    /// 全局限速器（None = 不限速）。
+    limiter: Option<Arc<RateLimiter>>,
 }
 
 /// panic 隔离包装：协程 panic → 转致命错误，避免主流程死等。
@@ -1574,6 +1580,10 @@ async fn run_segment(
         } else {
             chunk.slice(..cap)
         };
+        // 全局限速：入队写线程前消费令牌，不足时等待（TCP 背压收敛）
+        if let Some(l) = &ctx.limiter {
+            l.acquire(cap).await;
+        }
         ctx.tx
             .send(ToWriter::Write {
                 seg,

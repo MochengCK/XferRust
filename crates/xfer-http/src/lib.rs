@@ -3,9 +3,11 @@
 //! + 段级控制文件断点续传）。
 
 mod adaptive;
+mod rate;
 mod split;
 
 pub use adaptive::{AdaptiveConfig, AdaptiveScheduler, ConnPerf, ScheduleAction};
+pub use rate::RateLimiter;
 pub use split::{
     ctrl_path, download_split, PieceSnapshot, PieceTrack, SplitDone, SplitOptions, SplitStats,
 };
@@ -205,6 +207,8 @@ pub trait TransferSink: Send {
 
 /// 流式下载：从 `start` 偏移请求，逐块经 `sink` 落盘。
 ///
+/// `limiter`：全局限速器（None / rate 0 = 不限），每块落盘前消费令牌。
+///
 /// 取消令牌触发时返回 [`HttpError::Cancelled`]（已写入部分由调用方保留）。
 pub async fn download(
     client: &reqwest::Client,
@@ -212,6 +216,7 @@ pub async fn download(
     start: u64,
     cancel: &CancellationToken,
     sink: &mut dyn TransferSink,
+    limiter: Option<&RateLimiter>,
 ) -> Result<TransferDone, HttpError> {
     if cancel.is_cancelled() {
         return Err(HttpError::Cancelled);
@@ -254,6 +259,10 @@ pub async fn download(
         };
         if chunk.is_empty() {
             continue;
+        }
+        // 全局限速：落盘前消费令牌，不足时等待（TCP 背压收敛速率）
+        if let Some(l) = limiter {
+            l.acquire(chunk.len()).await;
         }
         sink.write_chunk(&chunk)
             .map_err(|e| HttpError::Io(e.to_string()))?;

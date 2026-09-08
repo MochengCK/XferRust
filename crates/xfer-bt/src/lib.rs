@@ -16,7 +16,7 @@ pub mod tracker;
 
 pub use engine::{
     BtProtocol, EncryptionMode, PeerInfo, PeerSource, PeerStream, TorrentConfig, TorrentEngine,
-    TorrentProgress,
+    TorrentProgress, TrackerStat,
 };
 pub use message::{
     decode_handshake, encode_handshake, supports_dht, supports_extension, supports_fast_extension,

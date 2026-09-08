@@ -649,7 +649,9 @@ pub fn status_json(task: &Task) -> Value {
         .iter()
         .filter(|p| p.seed)
         .count();
-    let seeder = s.completed > 0 && s.total_len.is_some_and(|t| s.completed >= t && t > 0);
+    let seeder = task.bt_meta.lock().unwrap().is_some()
+        && s.completed > 0
+        && s.total_len.is_some_and(|t| s.completed >= t && t > 0);
     let mut m = Map::new();
     m.insert("gid".into(), json!(s.gid));
     m.insert("status".into(), json!(s.status.as_str()));
@@ -760,7 +762,9 @@ pub fn status_json_native(task: &Task) -> Value {
         .iter()
         .filter(|p| p.seed)
         .count();
-    let seeder = s.completed > 0 && s.total_len.is_some_and(|t| s.completed >= t && t > 0);
+    let seeder = task.bt_meta.lock().unwrap().is_some()
+        && s.completed > 0
+        && s.total_len.is_some_and(|t| s.completed >= t && t > 0);
     let hash = info_hash_hex(task);
     json!({
         "gid": s.gid,
