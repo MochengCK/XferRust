@@ -437,7 +437,7 @@ async fn pause_then_unpause_resumes_from_ctrl_file() {
     mgr.pause(&gid).expect("暂停应成功");
     let mut paused = false;
     for _ in 0..40 {
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         if mgr.tell_status_native(&gid, None).unwrap()["status"] == "paused" {
             paused = true;
             break;

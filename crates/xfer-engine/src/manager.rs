@@ -193,7 +193,7 @@ struct Inner {
     /// BT 任务（aria2 banPeer 的全局语义），随会话持久化。
     bt_bans: HashMap<IpAddr, Option<Instant>>,
     // 全局下载限速不再用共享令牌桶承载：每个任务持有自己的限速器，
-    // rate 由 apply_task_rate_limits 按 min(单任务, 全局) 合成同步。
+    // rate 由 apply_task_rate_limits 按 eff_limit（单任务优先，未设置跟随全局）合成同步。
 }
 
 /// Tracker 订阅源：远程 URL 返回纯文本（每行一个 tracker URL）。
@@ -622,38 +622,18 @@ impl TaskManager {
                 task.avg_bytes
                     .store(t["avgBytes"].as_u64().unwrap_or(0), Ordering::Relaxed);
                 match t["status"].as_str().unwrap_or("waiting") {
-                    "paused" => sh.status = Status::Paused,
                     "complete" => sh.status = Status::Complete,
                     "error" => sh.status = Status::Error,
                     "removed" => sh.status = Status::Removed,
-                    _ => {} // waiting / active → Waiting（active 重启后重新下载）
-                }
-                // 磁力解析流程：等待文件选择且元数据已就绪的任务恢复为
-                // 暂停——直接入队会跳过选择把全部文件下载下来
-                if task.awaiting_selection.load(Ordering::SeqCst)
-                    && task.bt_meta.lock().unwrap().is_some()
-                    && sh.status == Status::Waiting
-                {
-                    sh.status = Status::Paused;
+                    // paused / waiting / active（旧版会话把下载中任务存为
+                    // waiting）→ 一律恢复为暂停：重启后不自动开始下载
+                    _ => sh.status = Status::Paused,
                 }
             }
-            let status = task.status();
-            match status {
-                Status::Waiting => {
-                    // 磁盘已有部分 → 回填进度显示（下载启动时 probe 再校准）
-                    // 先 clone path 再释放锁，避免在锁内重复 lock 导致死锁
-                    let path_opt = task.shared.lock().unwrap().path.clone();
-                    if let Some(p) = &path_opt {
-                        let el = existing_len(p);
-                        if el > 0 {
-                            task.shared.lock().unwrap().completed = el;
-                            task.completed_atomic.store(el, Ordering::Relaxed);
-                        }
-                    }
-                    inner.queue.push_back(gid.clone());
-                }
-                Status::Paused => {}
-                _ => inner.stopped_order.push(gid.clone()),
+            // 恢复后的任务只会是暂停态或终态：暂停保持原样（不自动开始，
+            // 由用户手动恢复），终态进入已停止列表
+            if task.status().is_terminal() {
+                inner.stopped_order.push(gid.clone());
             }
             inner.tasks.insert(gid, task);
             restored += 1;
@@ -1926,9 +1906,10 @@ impl TaskManager {
         }
     }
 
-    /// 把某任务的实际生效限速（min(单任务, 全局)，0 = 不限）同步到
+    /// 把某任务的实际生效限速（单任务优先覆盖，未设置跟随全局）同步到
     /// 该任务的 HTTP 限速器与活动 BT 引擎。任务无活动传输路径时为
     /// 无操作（下次启动时会在驱动入口重新同步）。
+    /// 全局变更经 [`Self::apply_rate_limits`] 逐任务重新同步。
     fn apply_task_rate_limits(&self, task: &Arc<Task>) {
         let (gdl, gul) = self.rate_limits();
         let eff_dl = eff_limit(task.task_dl_limit.load(Ordering::Relaxed), gdl);
@@ -3356,7 +3337,7 @@ async fn drive_bt_download(
         .insert(task.gid.clone(), engine.clone());
     // 新引擎应用全局封禁名单（断开/拒绝名单内 IP 的连接）
     _mgr.apply_bans_to_engine(&engine);
-    // 应用该任务的实际生效限速（min(单任务, 全局)）
+    // 应用该任务的实际生效限速（单任务优先覆盖，未设置跟随全局）
     _mgr.apply_task_rate_limits(&task);
     // 记录数据路径：删除任务时据此清理控制文件与数据文件（磁力链接在元信息到手后补齐）
     if let Some(m) = &meta {
@@ -3592,7 +3573,7 @@ async fn try_uri(
     uri_idx: usize,
     cancel: &CancellationToken,
 ) -> Result<(), TaskFailure> {
-    // 任务级限速器同步（rate = min(单任务, 全局)）：新任务/选项变更后
+    // 任务级限速器同步（单任务优先覆盖，未设置跟随全局）：新任务/选项变更后
     // 的首次下载都在这里对齐，split 与单连接两条路径共用该限速器
     mgr.apply_task_rate_limits(task);
     let probe = xfer_http::probe(client, uri, cancel).await?;
@@ -3688,7 +3669,7 @@ async fn try_uri(
     }
 
     let mut sink = ResumeSink::new(task.clone(), path, mode);
-    // 任务级限速器（rate = min(单任务, 全局)，启动时同步一次）
+    // 任务级限速器（单任务优先覆盖，未设置跟随全局，启动时同步一次）
     let limiter = task.http_task_limiter();
     let done = xfer_http::download(client, uri, start, cancel, &mut sink, Some(&limiter)).await?;
 
@@ -3737,12 +3718,14 @@ async fn finish_http_task(task: &Arc<Task>, path: &Path) -> Result<(), TaskFailu
     Ok(())
 }
 
-/// 合成任务实际生效限速：单任务与全局取较严值（0 = 不限不参与约束）。
+/// 单任务限速与全局限速的合成：单任务已设置（>0）时优先生效——
+/// 可高于也可低于全局（全局仅约束未单独设置限速的任务）；
+/// 单任务未设置（0 = 跟随全局）时取全局值。
 fn eff_limit(task_v: u64, global_v: u64) -> u64 {
-    match (task_v, global_v) {
-        (0, g) => g,
-        (t, 0) => t,
-        (t, g) => t.min(g),
+    if task_v > 0 {
+        task_v
+    } else {
+        global_v
     }
 }
 
@@ -3942,5 +3925,63 @@ mod tests {
     fn normalize_dir_resolves_relative_to_cwd() {
         let expected = std::env::current_dir().unwrap().join("rel/dir");
         assert_eq!(normalize_dir("rel/dir"), expected);
+    }
+
+    #[tokio::test]
+    async fn change_option_task_limit_overrides_global() {
+        let tmp = std::env::temp_dir().join(format!("xfer-diag-{}", std::process::id()));
+        let mgr = TaskManager::new(tmp.clone(), 5);
+        let gid = mgr
+            .add_uri(
+                vec!["http://127.0.0.1:1/file.bin".into()],
+                &serde_json::json!({"pause": "true"}),
+                None,
+            )
+            .unwrap();
+        let task = mgr.task_of(&gid).unwrap();
+
+        // 全局 1M；单任务未设置 → 跟随全局
+        mgr.change_global_option(
+            &serde_json::json!({"max-overall-download-limit": "1M"}),
+        )
+        .unwrap();
+        assert_eq!(
+            task.http_task_limiter().rate(),
+            1024 * 1024,
+            "未设置单任务限速时应跟随全局 1M"
+        );
+
+        // 单任务 5M > 全局 1M → 单任务优先生效（回归：此前取 min 恒为全局 1M）
+        mgr.change_option(&gid, &serde_json::json!({"max-download-limit": "5M"}))
+            .unwrap();
+        assert_eq!(
+            task.task_dl_limit.load(Ordering::Relaxed),
+            5 * 1024 * 1024,
+            "atomic mirror should be 5M"
+        );
+        assert_eq!(
+            task.http_task_limiter().rate(),
+            5 * 1024 * 1024,
+            "单任务限速应覆盖全局（可高于全局）"
+        );
+
+        // 单任务低于全局 → 取单任务值
+        mgr.change_option(&gid, &serde_json::json!({"max-download-limit": "500K"}))
+            .unwrap();
+        assert_eq!(
+            task.http_task_limiter().rate(),
+            500 * 1024,
+            "单任务低于全局时取单任务值"
+        );
+
+        // 清空单任务限速 → 回落跟随全局
+        mgr.change_option(&gid, &serde_json::json!({"max-download-limit": ""}))
+            .unwrap();
+        assert_eq!(
+            task.http_task_limiter().rate(),
+            1024 * 1024,
+            "清空单任务限速后应回落跟随全局 1M"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }

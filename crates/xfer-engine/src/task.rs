@@ -194,13 +194,14 @@ pub struct Task {
     /// 单任务下载限速（bytes/s，0 = 跟随全局）：`max-download-limit`
     /// 任务选项的原子镜像。构造/恢复/changeOption 时由
     /// [`Task::sync_task_limits`] 从 options 重建；实际生效值由
-    /// Manager 按 min(单任务, 全局) 合成后下发。
+    /// Manager 按单任务优先覆盖（未设置跟随全局）合成后下发。
     pub task_dl_limit: AtomicU64,
     /// 单任务上传限速（bytes/s，0 = 跟随全局）：`max-upload-limit`
     /// 任务选项的原子镜像（仅 BT 任务的传输路径消费）。
     pub task_ul_limit: AtomicU64,
     /// 任务级 HTTP 下载限速器：所有连接（单连接 + split 多连接）共享，
-    /// rate = min(单任务, 全局)。驱动启动与限速变更时由 Manager 同步。
+    /// rate = 单任务优先覆盖（未设置跟随全局）。驱动启动与限速变更时由
+    /// Manager 同步。
     pub http_limiter: OnceLock<Arc<xfer_http::RateLimiter>>,
     /// 完成/错误时刻（Unix 毫秒；0 = 未知）。终态转移时设置，
     /// 会话持久化保存，重启恢复后客户端仍可显示完成时间。

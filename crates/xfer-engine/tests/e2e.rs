@@ -493,6 +493,66 @@ async fn session_persistence_and_restore() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// 回归：下载中的任务随应用退出重启后应恢复为暂停，且不自动开始下载
+/// （由用户手动恢复；进度已保存可续传）。
+#[tokio::test]
+async fn active_task_restores_paused_and_does_not_autostart() {
+    let data = make_data(DATA_LEN);
+    let server = start_server(data.clone(), Duration::from_millis(15)).await;
+    let root = temp_dir("restart-paused");
+    let _ = std::fs::remove_dir_all(&root);
+    let dl_dir = root.join("dl");
+    let _ = std::fs::create_dir_all(&dl_dir);
+    let session = root.join("session.json");
+    let _ = std::fs::remove_file(&session);
+
+    // 第一段实例：任务进入下载中（有进度）后直接退出（不暂停）
+    let mgr = TaskManager::start_with_session(Some(dl_dir.clone()), Some(1), session.clone());
+    let gid = add(
+        &mgr,
+        vec![format!("{}/slow.bin", server.base)],
+        json!({"dir": dl_dir.to_string_lossy(), "out": "restart.bin"}),
+    );
+    let mut advanced = false;
+    for _ in 0..200 {
+        let st = status(&mgr, &gid);
+        let c: u64 = st["completedLength"].as_str().unwrap().parse().unwrap();
+        if c > 0 && st["status"] == "active" {
+            advanced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(advanced, "下载应已开始推进");
+    // 模拟客户端退出时的显式保存
+    mgr.save_session().unwrap();
+    drop(mgr);
+
+    // 第二段实例：任务应恢复为暂停，且等待后仍不自动开始
+    let mgr2 = TaskManager::start_with_session(None, None, session.clone());
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let st = status(&mgr2, &gid);
+    assert_eq!(st["status"], "paused", "重启后任务不应自动开始");
+    let c0: u64 = st["completedLength"].as_str().unwrap().parse().unwrap();
+    assert!(c0 > 0, "重启前的进度应已恢复");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let st = status(&mgr2, &gid);
+    assert_eq!(st["status"], "paused", "恢复后仍应保持暂停");
+    let c1: u64 = st["completedLength"].as_str().unwrap().parse().unwrap();
+    assert_eq!(c0, c1, "暂停态不应有下载推进");
+
+    // 手动恢复可继续下载至完成（断点续传）
+    mgr2.unpause(&parse_gid(&gid)).unwrap();
+    wait_status(&mgr2, &gid, "complete", Duration::from_secs(30)).await;
+    assert_eq!(
+        std::fs::read(dl_dir.join("restart.bin")).unwrap(),
+        data,
+        "续传结果内容必须与源一致"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// 设置持久化回归：命令行参数（-j/-d）只做本次会话的临时覆盖，
 /// 退出保存后再次无参数启动应恢复用户在界面里保存的设置，
 /// 而不是被上次的临时参数改写。
