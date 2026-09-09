@@ -571,6 +571,34 @@ impl TaskManager {
                     *task.selected_files.lock().unwrap() = Some(sel);
                 }
             }
+            // 恢复 BT 分片位图（hex → bytes）
+            if let Some(hex) = t["btBitfield"].as_str() {
+                let bytes: Vec<u8> = (0..hex.len())
+                    .step_by(2)
+                    .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                    .collect();
+                if !bytes.is_empty() {
+                    *task.bt_bitfield.lock().unwrap() = bytes;
+                }
+            }
+            // 恢复 HTTP 分片跟踪：用保存的 numPieces/pieceLen 重建 PieceTrack，
+            // 并根据已下载字节回填全满位图（终态任务已完成）。
+            let http_np = t["httpNumPieces"].as_u64().unwrap_or(0);
+            let http_pl = t["httpPieceLen"].as_u64().unwrap_or(0);
+            if http_np > 0 && http_pl > 0 {
+                let total = t["totalLength"].as_u64().unwrap_or(0);
+                let completed = t["completedLength"].as_u64().unwrap_or(0);
+                if total > 0 {
+                    let pieces = xfer_http::PieceTrack::new(total, http_pl);
+                    if completed >= total {
+                        // 已完成任务：全满位图
+                        pieces.add_range(0, total);
+                    } else if completed > 0 {
+                        pieces.add_range(0, completed);
+                    }
+                    *task.http_pieces.write().unwrap() = Some(pieces);
+                }
+            }
             {
                 let mut sh = task.shared.lock().unwrap();
                 sh.completed = t["completedLength"].as_u64().unwrap_or(0);
@@ -661,6 +689,16 @@ impl TaskManager {
                 for (k, v) in t.options.lock().unwrap().iter() {
                     opts.insert(k.clone(), Value::String(v.clone()));
                 }
+                // 分片位图快照：BT 来自 bt_bitfield；HTTP 来自 http_pieces。
+                // 重启恢复后用于 UI 分片展示（已完成任务不再有写线程维护位图）。
+                let bt_bf_hex: String = {
+                    let bytes = t.bt_bitfield.lock().unwrap().clone();
+                    bytes.iter().map(|b| format!("{b:02x}")).collect()
+                };
+                let (http_num_pieces, http_piece_len) =
+                    t.http_pieces.read().unwrap().as_ref()
+                        .map(|p| (p.num_pieces() as u64, p.piece_len()))
+                        .unwrap_or((0, 0));
                 json!({
                     "gid": s.gid,
                     "uris": t.uris.lock().unwrap().clone(),
@@ -690,6 +728,10 @@ impl TaskManager {
                     }),
                     "awaitingSelection": t.awaiting_selection.load(Ordering::SeqCst),
                     "selectedFiles": t.selected_files.lock().unwrap().clone(),
+                    // 分片位图持久化：重启后 UI 分片展示不复丢失
+                    "btBitfield": bt_bf_hex,
+                    "httpNumPieces": http_num_pieces,
+                    "httpPieceLen": http_piece_len,
                 })
             })
             .collect();
