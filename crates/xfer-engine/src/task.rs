@@ -712,18 +712,20 @@ pub fn status_json(task: &Task) -> Value {
     };
     // 分片信息：BT 来自元信息；HTTP 来自分片跟踪（写线程按落盘区间
     // 增量维护），未知总长或不支持 Range 时为空。
-    let (num_pieces, piece_length, status_bitfield) = {
+    // partial_bitfield：HTTP 分片部分下载位图（BT 任务为空）。
+    let (num_pieces, piece_length, status_bitfield, partial_bitfield) = {
         let meta = task.bt_meta.lock().unwrap();
         if let Some(m) = &*meta {
             (
                 m.info.piece_count() as u64,
                 m.info.piece_length,
                 task.bt_bitfield.lock().unwrap().clone(),
+                Vec::new(),
             )
         } else {
             match task.http_pieces.read().unwrap().as_ref() {
-                Some(p) => (p.num_pieces() as u64, p.piece_len(), p.bitfield()),
-                None => (0, 0, Vec::new()),
+                Some(p) => (p.num_pieces() as u64, p.piece_len(), p.bitfield(), p.partial_bitfield()),
+                None => (0, 0, Vec::new(), Vec::new()),
             }
         }
     };
@@ -754,6 +756,7 @@ pub fn status_json(task: &Task) -> Value {
         json!(average_speed_of(task).to_string()),
     );
     m.insert("bitfield".into(), json!(bitfield_hex(&status_bitfield)));
+    m.insert("partialBitfield".into(), json!(bitfield_hex(&partial_bitfield)));
     m.insert("connections".into(), json!(s.connections.to_string()));
     m.insert("errorCode".into(), json!(s.error_code.to_string()));
     m.insert("errorMessage".into(), json!(s.error_message));
@@ -836,18 +839,20 @@ pub fn status_json_native(task: &Task) -> Value {
     };
     // 分片信息：BT 来自元信息；HTTP 来自分片跟踪（写线程按落盘区间
     // 增量维护），未知总长或不支持 Range 时为空。
-    let (num_pieces, piece_length, status_bitfield) = {
+    // partial_bitfield：HTTP 分片部分下载位图（BT 任务为空）。
+    let (num_pieces, piece_length, status_bitfield, partial_bitfield) = {
         let meta = task.bt_meta.lock().unwrap();
         if let Some(m) = &*meta {
             (
                 m.info.piece_count() as u64,
                 m.info.piece_length,
                 task.bt_bitfield.lock().unwrap().clone(),
+                Vec::new(),
             )
         } else {
             match task.http_pieces.read().unwrap().as_ref() {
-                Some(p) => (p.num_pieces() as u64, p.piece_len(), p.bitfield()),
-                None => (0, 0, Vec::new()),
+                Some(p) => (p.num_pieces() as u64, p.piece_len(), p.bitfield(), p.partial_bitfield()),
+                None => (0, 0, Vec::new(), Vec::new()),
             }
         }
     };
@@ -874,6 +879,7 @@ pub fn status_json_native(task: &Task) -> Value {
         // 平均速度（应用端进度窗口/任务详情直取引擎，1Hz 刷新）
         "averageSpeed": average_speed_of(task),
         "bitfield": bitfield_hex(&status_bitfield),
+        "partialBitfield": bitfield_hex(&partial_bitfield),
         "connections": s.connections,
         "errorCode": s.error_code,
         "errorMessage": s.error_message,

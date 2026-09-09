@@ -221,9 +221,25 @@ impl PieceTrack {
         }
     }
 
-    /// wire 语义位图副本。
+    /// wire 语义位图副本（每片 1 bit：已落盘满 = 1）。
     pub fn bitfield(&self) -> Vec<u8> {
         self.bf.lock().unwrap().clone()
+    }
+
+    /// 部分下载位图：每片 1 bit：已落盘 > 0 但未满 = 1。
+    /// 用于 UI 三态展示：未开始(灰)、下载中(黄)、已完成(绿)。
+    pub fn partial_bitfield(&self) -> Vec<u8> {
+        let n = self.done.len();
+        let nbytes = n.div_ceil(8);
+        let mut bf = vec![0u8; nbytes];
+        for i in 0..n {
+            let d = self.done[i].load(Ordering::Relaxed);
+            // done[i] > 0 且 done[i] < len_at(i) → 部分下载
+            if d > 0 && d < self.len_at(i) {
+                bf[i / 8] |= 0x80 >> (i % 8);
+            }
+        }
+        bf
     }
 }
 

@@ -1,4 +1,4 @@
-**摘要**：本版本在 v0.3.0 基础上继续演进，围绕「HTTP 能力补齐、前端协议对接、可观测性」三条主线。HTTP 下载获得与 BT 同级的真实分片位图（`numPieces` / `pieceLength` / `bitfield`，随落盘实时推进）与全局限速执行（跨任务共享令牌桶，`1M`/`500K` 单位直通，运行时热生效）；`task.getTrackers` 升级为带 per-tracker announce 状态（协议 / 工作状态 / 做种数 / 下次 announce 时间）。协议对接侧：任务状态新增 aria2 风格 `bittorrent` 对象与 `infoHash` 字段（前端 BT 识别与任务命名依赖）、命令行运行时选项直通（`--key=value`，含 `--enable-upnp` 等应用侧开关自动映射）、`engine.changeOptions` 支持全局 tracker 全量替换（`bt-trackers`）与订阅自动更新开关。可观测性侧：下载速度改为每秒刷新的 3 秒滑动窗口、暴露 BT 分片位图与逐对端位图、新增 BT 对端 IP 封禁（限时/永久），以及 `task.changeUri` / `task.getServers` 两个 aria2 兼容 RPC。本轮还补齐任务级平均速度（`averageSpeed`，活动阶段累计、随会话持久化）、细化 HTTP 分片粒度（几 MB 的小文件也能及时点亮分片）、修复并扩展文件选择链路（`task.changeOption` 真正应用 `select-file`、`files[].selected` 按真实选择上报、HTTP/HTTPS 任务支持选择文件），单文件磁力元数据就绪后自动全量续下。本轮还新增任务级限速（`max-download-limit` / `max-upload-limit`，HTTP 与 BT 全覆盖，生效值取 min(单任务, 全局)、运行时热生效、随会话持久化），`.torrent` 添加支持 `bt-file-selection` 文件勾选流程。CI 新增 linux-arm64（aarch64 musl 静态）构建矩阵。
+**摘要**：本版本在 v0.3.0 基础上继续演进，围绕「HTTP 能力补齐、前端协议对接、可观测性、会话持久化」四条主线。HTTP 下载获得与 BT 同级的真实分片位图（`numPieces` / `pieceLength` / `bitfield`，随落盘实时推进）与全局限速执行（跨任务共享令牌桶，`1M`/`500K` 单位直通，运行时热生效）；`task.getTrackers` 升级为带 per-tracker announce 状态（协议 / 工作状态 / 做种数 / 下次 announce 时间）。协议对接侧：任务状态新增 aria2 风格 `bittorrent` 对象与 `infoHash` 字段（前端 BT 识别与任务命名依赖）、命令行运行时选项直通（`--key=value`，含 `--enable-upnp` 等应用侧开关自动映射）、`engine.changeOptions` 支持全局 tracker 全量替换（`bt-trackers`）与订阅自动更新开关。可观测性侧：下载速度改为每秒刷新的 3 秒滑动窗口、暴露 BT 分片位图与逐对端位图、新增 BT 对端 IP 封禁（限时/永久），以及 `task.changeUri` / `task.getServers` 两个 aria2 兼容 RPC。本轮还补齐任务级平均速度（`averageSpeed`，活动阶段累计、随会话持久化）、细化 HTTP 分片粒度（几 MB 的小文件也能及时点亮分片）、修复并扩展文件选择链路（`task.changeOption` 真正应用 `select-file`、`files[].selected` 按真实选择上报、HTTP/HTTPS 任务支持选择文件），单文件磁力元数据就绪后自动全量续下。本轮还新增任务级限速（`max-download-limit` / `max-upload-limit`，HTTP 与 BT 全覆盖，生效值取 min(单任务, 全局)、运行时热生效、随会话持久化），`.torrent` 添加支持 `bt-file-selection` 文件勾选流程。本轮还新增分片三态展示（`partialBitfield`：部分下载分片位图，UI 区分未开始/下载中/已完成）、分片位图会话持久化（重启后已完成任务分片不丢）。CI 新增 linux-arm64（aarch64 musl 静态）构建矩阵。
 
 ## 新功能
 
@@ -50,8 +50,19 @@
 - 单键错误不再中断整批设置：`changeOptions` 中限速值 / `bt-encryption` / `bt-protocol` / 端口类选项取值非法时降级为告警并跳过该键，其余设置项照常生效——此前一个非法键导致整批 changeOptions 返回错误、用户改一处限速会把所有系统设置一起弄失效
 - tracker announce 状态：`task.getTrackers` 从仅返回 URL 升级为带 per-tracker 状态——`protocol`（http / https / udp / ws）、`status`（working / not-working / waiting）、`seeders` / `leechers`（tracker 报告的 complete / incomplete）、`peers`、`lastAnnounceTime` / `nextAnnounceTime`（成功响应 interval 推算）、`error`（最近一次失败原因）；BT 引擎在每轮 announce 聚合时逐 URL 记录，未 announce 过的 URL 保持 waiting
 
+## 新功能（续）
+
+### 分片三态展示（partialBitfield）
+
+- 任务状态响应（`task.tell` / `task.list`，aria2 风格与原生数值两种编码）新增 `partialBitfield` 字段：HTTP 任务输出部分下载分片位图（已落盘 > 0 但未满的分片标记为 1），BT 任务恒为空串。配合已有的 `bitfield`（全满分片），UI 可渲染三态分片图：未开始（灰）、下载中（黄）、已完成（绿）。`PieceTrack` 新增 `partial_bitfield()` 方法，遍历逐片已落盘字节量，判断 `0 < done[i] < len_at(i)` 的分片
+
+### 分片位图会话持久化
+
+- 会话保存（`session_json`）新增 `btBitfield`（BT 分片位图 hex）、`httpNumPieces` / `httpPieceLen`（HTTP 分片维度），重启恢复（`restore_tasks`）时从这些字段重建 `bt_bitfield` 与 `http_pieces`（`PieceTrack`），并根据已下载字节回填分片状态（已完成任务直接全满）。此前分片位图不随会话持久化，重启后已完成任务的分片图消失（`numPieces=0` / `bitfield` 空）
+
 ## 问题修复
 
+- 修复重启后已完成任务分片进度消失：分片位图（`bt_bitfield` / `http_pieces`）此前不随会话保存与恢复，重启后 `numPieces=0` / `bitfield` 空串，UI 分片图空白。现会话文件持久化分片数据，恢复时重建位图
 - 修复「选择文件」保存后不生效且重开详情页全部显示未选：`changeOption` 的 `select-file` 此前只被存储、从未应用，且原生编码 `files[].selected` 硬编码 `true`，详见「文件选择（select-file）全链路」
 - 修复几 MB 的小文件 HTTP 分片位图恒为零：片长曾固定取 `min-split-size`，小文件整个下载量尚不足以点亮一片，详见「HTTP 分片位图与全局限速」
 - 修复 HTTP 任务完成后误报 `seeder=true`：`seeder` 语义修正为「本端为 BT 任务且已完整」，此前按「completed ≥ total」对所有任务类型计算，HTTP 任务下载完成即误报，应用端据此把普通任务标成“做种中”并补发 BT 完成事件
