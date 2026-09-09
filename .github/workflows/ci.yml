@@ -200,6 +200,35 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
+  # 单元 + 集成测试：cargo test 全量（lib/bins 单元 + crates/*/tests 集成 e2e）。
+  # 与黑盒 test job 并行；与黑盒互补（此前 CI 只有黑盒，cargo test 从未执行，
+  # 单元层回归无人发现）。本地同一入口：scripts/test.sh full（规范见 TESTING.md）。
+  # ---------------------------------------------------------------------------
+  unit-test:
+    name: Cargo test (unit + integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run cargo test (full tier)
+        shell: bash
+        run: scripts/test.sh full
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-test-logs
+          path: target/test-out/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
   # 严格测试：3 平台各自黑盒测试编译产物（引擎运行 / HTTP / HTTPS / 磁力）
   # ---------------------------------------------------------------------------
   test:
@@ -271,7 +300,7 @@ jobs:
   release:
     name: Release (草稿/不覆盖已发布)
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-    needs: [build, test, build-android]
+    needs: [build, test, unit-test, build-android]
     runs-on: ubuntu-latest
     permissions:
       contents: write

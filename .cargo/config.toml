@@ -1,0 +1,8 @@
+# 本仓库 cargo 别名：与 scripts/test.sh 分层保持一致。
+# - cargo t      快速单元层（lib + bins），日常开发默认
+# - cargo tfull  全量层（含 crates/*/tests 集成 e2e）
+# 黑盒层依赖 release 产物与 scripts/ci_test.py，请用 scripts/test.sh blackbox。
+
+[alias]
+t = "test --workspace --lib --bins"
+tfull = "test --workspace"
