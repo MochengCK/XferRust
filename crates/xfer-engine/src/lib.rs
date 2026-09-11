@@ -46,39 +46,24 @@ impl Default for EngineConfig {
     }
 }
 
-/// 参数解析结果：配置 + 被忽略的选项（用于启动日志）。
+/// 参数解析结果：配置 + 被忽略的参数（仅裸位置参数，用于启动日志）。
 #[derive(Debug)]
 pub struct ParsedArgs {
     pub config: EngineConfig,
     pub ignored: Vec<String>,
 }
 
-/// 命令行可直通注入 global_options 的运行时选项
-/// （与 manager::change_global_option 接受的键保持一致）。
-const RUNTIME_OPTIONS: &[&str] = &[
-    "split",
-    "max-connection-per-server",
-    "min-split-size",
-    "max-overall-download-limit",
-    "max-overall-upload-limit",
-    "bt-max-peers",
-    "bt-adaptive",
-    "bt-seed-mode",
-    "bt-seed-ratio",
-    "bt-encryption",
-    "bt-protocol",
-    "bt-listen-port",
-    "dht-listen-port",
-    "bt-enable-lpd",
-    "bt-port-mapping",
-];
-
 /// 解析引擎命令行（`--key=value` 形式）。
 ///
 /// 不用 clap：应用端（transformConfig）固定产出自带值的 `--k=v` 形式，
 /// 且会传入大量尚未实现的引擎选项——手动解析可以精确做到
-/// "已知选项生效、已知但未实现的告警、完全未知的告警"，
+/// "已知选项生效、未知选项作为外部默认参数宽容接受"，
 /// 避免 clap 的严格校验把启动打挂。
+///
+/// 外部默认参数语义：任何 `--key=value` 都会被接受并存入 global_options
+/// （与 `engine.changeOptions` 同一存储，`engine.getOptions` 可读回）——
+/// 引擎已实现的键启动即生效，暂未实现的键仅作为默认值存储、不影响运行，
+/// 由调用方决定语义。仅裸位置参数（非 `--` 开头）视为无效参数告警忽略。
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParsedArgs {
     let mut cfg = EngineConfig::default();
     let mut ignored = Vec::new();
@@ -143,11 +128,12 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParsedArgs {
                 cfg.initial_options
                     .push(("bt-protocol".into(), if on { "tcp+utp".into() } else { "tcp".into() }));
             }
-            // 引擎在任务启动/下载时读取的运行时选项：直通注入
-            k if RUNTIME_OPTIONS.contains(&k) => {
+            // 其余 `--key=value` 一律作为外部传入的默认参数注入 global_options：
+            // 已实现键启动即生效；未实现键仅存储（getOptions 可读回），
+            // 不告警、不忽略——外部调用方可自由透传完整配置。
+            k => {
                 cfg.initial_options.push((k.to_string(), value.to_string()));
             }
-            _ => ignored.push(format!("--{key}")),
         }
     }
     ParsedArgs {
@@ -169,9 +155,9 @@ mod tests {
             "--max-concurrent-downloads=10".to_string(),
             "--log=/tmp/x.log".to_string(),
             "--log-level=warn".to_string(),
-            "--listen-port=21301".to_string(), // 已知但未实现 → 忽略告警
+            "--listen-port=21301".to_string(), // 未实现键 → 作为默认参数宽容接受
             "--bt-max-peers=128".to_string(),  // 运行时选项 → 注入 global_options
-            "--enable-dht=true".to_string(),   // 已知但未实现 → 忽略告警
+            "--enable-dht=true".to_string(),   // 未实现键 → 作为默认参数宽容接受
         ]);
         assert_eq!(p.config.rpc_listen_port, 21301);
         assert_eq!(p.config.rpc_secret.as_deref(), Some("abc"));
@@ -179,8 +165,18 @@ mod tests {
         assert_eq!(p.config.max_concurrent, 10);
         assert_eq!(p.config.log_file, Some(PathBuf::from("/tmp/x.log")));
         assert_eq!(p.config.log_level.as_deref(), Some("warn"));
-        assert_eq!(p.ignored, vec!["--listen-port", "--enable-dht"]);
+        // 未知/未实现选项不再告警忽略，全部作为外部默认参数接受
+        assert!(p.ignored.is_empty());
         assert!(p.config.initial_options.contains(&("bt-max-peers".to_string(), "128".to_string())));
+        assert!(p.config.initial_options.contains(&("listen-port".to_string(), "21301".to_string())));
+        assert!(p.config.initial_options.contains(&("enable-dht".to_string(), "true".to_string())));
+    }
+
+    #[test]
+    fn positional_args_are_ignored() {
+        let p = parse_args(["stray".to_string(), "--bt-seed-mode=true".to_string()]);
+        assert_eq!(p.ignored, vec!["stray"]);
+        assert!(p.config.initial_options.contains(&("bt-seed-mode".to_string(), "true".to_string())));
     }
 
     #[test]

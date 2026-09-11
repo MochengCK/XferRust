@@ -28,7 +28,7 @@ async fn main() {
     install_panic_hook();
 
     for opt in &parsed.ignored {
-        tracing::warn!(option = %opt, "选项暂未实现，已忽略");
+        tracing::warn!(option = %opt, "无效参数，已忽略");
     }
 
     tracing::info!(

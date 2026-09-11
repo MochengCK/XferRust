@@ -4547,7 +4547,7 @@ fn draw_confirm_quit_popup(f: &mut ratatui::Frame) {
 fn cmd_daemon(args: &[String]) -> i32 {
     let parsed = xfer_engine::parse_args(args.iter().cloned());
     for opt in &parsed.ignored {
-        eprintln!("{}: {opt}", tr("忽略未实现选项", "Ignored unimplemented option"));
+        eprintln!("{}: {opt}", tr("忽略无效参数", "Ignored invalid argument"));
     }
     let cfg = parsed.config;
     let rt = tokio::runtime::Runtime::new().expect("创建 runtime 失败");

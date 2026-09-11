@@ -23,7 +23,9 @@ env:
 jobs:
   # ---------------------------------------------------------------------------
   # 构建：桌面平台各自产出 TUI(xfer) 与引擎内核(xferrust) 两个二进制。
-  # macOS 在 arm64 运行器上同时编译 arm64 + x86_64 并 lipo 合成通用二进制。
+  # macOS 在 arm64 运行器上同时编译 arm64 + x86_64：TUI 合并为通用二进制
+  # （xfer-tui-darwin-universal），引擎内核两架构分开打包
+  # （xferrust-darwin-aarch64 / xferrust-darwin-x86_64，供应用端按架构直取）。
   # Android 只构建引擎内核（xferrust），不包含 TUI（无终端界面）。
   # ---------------------------------------------------------------------------
   build:
@@ -87,24 +89,26 @@ jobs:
           cp target/aarch64-unknown-linux-musl/release/xferrust dist/xferrust
           file dist/xfer dist/xferrust
 
-      - name: "Build + smoke test (macOS universal: Intel + Apple Silicon)"
+      - name: "Build (macOS: TUI universal 合并，引擎内核分架构)"
         if: matrix.os == 'macos-latest'
         shell: bash
         run: |
           cargo build --release --target aarch64-apple-darwin --bin xfer --bin xferrust
           cargo build --release --target x86_64-apple-darwin --bin xfer --bin xferrust
           mkdir -p dist
+          # TUI：lipo 合并双架构通用二进制
           lipo -create -output dist/xfer \
             target/aarch64-apple-darwin/release/xfer \
             target/x86_64-apple-darwin/release/xfer
-          lipo -create -output dist/xferrust \
-            target/aarch64-apple-darwin/release/xferrust \
-            target/x86_64-apple-darwin/release/xferrust
-          file dist/xfer
+          # 引擎内核：不合并，两架构分开产出
+          cp target/aarch64-apple-darwin/release/xferrust dist/xferrust-aarch64
+          cp target/x86_64-apple-darwin/release/xferrust dist/xferrust-x86_64
+          file dist/xfer dist/xferrust-aarch64 dist/xferrust-x86_64
           "dist/xfer" --version
-          "dist/xferrust" --version
+          "dist/xferrust-aarch64" --version
+          "dist/xferrust-x86_64" --version
 
-      - name: Package artifacts (TUI 与引擎内核分开打包)
+      - name: Package artifacts (TUI 与引擎内核分开打包；macOS 引擎内核分架构)
         shell: bash
         run: |
           EXT=; [ "$RUNNER_OS" = "Windows" ] && EXT=.exe
@@ -113,11 +117,22 @@ jobs:
           cp "dist/xfer$EXT" "pkg-xfer/xfer$EXT"
           cp LICENSE README.md pkg-xfer/
           tar -C pkg-xfer -czf "xfer-tui-${{ matrix.artifact }}.tar.gz" "xfer$EXT" LICENSE README.md
-          # 引擎内核版（无 TUI）：仅 xferrust
-          mkdir -p pkg-xferrust
-          cp "dist/xferrust$EXT" "pkg-xferrust/xferrust$EXT"
-          cp LICENSE README.md pkg-xferrust/
-          tar -C pkg-xferrust -czf "xferrust-${{ matrix.artifact }}.tar.gz" "xferrust$EXT" LICENSE README.md
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # macOS 引擎内核：aarch64 / x86_64 两个独立包（供应用端按架构直取）
+            mkdir -p pkg-arm64 pkg-x86_64
+            cp dist/xferrust-aarch64 pkg-arm64/xferrust
+            cp dist/xferrust-x86_64  pkg-x86_64/xferrust
+            cp LICENSE README.md pkg-arm64/
+            cp LICENSE README.md pkg-x86_64/
+            tar -C pkg-arm64  -czf "xferrust-darwin-aarch64.tar.gz" xferrust LICENSE README.md
+            tar -C pkg-x86_64 -czf "xferrust-darwin-x86_64.tar.gz"  xferrust LICENSE README.md
+          else
+            # 引擎内核版（无 TUI）：仅 xferrust
+            mkdir -p pkg-xferrust
+            cp "dist/xferrust$EXT" "pkg-xferrust/xferrust$EXT"
+            cp LICENSE README.md pkg-xferrust/
+            tar -C pkg-xferrust -czf "xferrust-${{ matrix.artifact }}.tar.gz" "xferrust$EXT" LICENSE README.md
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -125,7 +140,7 @@ jobs:
           name: build-${{ matrix.artifact }}
           path: |
             xfer-tui-${{ matrix.artifact }}.tar.gz
-            xferrust-${{ matrix.artifact }}.tar.gz
+            xferrust-*.tar.gz
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -259,7 +274,12 @@ jobs:
         run: |
           mkdir -p bin
           tar -xzf "bin/xfer-tui-${{ matrix.artifact }}.tar.gz" -C bin
-          tar -xzf "bin/xferrust-${{ matrix.artifact }}.tar.gz" -C bin
+          # macOS 引擎内核分架构打包：macos-latest 为 arm64 运行器
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            tar -xzf "bin/xferrust-darwin-aarch64.tar.gz" -C bin
+          else
+            tar -xzf "bin/xferrust-${{ matrix.artifact }}.tar.gz" -C bin
+          fi
           ls -la bin
 
       - name: Run strict functional tests
