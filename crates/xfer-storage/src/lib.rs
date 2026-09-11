@@ -175,13 +175,11 @@ impl HashAlgo {
     }
 }
 
-/// 流式计算文件哈希并比对期望值（hex，大小写不敏感）。
+/// 流式计算文件哈希，返回（摘要字节, 读取总字节数）。
 ///
 /// 读取错误必须向上传播：`while let Ok` 会把中途读错误当 EOF，
 /// 对截断前缀算哈希——校验通过与否都不可信。
-pub fn verify_file_hash(path: &Path, algo: HashAlgo, expected_hex: &str) -> Result<(), String> {
-    let expected = hex::decode(expected_hex.trim())
-        .map_err(|_| format!("期望哈希值不是合法 hex: {expected_hex}"))?;
+fn file_digest(path: &Path, algo: HashAlgo) -> Result<(Vec<u8>, u64), String> {
     let mut file = std::fs::File::open(path).map_err(|e| format!("打开文件失败: {e}"))?;
     // 256KB 读块：一次分配整个校验过程复用，大文件读系统调用更少
     let mut buf = vec![0u8; 256 * 1024];
@@ -202,7 +200,7 @@ pub fn verify_file_hash(path: &Path, algo: HashAlgo, expected_hex: &str) -> Resu
             h.update(&buf[..n]);
         }
     }
-    let (actual, total): (Vec<u8>, u64) = match algo {
+    Ok(match algo {
         HashAlgo::Sha1 => {
             let mut h = Sha1::new();
             let t = feed(&mut h, &mut file, &mut buf).map_err(|e| format!("读取文件失败: {e}"))?;
@@ -224,7 +222,20 @@ pub fn verify_file_hash(path: &Path, algo: HashAlgo, expected_hex: &str) -> Resu
             let t = feed(&mut h, &mut file, &mut buf).map_err(|e| format!("读取文件失败: {e}"))?;
             (h.finalize().to_vec(), t)
         }
-    };
+    })
+}
+
+/// 流式计算文件哈希并返回十六进制摘要（任务文件校验用）。
+pub fn file_digest_hex(path: &Path, algo: HashAlgo) -> Result<String, String> {
+    let (actual, _total) = file_digest(path, algo)?;
+    Ok(hex::encode(actual))
+}
+
+/// 流式计算文件哈希并比对期望值（hex，大小写不敏感）。
+pub fn verify_file_hash(path: &Path, algo: HashAlgo, expected_hex: &str) -> Result<(), String> {
+    let expected = hex::decode(expected_hex.trim())
+        .map_err(|_| format!("期望哈希值不是合法 hex: {expected_hex}"))?;
+    let (actual, total) = file_digest(path, algo)?;
     if total == 0 {
         return Err("文件为空或读取失败".into());
     }

@@ -23,7 +23,9 @@ use futures_util::future::FutureExt;
 use crate::task::{
     filter_keys, snapshot, status_json, status_json_native, Intent, Status, Task, TaskFailure,
 };
-use xfer_storage::{existing_len, verify_file_hash, FileSink, HashAlgo};
+use xfer_storage::{
+    existing_len, file_digest_hex, verify_file_hash, FileSink, HashAlgo,
+};
 
 /// 事件负载：(事件名, gid)，RPC 层拼装线上通知帧。
 pub type EngineEvent = (String, String);
@@ -2053,6 +2055,112 @@ impl TaskManager {
             .get("files")
             .cloned()
             .unwrap_or_else(|| Value::Array(vec![])))
+    }
+
+    /// 单任务文件校验（原生 task.verifyFiles）。
+    ///
+    /// 下载完成后的完整性检查在引擎侧执行：存在性 / 大小 / 哈希（流式），
+    /// 前端只负责交互（发起、提示、复制结果）。语义与旧前端实现一致：
+    /// - 任一文件缺失 → status = "missing"（不再继续哈希）；
+    /// - 任一文件大小与期望不符（期望 > 0 才检查）→ status = "sizeMismatch"；
+    /// - 其余 → status = "ok"；algorithm = "size" 时不做哈希。
+    /// `hashes[].path` 为展示用路径（BT 多文件为 "目录名/相对路径"），
+    /// 绝对路径仅用于引擎本地读盘，不回传。
+    ///
+    /// 注意：包含阻塞 I/O 与哈希计算，调用方（RPC）需置于
+    /// `tokio::task::block_in_place` 中。
+    pub fn verify_task_files(&self, gid: &Gid, algorithm: &str) -> Result<Value, String> {
+        enum Algo {
+            Size,
+            Hash(HashAlgo),
+        }
+        let algo = if algorithm.eq_ignore_ascii_case("size") {
+            Algo::Size
+        } else {
+            Algo::Hash(
+                HashAlgo::parse(algorithm)
+                    .ok_or_else(|| format!("不支持的校验算法: {algorithm}"))?,
+            )
+        };
+
+        let task = self.task_of(gid)?;
+        let s = snapshot(&task);
+        let sel = task.selected_files.lock().unwrap().clone();
+        let is_selected = |i: usize| match &sel {
+            None => true,
+            Some(v) => v.contains(&i),
+        };
+        let dir = PathBuf::from(&s.dir);
+
+        // (展示路径, 本地绝对路径, 期望大小)
+        let entries: Vec<(String, PathBuf, u64)> =
+            if let Some(meta) = &*task.bt_meta.lock().unwrap() {
+                meta.info
+                    .files
+                    .iter()
+                    .enumerate()
+                    // 未选择的文件不属于本次下载，不参与校验
+                    .filter(|(i, _)| is_selected(*i))
+                    .map(|(i, f)| {
+                        let label = format!("{}/{}", meta.info.name, f.path.join("/"));
+                        let abs = if Path::new(&label).is_absolute() {
+                            PathBuf::from(&label)
+                        } else {
+                            dir.join(&label)
+                        };
+                        (label, abs, f.length)
+                    })
+                    .collect()
+            } else {
+                let label = s.path.clone();
+                let abs = if Path::new(&label).is_absolute() {
+                    PathBuf::from(&label)
+                } else {
+                    dir.join(&label)
+                };
+                vec![(label, abs, s.file_len)]
+            };
+        if entries.is_empty() {
+            return Err("任务没有可校验的文件".into());
+        }
+
+        let mut missing: Vec<String> = Vec::new();
+        let mut mismatched: Vec<String> = Vec::new();
+        for (label, abs, expected) in &entries {
+            let Ok(st) = std::fs::metadata(abs) else {
+                missing.push(label.clone());
+                continue;
+            };
+            if *expected > 0 && st.len() != *expected {
+                mismatched.push(label.clone());
+            }
+        }
+        let status = if !missing.is_empty() {
+            "missing"
+        } else if !mismatched.is_empty() {
+            "sizeMismatch"
+        } else {
+            "ok"
+        };
+
+        let mut hashes: Vec<Value> = Vec::new();
+        if status == "ok" {
+            if let Algo::Hash(h) = algo {
+                for (label, abs, _) in &entries {
+                    let digest = file_digest_hex(abs, h)
+                        .map_err(|e| format!("计算哈希失败（{label}）: {e}"))?;
+                    hashes.push(json!({ "path": label, "digest": digest }));
+                }
+            }
+        }
+
+        Ok(json!({
+            "status": status,
+            "count": entries.len(),
+            "missing": missing,
+            "mismatched": mismatched,
+            "hashes": hashes,
+        }))
     }
 
     pub fn get_uris(&self, gid: &Gid) -> Result<Value, String> {

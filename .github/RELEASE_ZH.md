@@ -1,4 +1,4 @@
-**摘要**：本版本在 v0.3.0 基础上继续演进，围绕「HTTP 能力补齐、前端协议对接、可观测性、会话持久化」四条主线。HTTP 下载获得与 BT 同级的真实分片位图（`numPieces` / `pieceLength` / `bitfield`，随落盘实时推进）与全局限速执行（跨任务共享令牌桶，`1M`/`500K` 单位直通，运行时热生效）；`task.getTrackers` 升级为带 per-tracker announce 状态（协议 / 工作状态 / 做种数 / 下次 announce 时间）。协议对接侧：任务状态新增 aria2 风格 `bittorrent` 对象与 `infoHash` 字段（前端 BT 识别与任务命名依赖）、命令行运行时选项直通（`--key=value`，含 `--enable-upnp` 等应用侧开关自动映射）、`engine.changeOptions` 支持全局 tracker 全量替换（`bt-trackers`）与订阅自动更新开关。可观测性侧：下载速度改为每秒刷新的 3 秒滑动窗口、暴露 BT 分片位图与逐对端位图、新增 BT 对端 IP 封禁（限时/永久），以及 `task.changeUri` / `task.getServers` 两个 aria2 兼容 RPC。本轮还补齐任务级平均速度（`averageSpeed`，活动阶段累计、随会话持久化）、细化 HTTP 分片粒度（几 MB 的小文件也能及时点亮分片）、修复并扩展文件选择链路（`task.changeOption` 真正应用 `select-file`、`files[].selected` 按真实选择上报、HTTP/HTTPS 任务支持选择文件），单文件磁力元数据就绪后自动全量续下。本轮还新增任务级限速（`max-download-limit` / `max-upload-limit`，HTTP 与 BT 全覆盖，生效值单任务优先覆盖全局（未设置跟随全局）、运行时热生效、随会话持久化），`.torrent` 添加支持 `bt-file-selection` 文件勾选流程。本轮还新增分片三态展示（`partialBitfield`：部分下载分片位图，UI 区分未开始/下载中/已完成）、分片位图会话持久化（重启后已完成任务分片不丢）。CI 新增 linux-arm64（aarch64 musl 静态）构建矩阵。本轮将单任务限速合成语义调整为「单任务优先覆盖全局」（已设置时优先生效，可高于也可低于全局；未设置跟随全局），并把重启恢复语义收紧为：所有未完成任务一律恢复为暂停、不再自动开始下载。本轮还让引擎命令行支持外部传入默认参数——任意 `--key=value` 都宽容接受为全局默认值（未实现的键不再告警忽略），并将 macOS 引擎内核产物按架构拆分（aarch64 / x86_64 独立打包，TUI 仍为双架构通用二进制）。
+**摘要**：本版本在 v0.3.0 基础上继续演进，围绕「HTTP 能力补齐、前端协议对接、可观测性、会话持久化」四条主线。HTTP 下载获得与 BT 同级的真实分片位图（`numPieces` / `pieceLength` / `bitfield`，随落盘实时推进）与全局限速执行（跨任务共享令牌桶，`1M`/`500K` 单位直通，运行时热生效）；`task.getTrackers` 升级为带 per-tracker announce 状态（协议 / 工作状态 / 做种数 / 下次 announce 时间）。协议对接侧：任务状态新增 aria2 风格 `bittorrent` 对象与 `infoHash` 字段（前端 BT 识别与任务命名依赖）、命令行运行时选项直通（`--key=value`，含 `--enable-upnp` 等应用侧开关自动映射）、`engine.changeOptions` 支持全局 tracker 全量替换（`bt-trackers`）与订阅自动更新开关。可观测性侧：下载速度改为每秒刷新的 3 秒滑动窗口、暴露 BT 分片位图与逐对端位图、新增 BT 对端 IP 封禁（限时/永久），以及 `task.changeUri` / `task.getServers` 两个 aria2 兼容 RPC。本轮还补齐任务级平均速度（`averageSpeed`，活动阶段累计、随会话持久化）、细化 HTTP 分片粒度（几 MB 的小文件也能及时点亮分片）、修复并扩展文件选择链路（`task.changeOption` 真正应用 `select-file`、`files[].selected` 按真实选择上报、HTTP/HTTPS 任务支持选择文件），单文件磁力元数据就绪后自动全量续下。本轮还新增任务级限速（`max-download-limit` / `max-upload-limit`，HTTP 与 BT 全覆盖，生效值单任务优先覆盖全局（未设置跟随全局）、运行时热生效、随会话持久化），`.torrent` 添加支持 `bt-file-selection` 文件勾选流程。本轮还新增分片三态展示（`partialBitfield`：部分下载分片位图，UI 区分未开始/下载中/已完成）、分片位图会话持久化（重启后已完成任务分片不丢）。CI 新增 linux-arm64（aarch64 musl 静态）构建矩阵。本轮将单任务限速合成语义调整为「单任务优先覆盖全局」（已设置时优先生效，可高于也可低于全局；未设置跟随全局），并把重启恢复语义收紧为：所有未完成任务一律恢复为暂停、不再自动开始下载。本轮还让引擎命令行支持外部传入默认参数——任意 `--key=value` 都宽容接受为全局默认值（未实现的键不再告警忽略），并将 macOS 引擎内核产物按架构拆分（aarch64 / x86_64 独立打包，TUI 仍为双架构通用二进制）。本轮还新增文件校验 RPC `task.verifyFiles`（存在性 / 大小 / 流式哈希由引擎原生执行，返回结构化校验结果）。
 
 ## 新功能
 
@@ -60,6 +60,13 @@
 ### 分片位图会话持久化
 
 - 会话保存（`session_json`）新增 `btBitfield`（BT 分片位图 hex）、`httpNumPieces` / `httpPieceLen`（HTTP 分片维度），重启恢复（`restore_tasks`）时从这些字段重建 `bt_bitfield` 与 `http_pieces`（`PieceTrack`），并根据已下载字节回填分片状态（已完成任务直接全满）。此前分片位图不随会话持久化，重启后已完成任务的分片图消失（`numPieces=0` / `bitfield` 空）
+
+### 任务文件校验（task.verifyFiles）
+
+- 新增原生 RPC `task.verifyFiles`：对指定任务执行文件完整性检查——存在性检查、文件大小比对、流式哈希计算（SHA-256 / SHA-1 / SHA-512 / MD5，`algorithm` 参数支持 `size` / `sha256` / `sha1` / `md5` / `sha512`，大小写不敏感）
+- 路径解析与读盘全部在引擎内完成：BT 多文件按「目录名/相对路径」拼接任务目录，HTTP 任务取任务实际落盘路径；未选择的文件（select-file 之外的 BT 文件）不参与校验。返回结构化结果：`status`（`ok` / `missing` / `sizeMismatch`）、`count`、`missing` / `mismatched`（问题文件列表）与 `hashes`（`path` 展示路径 + `digest` 十六进制摘要，`size` 校验时为空）
+- `engine.getVersion` 的 `features` 列表新增 `"verify-files"`
+- `xfer-storage` 新增 `file_digest_hex`（流式计算文件哈希并返回 hex 摘要），与已有的 `verify_file_hash`（比对期望值）共享底层 `file_digest` 实现
 
 ## 问题修复
 

@@ -134,6 +134,16 @@ impl NativeDispatcher {
                 .remove_download_result(&gid("gid")?)
                 .map(|_| json!({"ok": true})),
             "task.getFiles" => e.get_files(&gid("gid")?),
+            "task.verifyFiles" => {
+                let gid = gid("gid")?;
+                let algorithm = obj
+                    .get("algorithm")
+                    .and_then(Value::as_str)
+                    .unwrap_or("sha256");
+                // 阻塞 I/O + 流式哈希，放到 blocking 线程执行
+                let mgr = e.clone();
+                tokio::task::block_in_place(|| mgr.verify_task_files(&gid, algorithm))
+            }
             "task.getUris" => e.get_uris(&gid("gid")?),
             "task.getPeers" => e.get_peers(&gid("gid")?),
             "task.getTrackers" => e.get_trackers(&gid("gid")?),
@@ -207,7 +217,7 @@ impl NativeDispatcher {
             "engine.getVersion" => Ok(json!({
                 "name": ENGINE_NAME,
                 "version": ENGINE_VERSION,
-                "features": ["http", "resume", "checksum", "bt", "events", "bitfield", "ban-peer", "change-uri", "get-servers"],
+                "features": ["http", "resume", "checksum", "bt", "events", "bitfield", "ban-peer", "change-uri", "get-servers", "verify-files"],
             })),
             "engine.globalStat" => Ok(e.global_stat_native()),
             "engine.getOptions" => Ok(e.get_global_option()),

@@ -285,6 +285,59 @@ async fn download_complete_and_checksum_flow() {
 }
 
 #[tokio::test]
+async fn verify_task_files_after_download() {
+    let data = make_data(DATA_LEN);
+    let server = start_server(data.clone(), Duration::ZERO).await;
+    let dir = temp_dir("verify");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = add(
+        &mgr,
+        vec![format!("{}/file.bin", server.base)],
+        json!({"dir": dir.to_string_lossy(), "out": "out.bin"}),
+    );
+    wait_status(&mgr, &gid, "complete", Duration::from_secs(15)).await;
+    let g = parse_gid(&gid);
+
+    // size 校验：大小与期望一致 → ok
+    let r = mgr.verify_task_files(&g, "size").unwrap();
+    assert_eq!(r["status"], "ok");
+    assert_eq!(r["count"], 1);
+    assert!(r["hashes"].as_array().unwrap().is_empty(), "size 校验不应计算哈希");
+
+    // sha256：摘要应与源数据一致
+    let r = mgr.verify_task_files(&g, "sha256").unwrap();
+    assert_eq!(r["status"], "ok");
+    assert_eq!(r["hashes"][0]["digest"], hex::encode(sha2::Sha256::digest(&data)));
+
+    // md5 / sha1 / sha512：摘要长度正确
+    let want_len = |a: &str| match a {
+        "md5" => 32,
+        "sha1" => 40,
+        _ => 128,
+    };
+    for algo in ["md5", "sha1", "sha512"] {
+        let r = mgr.verify_task_files(&g, algo).unwrap();
+        assert_eq!(r["status"], "ok", "{algo}");
+        let digest = r["hashes"][0]["digest"].as_str().unwrap();
+        assert_eq!(digest.len(), want_len(algo), "{algo}");
+    }
+
+    // 未知算法 / 未知 gid → 报错
+    assert!(mgr.verify_task_files(&g, "crc32").is_err());
+    assert!(mgr.verify_task_files(&parse_gid("0123456789abcdef"), "sha256").is_err());
+
+    // 文件被删 → missing
+    std::fs::remove_file(dir.join("out.bin")).unwrap();
+    let r = mgr.verify_task_files(&g, "sha256").unwrap();
+    assert_eq!(r["status"], "missing");
+    assert_eq!(r["missing"].as_array().unwrap().len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn pause_then_resume_via_range() {
     let data = make_data(DATA_LEN);
     let server = start_server(data.clone(), Duration::from_millis(15)).await;
