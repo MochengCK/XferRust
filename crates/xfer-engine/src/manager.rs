@@ -3284,9 +3284,12 @@ async fn speed_ticker(task: Arc<Task>, events: broadcast::Sender<EngineEvent>) {
     // （跨度 2-3s）；样本数未满窗口时按实际跨度折算。
     const WINDOW_SECS: usize = 3;
     let mut samples: VecDeque<(u64, u64)> = VecDeque::with_capacity(WINDOW_SECS + 1);
-    // 平均速度累计的基准：前次采样完成字节（本 ticker 随一次下载运行
-    // 启停，None = 尚未采样）。
-    let mut last_completed: Option<u64> = None;
+    // 平均速度累计的基准：本次下载运行启动时的完成字节快照。ticker 在
+    // run_task 一开始（驱动真正开始下载前）spawn，此处立即取样使首个
+    // 1Hz tick 的吞吐也计入均值——此前 None 起步会把第一秒的字节丢弃
+    // 而 1 秒时长照记，短任务均值系统性偏低；resume 基线（此前已下载
+    // 的字节）恰在该快照中，不会重复计入。
+    let mut last_completed: Option<u64> = Some(task.completed_live());
     loop {
         interval.tick().await;
         let completed = task.completed_live();

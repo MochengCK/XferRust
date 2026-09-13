@@ -301,3 +301,64 @@ async fn task_add_torrent_invalid_base64_rejected() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 回归：task.add 必须全量透传任务选项（除协议保留键）。
+/// 曾有缺陷：只透传 dir/out/checksum，bt-file-selection 被静默丢弃，
+/// 磁力任务元数据就绪后不进入"等待文件选择"自动暂停，而是直接下载。
+/// 断言添加后立即读 awaitingSelection=true（元数据未就绪阶段该标记
+/// 已置位，无需真实 swarm，结果确定）。
+#[tokio::test]
+async fn task_add_passthrough_bt_file_selection() {
+    let dir = std::env::temp_dir().join(format!("xfer-rpc-magnet-sel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let events = mgr.events();
+    let router = Arc::new(RpcRouter::new(None, mgr.clone(), events));
+    let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=sel-test";
+
+    // magnet 字段形态（原生独有）
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"task.add","params":{{"magnet":"{magnet}","dir":"{}","bt-file-selection":"true"}}}}"#,
+        dir.display()
+    );
+    let resp = router.handle(&body).response.expect("应有响应");
+    assert_eq!(
+        resp["error"],
+        serde_json::Value::Null,
+        "task.add(magnet) 失败: {resp}"
+    );
+    let gid = resp["result"]["gid"].as_str().unwrap().to_string();
+    let st = mgr
+        .tell_status_native(&xfer_types::Gid::parse(&gid).unwrap(), None)
+        .unwrap();
+    assert_eq!(
+        st["awaitingSelection"],
+        serde_json::json!(true),
+        "magnet 形态应透传 bt-file-selection: {st}"
+    );
+
+    // uris 形态（桌面端 addUri 路径：磁力链接混在 uris 里）
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"task.add","params":{{"uris":["{magnet}"],"dir":"{}","bt-file-selection":"true"}}}}"#,
+        dir.display()
+    );
+    let resp = router.handle(&body).response.expect("应有响应");
+    assert_eq!(
+        resp["error"],
+        serde_json::Value::Null,
+        "task.add(uris) 失败: {resp}"
+    );
+    let gid2 = resp["result"]["gid"].as_str().unwrap().to_string();
+    let st2 = mgr
+        .tell_status_native(&xfer_types::Gid::parse(&gid2).unwrap(), None)
+        .unwrap();
+    assert_eq!(
+        st2["awaitingSelection"],
+        serde_json::json!(true),
+        "uris 形态应透传 bt-file-selection: {st2}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

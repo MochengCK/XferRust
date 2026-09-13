@@ -208,7 +208,7 @@ pub struct Task {
     pub finished_at: AtomicU64,
     /// 平均速度累计——活动下载阶段（Status::Active，不含做种）每秒
     /// 记一次：avg_active_ms += 1000、avg_bytes += 完成字节增量。
-    /// averageSpeed = avg_bytes / (avg_active_ms / 1000)，随会话持久化，
+    /// averageSpeed = avg_bytes * 1000 / avg_active_ms，随会话持久化，
     /// 重启续传后均值不漂移。
     pub avg_active_ms: AtomicU64,
     pub avg_bytes: AtomicU64,
@@ -654,12 +654,17 @@ fn bittorrent_json(task: &Task, hash: Option<&str>) -> Value {
 
 /// 平均速度（字节/秒）：活动下载阶段累计字节 / 活动时长。
 /// 两者均随会话持久化（重启续传后均值不漂移），做种期不累计不稀释。
+/// 用 bytes*1000/ms 而非 bytes/(ms/1000)：后者在 ms<2000 时除数
+/// 截断会把均值放大（ms=1999 时误差近 2 倍），开头几秒数值虚高。
 fn average_speed_of(task: &Task) -> u64 {
     let ms = task.avg_active_ms.load(Ordering::Relaxed);
     if ms < 1000 {
         return 0;
     }
-    task.avg_bytes.load(Ordering::Relaxed) / (ms / 1000)
+    task.avg_bytes
+        .load(Ordering::Relaxed)
+        .saturating_mul(1000)
+        / ms
 }
 
 /// 任务状态 → 前端兼容协议 JSON（数值以字符串承载）。

@@ -64,14 +64,23 @@ impl NativeDispatcher {
         let e = &self.engine;
         match method {
             "task.add" => {
+                // 任务选项：除协议保留键外全量透传。此前只透传
+                // dir/out/checksum，把 bt-file-selection / select-file 等
+                // 任务级选项静默丢弃——磁力/种子的"元数据就绪后自动暂停
+                // 等待勾选文件"流程因此失效，任务直接开始下载。
+                // 未知键由 manager 侧忽略（无效参数宽容语义）。
+                let extract_options = |obj: &serde_json::Map<String, Value>| -> serde_json::Map<String, Value> {
+                    const RESERVED: [&str; 6] = [
+                        "token", "uris", "torrent", "magnet", "position", "keys",
+                    ];
+                    obj.iter()
+                        .filter(|(k, _)| !RESERVED.contains(&k.as_str()))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                };
                 // BT 磁力链接（BEP 9：先获取元数据再下载）
                 if let Some(m) = obj.get("magnet").and_then(Value::as_str) {
-                    let mut options = serde_json::Map::new();
-                    for k in ["dir", "out"] {
-                        if let Some(v) = obj.get(k) {
-                            options.insert(k.to_string(), v.clone());
-                        }
-                    }
+                    let options = extract_options(&obj);
                     let position = obj.get("position").and_then(Value::as_i64);
                     return e
                         .add_magnet(m, &Value::Object(options), position)
@@ -79,12 +88,7 @@ impl NativeDispatcher {
                 }
                 // BT 形式：torrent 字段（.torrent base64）
                 if let Some(tb64) = obj.get("torrent").and_then(Value::as_str) {
-                    let mut options = serde_json::Map::new();
-                    for k in ["dir", "out"] {
-                        if let Some(v) = obj.get(k) {
-                            options.insert(k.to_string(), v.clone());
-                        }
-                    }
+                    let options = extract_options(&obj);
                     let position = obj.get("position").and_then(Value::as_i64);
                     return e
                         .add_torrent(tb64, &Value::Object(options), position)
@@ -100,12 +104,7 @@ impl NativeDispatcher {
                             .collect()
                     })
                     .ok_or_else(|| "参数 uris（数组）缺失".to_string())?;
-                let mut options = serde_json::Map::new();
-                for k in ["dir", "out", "checksum"] {
-                    if let Some(v) = obj.get(k) {
-                        options.insert(k.to_string(), v.clone());
-                    }
-                }
+                let options = extract_options(&obj);
                 let position = obj.get("position").and_then(Value::as_i64);
                 e.add_uri(uris, &Value::Object(options), position)
                     .map(|g| json!({"gid": g.0}))
