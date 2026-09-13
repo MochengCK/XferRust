@@ -1647,6 +1647,12 @@ impl TorrentEngine {
     ///
     /// 后台各 run_peer 任务在元数据未就绪时只做元数据交换，
     /// 收集完成后由 `install_metadata` 置位，本循环随即返回。
+    ///
+    /// 取消必须被及时响应：元数据就绪后任务管理器会在同一个 1Hz 上报
+    /// tick 里回填元数据并下发暂停意图（等待用户勾选文件），若本循环此刻
+    /// 正卡在 announce（最长可阻塞到 tracker 超时）或 1s 睡眠里，任务要等
+    /// 这一轮走完才会真正落到 paused——表现为"真实任务名已经显示，但
+    /// 「待选择文件」要过一会才出现"。因此与下载阶段一样按取消优先处理。
     async fn fetch_metadata(self: &Arc<Self>, cancel: &CancellationToken) -> Result<(), String> {
         let deadline = Instant::now() + METADATA_TIMEOUT;
         tracing::info!(
@@ -1665,15 +1671,25 @@ impl TorrentEngine {
             if Instant::now() >= deadline {
                 return Err("获取元数据超时：无法从 peer 获取 .torrent 元数据".into());
             }
-            // 补充 announce 拿新 peer（低水位加速）
+            // 补充 announce 拿新 peer（低水位加速）。announce 最长可阻塞
+            // 到 tracker 超时，取消优先，暂停不被 tracker I/O 挡住
             if last_announce.elapsed() >= Duration::from_secs(METADATA_ANNOUNCE_INTERVAL) {
-                if let Some(r) = self.announce_all(None).await {
+                let r = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err("BT 任务已取消".into()),
+                    r = self.announce_all(None) => r,
+                };
+                if let Some(r) = r {
                     self.add_peers(r.peers, PeerSource::Tracker).await;
                 }
                 last_announce = Instant::now();
             }
             self.connect_pending().await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err("BT 任务已取消".into()),
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
         }
     }
 
@@ -5629,6 +5645,64 @@ mod tests {
         let meta = engine.meta().unwrap();
         assert_eq!(meta.info.name, "magnet-test.bin");
         assert_eq!(meta.info_hash, info_hash);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 回归：磁力取元数据阶段必须及时响应取消（暂停不被 tracker I/O 拖住）。
+    ///
+    /// 曾有缺陷：`fetch_metadata` 只在每轮循环开头检查取消，轮内的 announce
+    /// 不感知取消（HTTP tracker 单次超时 15s），循环末尾的 1s 睡眠同样不可
+    /// 中断。元数据就绪后任务管理器会在同一个 1Hz 上报 tick 里回填元数据并
+    /// 下发"等待文件选择"的暂停意图，若此时正卡在 announce，任务要等这一轮
+    /// 走完才真正落到 paused —— 表现为"真实任务名已经显示，但「待选择文件」
+    /// 还要过一会才出现"。
+    #[tokio::test]
+    async fn fetch_metadata_reacts_to_cancel_during_announce() {
+        // 假 tracker：accept 后既不读也不回，把 announce 卡在响应等待上
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("xfer-bt-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cfg = TorrentConfig {
+            dir: dir.clone(),
+            announce_urls: vec![format!("http://{addr}/announce")],
+            ..Default::default()
+        };
+        let engine = TorrentEngine::new_magnet([7u8; 20], cfg).unwrap();
+        let cancel = CancellationToken::new();
+
+        let e = engine.clone();
+        let c = cancel.clone();
+        let task = tokio::spawn(async move { e.fetch_metadata(&c).await });
+
+        // last_announce 预置为"已过间隔"，首轮循环立刻发 announce；
+        // 等它进入等待响应后再取消
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let t0 = Instant::now();
+        cancel.cancel();
+
+        let joined = tokio::time::timeout(Duration::from_secs(3), task).await;
+        let elapsed = t0.elapsed();
+        assert!(
+            joined.is_ok(),
+            "取消后 fetch_metadata 3s 内未返回（被 announce 拖住），耗时 {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "取消响应过慢（应立刻返回），耗时 {elapsed:?}"
+        );
+        let err = joined.unwrap().unwrap().unwrap_err();
+        assert!(err.contains("已取消"), "应返回取消错误，实际: {err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
