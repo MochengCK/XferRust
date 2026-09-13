@@ -9,6 +9,7 @@ description = "bencode 编解码 + .torrent 解析 + 磁力链接解析（BEP 3�
 thiserror = { workspace = true }
 sha1 = { workspace = true }
 hex = { workspace = true }
+xfer-types = { path = "../xfer-types" }
 
 [dev-dependencies]
 proptest = "1"

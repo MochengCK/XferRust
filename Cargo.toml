@@ -23,6 +23,8 @@ sha1 = "0.10"
 sha2 = "0.10"
 md-5 = "0.10"
 getrandom = "0.3"
+# 字符集解码（中文站点常用 GBK/GB2312 的百分号编码，见 xfer-types::text）
+encoding_rs = "0.8"
 base64 = "0.22"
 crossterm = "0.28"
 ratatui = "0.28"

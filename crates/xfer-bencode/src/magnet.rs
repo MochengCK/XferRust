@@ -66,31 +66,12 @@ fn parse_btih(s: &str) -> Result<[u8; 20], String> {
 }
 
 /// 百分号解码（无效转义按原样保留）。
+///
+/// 中文站点常用 GBK/GB2312 对 `dn` 做百分号编码，直接按 UTF-8 lossy 解会得到
+/// 一串 U+FFFD（界面显示 `����`）。解码交给 [`xfer_types::text`]：显式 charset
+/// → 严格 UTF-8 → GB18030 → lossy。
 fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    xfer_types::text::decode_percent_text(s)
 }
 
 /// RFC 4648 base32 解码（无 padding），失败返回 None。
@@ -151,6 +132,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.display_name.as_deref(), Some("测试"));
+    }
+
+    /// 回归：中文站点常用 GBK 百分号编码 dn，不能解成一串 U+FFFD（`����`）。
+    #[test]
+    fn percent_decoding_gbk_display_name() {
+        // %B2%E2%CA%D4 是 GBK 的「测试」
+        let m = parse_magnet(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=%B2%E2%CA%D4",
+        )
+        .unwrap();
+        assert_eq!(m.display_name.as_deref(), Some("测试"));
+        assert!(!m.display_name.as_deref().unwrap().contains('\u{FFFD}'));
     }
 
     #[test]

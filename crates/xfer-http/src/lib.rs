@@ -15,10 +15,9 @@ pub use split::{
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use percent_encoding::percent_decode_str;
 use tokio_util::sync::CancellationToken;
 
-use xfer_types::{ENGINE_NAME, ENGINE_VERSION};
+use xfer_types::{text as charset_text, ENGINE_NAME, ENGINE_VERSION};
 
 /// 构建 HTTP 客户端（全局共享）。
 ///
@@ -292,9 +291,12 @@ fn filename_from_content_disposition(cd: &str) -> Option<String> {
     for seg in cd.split(';') {
         let seg = seg.trim();
         if let Some(rest) = strip_ci(seg, "filename*=") {
-            // RFC 5987: charset'lang'percent-encoded
-            let value = rest.splitn(3, '\'').nth(2).unwrap_or("");
-            let decoded = percent_decode_str(value).decode_utf8_lossy().to_string();
+            // RFC 5987: charset'lang'percent-encoded。charset 必须尊重：
+            // 部分站点声明 gb2312/gbk，按 UTF-8 解会得到一串 U+FFFD
+            let mut parts = rest.splitn(3, '\'');
+            let charset = parts.next();
+            let value = parts.nth(1).unwrap_or("");
+            let decoded = charset_text::decode_percent_text_with_charset(value, charset);
             extended = sanitize_filename(&decoded);
         } else if let Some(rest) = strip_ci(seg, "filename=") {
             let value = rest.trim().trim_matches('"');
@@ -312,7 +314,9 @@ fn filename_from_url(url: &str) -> Option<String> {
     if last.is_empty() {
         return None;
     }
-    let decoded = percent_decode_str(last).decode_utf8_lossy().to_string();
+    // URL 路径里的中文常被站点按 GBK 百分号编码（%CF%C2%D4%D8 → 下载），
+    // 按 UTF-8 lossy 解会得到 `����`，交给字符集探测解码
+    let decoded = charset_text::decode_percent_text(last);
     sanitize_filename(&decoded)
 }
 
@@ -374,6 +378,22 @@ mod tests {
         assert_eq!(cd("attachment; filename="), None);
     }
 
+    /// 回归：`filename*` 的 charset 必须被尊重。中文下载站常声明
+    /// gb2312/gbk，按 UTF-8 lossy 解会得到一串 U+FFFD。
+    #[test]
+    fn parses_content_disposition_gbk_charset() {
+        // %B2%E2%CA%D4 是 GBK 的「测试」
+        assert_eq!(
+            cd("attachment; filename*=gb2312''%B2%E2%CA%D4.zip"),
+            Some("测试.zip".into())
+        );
+        // 声明为 utf-8 的照旧按 UTF-8
+        assert_eq!(
+            cd("attachment; filename*=UTF-8''%E6%B5%8B%E8%AF%95.zip"),
+            Some("测试.zip".into())
+        );
+    }
+
     #[test]
     fn parses_url_filename() {
         assert_eq!(
@@ -383,6 +403,12 @@ mod tests {
         assert_eq!(
             filename_from_url("http://x/%E4%B8%AD.zip"),
             Some("中.zip".into())
+        );
+        // 回归：GBK 百分号编码的 URL 路径不能解成一串 U+FFFD
+        // （%CF%C2%D4%D8 是 GBK 的「下载」）
+        assert_eq!(
+            filename_from_url("http://x/%CF%C2%D4%D8.zip?token=1"),
+            Some("下载.zip".into())
         );
         assert_eq!(filename_from_url("http://x/dir/"), None);
         assert_eq!(filename_from_url("http://x/"), None);

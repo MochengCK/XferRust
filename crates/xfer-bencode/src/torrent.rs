@@ -180,10 +180,15 @@ fn sanitize_segment(seg: &str) -> String {
 
 fn parse_info(v: &Value) -> Result<Info, String> {
     let dict = v.as_dict().ok_or_else(|| "info 必须是字典".to_string())?;
+    // name 由字节按字符集探测解码：老中文种子普遍用 GBK 写 name，
+    // `Value::as_str` 要求合法 UTF-8，会直接判为"info 缺少 name"而整包拒收；
+    // lossy 则会得到一串 U+FFFD。两种都不对，用 xfer-types 的探测解码。
     let name = sanitize_segment(
-        dict.get(b"name.utf-8".as_slice())
+        &dict
+            .get(b"name.utf-8".as_slice())
             .or_else(|| dict.get(b"name".as_slice()))
-            .and_then(Value::as_str)
+            .and_then(Value::as_bytes)
+            .map(xfer_types::text::decode_text)
             .ok_or_else(|| "info 缺少 name".to_string())?,
     );
     let piece_length = dict
@@ -255,7 +260,8 @@ fn parse_info(v: &Value) -> Result<Info, String> {
             let parts: Vec<String> = path_raw
                 .split(|&b| b == 0)
                 .filter(|s| !s.is_empty())
-                .map(|s| sanitize_segment(&String::from_utf8_lossy(s)))
+                // 与 name 同理：路径段可能是 GBK 字节，探测解码而不是 lossy
+                .map(|s| sanitize_segment(&xfer_types::text::decode_text(s)))
                 .collect();
             if parts.is_empty() {
                 return Err("文件条目 path 为空".into());

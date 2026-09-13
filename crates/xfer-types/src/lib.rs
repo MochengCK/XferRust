@@ -2,6 +2,8 @@
 //!
 //! 依赖方向的根：所有 crate 都可以依赖本 crate，本 crate 不依赖任何兄弟 crate。
 
+pub mod text;
+
 /// 引擎版本。与 XferRust 的 Cargo.toml version 保持同步，
 /// RPC 版本查询与 UA/peer-id 前缀派生均以此为唯一源。
 pub const ENGINE_VERSION: &str = "0.3.0";
