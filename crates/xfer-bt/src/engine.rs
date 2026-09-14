@@ -1093,6 +1093,9 @@ pub struct TorrentEngine {
     /// 是否处于做种阶段（下载完成、seed 模式运行中）。
     /// 管理器据此上报"做种中"状态并豁免下载并发槽。
     seeding: AtomicBool,
+    /// 做种时长（秒，0 = 不限时）：`bt-seed-time` 的运行时镜像，
+    /// 可经 [`Self::set_seed_duration`] 热更新（初值来自 config）。
+    seed_duration_secs: AtomicU64,
     /// 由 `selected_files` 推导的所需片位图（None = 全量）。
     /// 元数据就绪 / 文件选择变更时重算。
     wanted: Mutex<Option<PieceMap>>,
@@ -1161,6 +1164,7 @@ impl TorrentEngine {
         let download_limit = config.download_limit;
         let upload_limit = config.upload_limit;
         let selected_files_init = config.selected_files.clone();
+        let seed_duration_init = config.seed_duration;
         let info_hash = meta.info_hash;
         let sched_cfg = scheduler_config(&config);
         let encryption_code = config.encryption.code();
@@ -1214,6 +1218,7 @@ impl TorrentEngine {
             tracker_stats: Mutex::new(Vec::new()),
             selected_files: Mutex::new(selected_files_init),
             seeding: AtomicBool::new(false),
+            seed_duration_secs: AtomicU64::new(seed_duration_init),
             wanted: Mutex::new(None),
         });
         engine.refresh_done_bytes();
@@ -1228,6 +1233,7 @@ impl TorrentEngine {
         let download_limit = config.download_limit;
         let upload_limit = config.upload_limit;
         let selected_files_init = config.selected_files.clone();
+        let seed_duration_init = config.seed_duration;
         let sched_cfg = scheduler_config(&config);
         let encryption_code = config.encryption.code();
         let protocol_code = config.bt_protocol.code();
@@ -1280,6 +1286,7 @@ impl TorrentEngine {
             tracker_stats: Mutex::new(Vec::new()),
             selected_files: Mutex::new(selected_files_init),
             seeding: AtomicBool::new(false),
+            seed_duration_secs: AtomicU64::new(seed_duration_init),
             wanted: Mutex::new(None),
         });
         Ok(engine)
@@ -2786,6 +2793,18 @@ impl TorrentEngine {
         self.upload_limiter.lock().unwrap().set_rate(upload);
     }
 
+    /// 运行时调整做种时长（秒，0 = 不限时）。
+    /// 全局选项 `bt-seed-time` 变更时由 Manager 下发：正在做种的任务
+    /// 以新时长重新计时，下载中的任务完成进入做种时按新时长计时。
+    pub fn set_seed_duration(&self, secs: u64) {
+        self.seed_duration_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// 当前做种时长（秒，0 = 不限时）。
+    pub fn seed_duration(&self) -> u64 {
+        self.seed_duration_secs.load(Ordering::Relaxed)
+    }
+
     /// 当前加密模式（无锁读，拨号/握手热路径用）。
     pub fn encryption(&self) -> EncryptionMode {
         EncryptionMode::from_code(self.encryption_mode.load(Ordering::Relaxed))
@@ -2961,14 +2980,17 @@ impl TorrentEngine {
     }
 
     /// 重新统计 done_bytes（启动/续传后/文件选择变更）。
-    /// 有文件选择时只统计所需片的字节（总量同口径收缩）。
+    /// 有文件选择时只统计所选文件一侧的字节（总量同口径收缩）。
     fn refresh_done_bytes(&self) {
+        // 先取选择再取 store：apply_selection 是「selected_files → store」
+        // 的加锁顺序，此处反向嵌套会与之形成 ABBA 死锁
+        let selected = self.selected_files.lock().unwrap().clone();
         let guard = self.store.lock().unwrap();
         let Some(store) = guard.as_ref() else {
             return;
         };
         let wanted = self.wanted.lock().unwrap().clone();
-        let n = done_bytes_of(store, wanted.as_ref());
+        let n = done_bytes_of(store, wanted.as_ref(), selected.as_deref());
         self.done_bytes.store(n, Ordering::Relaxed);
     }
 
@@ -2981,11 +3003,8 @@ impl TorrentEngine {
     async fn run_seed_mode(self: &Arc<Self>, cancel: &CancellationToken) -> Result<(), String> {
         tracing::info!("进入 seed 模式");
 
-        let seed_duration = if self.config.seed_duration > 0 {
-            Some(Duration::from_secs(self.config.seed_duration))
-        } else {
-            None
-        };
+        // seed 时长（秒，0 = 不限时）每 tick 从原子镜像读取：
+        // `bt-seed-time` 全局选项热更新立即生效（含正在做种的任务）。
         // seed_duration 之前被完全忽略（`let _ = dur;`），任务只能
         // 靠外部 cancel 停止——与文档「seed 模式持续时间（秒，0 = 永久）」不符
         let started_at = Instant::now();
@@ -3036,16 +3055,16 @@ impl TorrentEngine {
                         }
                     }
                     // 检查 seed 超时：到时正常退出（stopped announce 由
-                    // 调用方 stop_background 前后的收尾路径处理）
-                    if let Some(dur) = seed_duration {
-                        if started_at.elapsed() >= dur {
-                            tracing::info!(
-                                secs = self.config.seed_duration,
-                                "seed 时长已到，正常退出做种"
-                            );
-                            self.announce_all_sync(Some("stopped"));
-                            return Ok(());
-                        }
+                    // 调用方 stop_background 前后的收尾路径处理）；
+                    // 时长每 tick 读镜像，bt-seed-time 热更新立即生效
+                    let seed_secs = self.seed_duration_secs.load(Ordering::Relaxed);
+                    if seed_secs > 0 && started_at.elapsed() >= Duration::from_secs(seed_secs) {
+                        tracing::info!(
+                            secs = seed_secs,
+                            "seed 时长已到，正常退出做种"
+                        );
+                        self.announce_all_sync(Some("stopped"));
+                        return Ok(());
                     }
                 }
             }
@@ -5477,6 +5496,9 @@ impl TorrentEngine {
             tracing::warn!(piece = index, "片哈希校验失败，重新下载");
             return false;
         }
+        // 选择先于 store 锁读取：apply_selection 为「selected_files →
+        // store」顺序，反向嵌套会形成 ABBA 死锁
+        let selected = self.selected_files.lock().unwrap().clone();
         let mut guard = self.store.lock().unwrap();
         let store = guard.as_mut().unwrap();
         // 双检去重（淘汰换血后同片被双路下载等竞态，含哈希计算窗口）：
@@ -5492,7 +5514,7 @@ impl TorrentEngine {
                 // 位图/磁盘背离（进度虚报）。
                 let done = {
                     let wanted = self.wanted.lock().unwrap();
-                    done_bytes_of(store, wanted.as_ref())
+                    done_bytes_of(store, wanted.as_ref(), selected.as_deref())
                 };
                 drop(guard);
                 self.done_bytes.store(done, Ordering::Relaxed);
@@ -5730,40 +5752,65 @@ impl TorrentEngine {
     }
 }
 
-/// 从续传控制文件恢复已完成片位图。
-///
-/// 只信任「片的字节区间被磁盘现有长度完全覆盖」的位——
-/// 防御控制文件写入后文件被截断/部分删除的情形。
-/// 成功恢复（至少一片）时应用到 store 并返回 true。
-/// 按位图统计已完成字节（可选按所需片掩码收缩口径）。
+/// 按位图统计已完成字节（可选按所需片掩码与文件选择收缩口径）。
 ///
 /// 进度上报的唯一真相源是 piece 位图（每位置位前必经 SHA-1 校验 +
 /// 落盘）；`done_bytes` 只做位图的缓存镜像，由落盘/续传/选片路径
 /// 用本函数重算。此前用 `fetch_add` 逐片累加的计数器曾观测到与
 /// 位图/磁盘实测背离（进度虚报，见 ANALYSIS_BT_SPEED.md 第六节）。
-fn done_bytes_of(store: &PieceStore, wanted: Option<&PieceMap>) -> u64 {
+///
+/// 口径与 `total_bytes` 严格配对：
+/// - `selected = None`（全量下载）：总量 = 全部文件长度，已完成 = 每个
+///   已完成片的片长之和（非末片恒为 piece_length，末片查布局）；
+/// - `selected = Some`（勾选部分文件）：总量 = 所选文件长度之和，已完成
+///   只累计「已完成片落在所选文件内的段长」——跨选/未选边界的片必须
+///   按段长归属拆分，否则未选文件一侧的字节会混入分子，出现
+///   completedLength > totalLength 的 >100% 进度（曾观测到 100.08%）。
+fn done_bytes_of(
+    store: &PieceStore,
+    wanted: Option<&PieceMap>,
+    selected: Option<&[usize]>,
+) -> u64 {
     let count = store.piece_count();
     if count == 0 {
         return 0;
     }
-    // 非末片长度恒等于 piece_length，只有末片需查布局（避免每片
-    // 重算 total_length 的 O(片数×文件数) 开销）。
-    let piece_length = store.layout().piece_length;
-    let last = count - 1;
-    let mut n = 0u64;
-    for i in 0..count {
-        let wanted_i = wanted.is_none_or(|m| m.is_set(i));
-        if wanted_i && store.have_piece(i) {
-            n += if i == last {
-                store.piece_len(i)
-            } else {
-                piece_length
-            };
+    if selected.is_none() {
+        // 全量快路径：不查文件布局（避免每片重算 total_length 的
+        // O(片数×文件数) 开销）
+        let piece_length = store.layout().piece_length;
+        let last = count - 1;
+        let mut n = 0u64;
+        for i in 0..count {
+            let wanted_i = wanted.is_none_or(|m| m.is_set(i));
+            if wanted_i && store.have_piece(i) {
+                n += if i == last {
+                    store.piece_len(i)
+                } else {
+                    piece_length
+                };
+            }
         }
+        return n;
     }
-    n
+    // 收缩口径：逐片按段长归属统计（O(片数 + 文件数)）
+    let set: HashSet<usize> = selected.unwrap().iter().copied().collect();
+    let per_file = store
+        .layout()
+        .files_done_bytes(|i| wanted.is_none_or(|m| m.is_set(i)) && store.have_piece(i));
+    per_file
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| set.contains(i))
+        .map(|(_, v)| *v)
+        .sum()
 }
 
+/// 从续传控制文件恢复已完成片位图。
+///
+/// 只信任「片的字节区间被磁盘现有长度完全覆盖」的位——
+/// 防御控制文件写入后文件被截断/部分删除的情形。
+/// 成功恢复（至少一片）时应用到 store 并返回 true。
 fn restore_resume(
     ctrl: &Path,
     info_hash: &[u8; 20],

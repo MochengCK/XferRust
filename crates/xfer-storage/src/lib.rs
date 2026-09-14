@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 
-pub use piece::{verify_piece, FileLayout, PieceLayout, PieceMap, PieceStore};
+pub use piece::{
+    files_done_bytes, verify_piece, FileLayout, PieceLayout, PieceMap, PieceStore,
+};
 
 /// 已存在文件的字节数；文件不存在返回 0。
 pub fn existing_len(path: &Path) -> u64 {

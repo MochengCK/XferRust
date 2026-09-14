@@ -958,5 +958,55 @@ async fn change_option_select_file_applies_and_reports() {
         "未选文件不应被创建"
     );
 
+    // 回归（进度口径）：每文件 completedLength 必须按「已完成片归属到文件」
+    // 的真实段长上报，而不是「文件长度 × 任务总进度 / 全部文件总长」估算。
+    // 估算把跨选/未选边界片的未选一侧也算进去，表现为未勾选下载的文件
+    // 也显示进度（用户实测 80% / 11.4MB）、任务进度超过 100%（100.08%）。
+    let st = mgr.tell_status_native(&gid, None).unwrap();
+    let files = st["files"].as_array().cloned().unwrap();
+    assert_eq!(files.len(), 3);
+    assert_eq!(
+        files[0]["completedLength"],
+        serde_json::json!(0),
+        "未选文件不得虚报已完成字节: {files:?}"
+    );
+    assert_eq!(
+        files[2]["completedLength"],
+        serde_json::json!(0),
+        "未选文件不得虚报已完成字节: {files:?}"
+    );
+    // 选中文件 b.bin（其末字节与 c.bin 同处一片）：只计落在 b.bin 内的段长
+    assert_eq!(files[1]["completedLength"], serde_json::json!(L1 as u64));
+    // 任务级口径与文件级同源：所选文件长度之和为总量，完成后恰好 100%
+    assert_eq!(
+        st["totalLength"].as_u64().unwrap(),
+        L1 as u64,
+        "总量应为所选文件长度之和"
+    );
+    assert_eq!(
+        st["completedLength"].as_u64().unwrap(),
+        L1 as u64,
+        "完成任务必须恰好 100%，不得因边界片整片计入而超过总量"
+    );
+    // 需下载片位图：片 1（全在 b.bin）+ 片 2（跨 b/c，需下载）为 1，
+    // 只属于未选文件的片 0 / 片 3 为 0 → 0b0110 = 0x60。
+    // 界面据此把「未选择，无需下载」的片与「未下载」区分开。
+    assert_eq!(
+        st["wantedBitfield"],
+        serde_json::json!("60"),
+        "需下载片位图应与文件选择一致: {st:?}"
+    );
+    // aria2 兼容编码（数值以字符串承载）同源
+    let st_c = mgr.tell_status(&gid, None).unwrap();
+    assert_eq!(
+        st_c["files"][1]["completedLength"],
+        serde_json::json!(L1.to_string())
+    );
+    assert_eq!(
+        st_c["files"][0]["completedLength"],
+        serde_json::json!("0")
+    );
+    assert_eq!(st_c["wantedBitfield"], serde_json::json!("60"));
+
     let _ = std::fs::remove_dir_all(&dir);
 }

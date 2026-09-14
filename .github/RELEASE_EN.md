@@ -4,8 +4,8 @@
 - UDP hole punching (`ut_holepunch`) aligned with the libtorrent standard — relays through double NATs with standard clients such as qBittorrent
 - HTTP piece bitmaps, global & per-task rate limiting, per-task average speed, command-line option passthrough
 - File selection (`select-file`) works end-to-end; `.torrent` additions support the `bt-file-selection` flow
-- Piece tri-state display (`partialBitfield`) with session persistence; BT peer IP banning; tracker announce state
-- `task.getPeers` gains per-peer dial / transport stats and a banned group display
+- Piece display upgrades: persisted tri-state bitmap (`partialBitfield`), wanted-piece bitmap `wantedBitfield`, seed duration `bt-seed-time` that stops seeding automatically when reached; BT peer IP banning and `task.getPeers` per-peer stats / banned group
+- Fixed phantom progress on unselected files and task progress above 100%: per-file and task progress now share one piece-segment accounting
 - Fixed magnet/torrent tasks skipping "awaiting file selection" and downloading directly, garbled Chinese task names, inaccurate average speed
 - All non-terminal tasks are restored as paused after restart; per-task rate limits now override the global one
 
@@ -96,6 +96,17 @@
 - New banned group: bans are recorded per IP (`addr` holds only the address, `port` empty) and report `remainingSecs` (0 = permanent), `source` and `banReason` (`manual` = banned by hand / `ban_list` = pushed via the ban list); one `getPeers` call returns all four groups — connected / attempting / disconnected / banned
 - Ban entries distinguish their origin: `task.banPeer` is recorded as manual, `bt-ip-ban-list` pushes as list entries; persisted across sessions, with legacy session files defaulting to list entries
 
+### BT Seed Duration (bt-seed-time)
+
+- New global option `bt-seed-time` (minutes, 0 = unlimited): seeding stops automatically and the task turns complete once the duration is reached — a second seeding exit condition alongside `bt-seed-ratio`
+- Changes are pushed hot to all active BT engines: seeding tasks re-evaluate against the new duration (the seeding start time is unchanged), and tasks finishing download later pick it up when they enter seeding; persisted with the session
+
+### Wanted-Piece Bitmap (wantedBitfield)
+
+- Task status responses gain `wantedBitfield` (aria2-compatible hex encoding, same format as `bitfield`): for BT tasks with a partial file selection it reports the pieces that must be downloaded; it is an empty string for full / no selection
+- Pieces belonging only to unselected files are never set (the engine neither requests nor writes them), so the UI can tell "not selected, not needed" apart from "not downloaded" — previously a completed task still showed a few grey cells at the end that looked like missing pieces
+- Pieces spanning a selected/unselected boundary still count as wanted (pieces cannot be split; the whole piece is downloaded while the unselected side is not written)
+
 ### Charset-Aware Text Decoding (xfer-types::text)
 
 - New text decoding module: explicit charset → strict UTF-8 → GB18030 → lossy, used uniformly by magnet / .torrent / HTTP parsing
@@ -103,6 +114,8 @@
 
 ## Bug Fixes
 
+- Fix misreported per-file progress on BT tasks: `files[].completedLength` used to be estimated as "file length × overall progress / total length of all files", so a file the user never selected still showed progress (observed as 80% / 11.4 MB). It is now accounted per piece boundary segment — each file only accumulates the bytes of completed pieces that fall inside it, unselected files stay at 0, and the per-file values sum up consistently with the task progress
+- Fix task progress exceeding 100% (observed as 100.08%): with a partial file selection the total shrinks to the selected files' length while completed bytes were summed as whole piece lengths of wanted pieces, pulling the unselected side of boundary pieces into the numerator. Bytes are now attributed per segment, so `completedLength` never exceeds `totalLength` and a finished task reads exactly 100%
 - Fix magnet/.torrent tasks skipping "awaiting file selection" and downloading directly: `task.add` previously passed through only `dir` / `out` / `checksum`, silently dropping task-level options such as `bt-file-selection` / `select-file`; all options except reserved protocol keys are now passed through, so the auto-pause-awaiting-selection flow works again
 - Fix inaccurate task average speed: the formula `bytes/(ms/1000)` inflated the average when active time was under 2 seconds due to integer truncation (nearly 2x error at ms=1999, inflated early readings); it now computes `bytes*1000/ms`. Speed sampling also starts at the moment the task starts, so the first 1 Hz tick's bytes count toward the average (previously dropped, systematically underreporting short tasks)
 - Fix the "awaiting file selection" state appearing late after magnet metadata is ready: the metadata-fetch loop's tracker announce (which can block up to a 15s timeout) and its 1-second polling were not cancellation-aware, deferring the pause intent until the round finished; cancellation is now handled first and the pause takes effect immediately

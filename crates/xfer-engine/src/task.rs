@@ -1,6 +1,6 @@
 //! 任务实体：共享状态、控制信号与状态序列化。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -8,9 +8,9 @@ use std::time::{Instant, SystemTime};
 
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
-use xfer_bencode::TorrentMeta;
+use xfer_bencode::{Info, TorrentMeta};
 use xfer_bt::PeerInfo;
-use xfer_storage::HashAlgo;
+use xfer_storage::{files_done_bytes, HashAlgo};
 use xfer_types::Gid;
 use crate::manager::parse_size_bytes;
 
@@ -635,6 +635,110 @@ fn bitfield_hex(bytes: &[u8]) -> String {
     s
 }
 
+/// wire 位图第 i 位（BEP 3：字节内高位在前）。
+fn bitfield_bit(bytes: &[u8], i: u32) -> bool {
+    match bytes.get((i / 8) as usize) {
+        Some(b) => b & (0x80 >> (i % 8)) != 0,
+        None => false,
+    }
+}
+
+/// 每文件已完成字节（BT 任务，对应文件表「进度」列的 completedLength）。
+///
+/// 逐片按位图累加「已完成片落在该文件内的段长」：跨文件边界的片必须按
+/// 段长归属拆分到两侧文件；未选中的文件恒为 0 —— 边界片在未选一侧既不
+/// 下发也不落盘（[`xfer_storage::PieceStore`] 写入时跳过缺席句柄）。
+///
+/// 曾用「文件长度 × 总进度 / 全部文件总长」估算，导致两个可见错误：
+/// 未勾选下载的文件也显示进度（如 80% / 11.4 MB），以及各文件之和与
+/// 任务进度对不上。逐片归属后文件之和 = 已完成片覆盖字节，口径自洽。
+///
+/// `complete` 仅在位图缺失（旧会话）时用于兜底：无片数据时不得再退回
+/// 比例估算，只能按任务是否完整决定「整文件完成」或 0。
+fn bt_files_done_bytes(
+    info: &Info,
+    bitfield: &[u8],
+    sel: Option<&[usize]>,
+    complete: bool,
+) -> Vec<u64> {
+    // 位图缺失（旧会话无 btBitfield 字段 / 引擎未运行）：若任务已完整，
+    // 按「选中的文件整文件已完成」兜底；否则只能报 0（无片数据无法细分，
+    // 不能凭空按比例估算——那正是本次修复前的错误行为）
+    if bitfield.is_empty() {
+        if !complete {
+            return vec![0; info.files.len()];
+        }
+        return info
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let selected = sel.is_none_or(|s| s.contains(&i));
+                if selected {
+                    f.length
+                } else {
+                    0
+                }
+            })
+            .collect();
+    }
+    let mut bounds: Vec<(u64, u64)> = Vec::with_capacity(info.files.len());
+    let mut offset = 0u64;
+    for f in &info.files {
+        bounds.push((offset, f.length));
+        offset += f.length;
+    }
+    let mut done = files_done_bytes(info.piece_length, info.total_length(), &bounds, |i| {
+        bitfield_bit(bitfield, i)
+    });
+    if let Some(sel) = sel {
+        let set: HashSet<usize> = sel.iter().copied().collect();
+        for (i, v) in done.iter_mut().enumerate() {
+            if !set.contains(&i) {
+                *v = 0;
+            }
+        }
+    }
+    done
+}
+
+/// 需下载片位图（wire 位图字节；全选/无选择返回空）。
+///
+/// 勾选部分文件时，跨选/未选边界的片仍需下载（片不可拆分），这类片在
+/// 位图中为「需要」；只属于未选文件的片为「不需要」，永远不会置位。
+/// 界面据此把「未选择，无需下载」的片与「未下载」区分开——否则任务
+/// 已 100% 完成时，末尾仍会残留几格灰色分片，看起来像没下完。
+fn wanted_bitfield(info: &Info, sel: Option<&[usize]>) -> Vec<u8> {
+    let Some(sel) = sel else {
+        return Vec::new();
+    };
+    let count = info.piece_count();
+    if count == 0 || info.piece_length == 0 {
+        return Vec::new();
+    }
+    let set: HashSet<usize> = sel.iter().copied().collect();
+    let mut needed = vec![false; count as usize];
+    let mut offset = 0u64;
+    for (fi, f) in info.files.iter().enumerate() {
+        if f.length > 0 && set.contains(&fi) {
+            // 文件覆盖的片区间（首片/末片可能与其他文件共享）
+            let first = offset / info.piece_length;
+            let last = (offset + f.length - 1) / info.piece_length;
+            for i in first..=last.min(count as u64 - 1) {
+                needed[i as usize] = true;
+            }
+        }
+        offset += f.length;
+    }
+    let mut bf = vec![0u8; (count as usize).div_ceil(8)];
+    for (i, want) in needed.iter().enumerate() {
+        if *want {
+            bf[i / 8] |= 0x80 >> (i % 8);
+        }
+    }
+    bf
+}
+
 /// 计算 BT 任务的 info_hash 十六进制表示（None = 非 BT 任务）。
 /// .torrent 任务 bt_info_hash 不落盘，回退取 bt_meta 解析时计算的哈希。
 fn info_hash_hex(task: &Task) -> Option<String> {    if let Some(h) = &*task.bt_info_hash.lock().unwrap() {
@@ -691,23 +795,21 @@ pub fn status_json(task: &Task) -> Value {
         Some(v) => v.contains(&i),
     };
     let files = if let Some(meta) = &*task.bt_meta.lock().unwrap() {
-        let total_done = s.completed;
+        // 每文件已完成字节由 piece 位图推导（未选文件恒 0），
+        // 不再按「文件占比 × 总进度」估算
+        let bitfield = task.bt_bitfield.lock().unwrap().clone();
+        let complete = s.total_len.is_some_and(|t| t > 0 && s.completed >= t);
+        let per_file = bt_files_done_bytes(&meta.info, &bitfield, sel.as_deref(), complete);
         meta.info
             .files
             .iter()
             .enumerate()
             .map(|(i, f)| {
-                // M2 不细分文件进度：completedLength 估算按字节占比
-                let frac = if meta.info.total_length() == 0 {
-                    0
-                } else {
-                    f.length as u128 * total_done as u128 / meta.info.total_length() as u128
-                };
                 json!({
                     "index": (i + 1).to_string(),
                     "path": format!("{}/{}", meta.info.name, f.path.join("/")),
                     "length": f.length.to_string(),
-                    "completedLength": frac.to_string(),
+                    "completedLength": per_file.get(i).copied().unwrap_or(0).to_string(),
                     "selected": is_selected(i).to_string(),
                     "uris": [],
                 })
@@ -734,7 +836,9 @@ pub fn status_json(task: &Task) -> Value {
     // 分片信息：BT 来自元信息；HTTP 来自分片跟踪（写线程按落盘区间
     // 增量维护），未知总长或不支持 Range 时为空。
     // partial_bitfield：HTTP 分片部分下载位图（BT 任务为空）。
-    let (num_pieces, piece_length, status_bitfield, partial_bitfield) = {
+    // wanted_bitfield：BT 需下载片位图（全选/无选择为空）——界面据此把
+    // 「未选择，无需下载」的片与「未下载」区分开。
+    let (num_pieces, piece_length, status_bitfield, partial_bitfield, wanted_bitfield) = {
         let meta = task.bt_meta.lock().unwrap();
         if let Some(m) = &*meta {
             (
@@ -742,11 +846,18 @@ pub fn status_json(task: &Task) -> Value {
                 m.info.piece_length,
                 task.bt_bitfield.lock().unwrap().clone(),
                 Vec::new(),
+                wanted_bitfield(&m.info, sel.as_deref()),
             )
         } else {
             match task.http_pieces.read().unwrap().as_ref() {
-                Some(p) => (p.num_pieces() as u64, p.piece_len(), p.bitfield(), p.partial_bitfield()),
-                None => (0, 0, Vec::new(), Vec::new()),
+                Some(p) => (
+                    p.num_pieces() as u64,
+                    p.piece_len(),
+                    p.bitfield(),
+                    p.partial_bitfield(),
+                    Vec::new(),
+                ),
+                None => (0, 0, Vec::new(), Vec::new(), Vec::new()),
             }
         }
     };
@@ -778,6 +889,11 @@ pub fn status_json(task: &Task) -> Value {
     );
     m.insert("bitfield".into(), json!(bitfield_hex(&status_bitfield)));
     m.insert("partialBitfield".into(), json!(bitfield_hex(&partial_bitfield)));
+    // 需下载片位图（未选择文件覆盖的片为 0；全选时为空串）
+    m.insert(
+        "wantedBitfield".into(),
+        json!(bitfield_hex(&wanted_bitfield)),
+    );
     m.insert("connections".into(), json!(s.connections.to_string()));
     m.insert("errorCode".into(), json!(s.error_code.to_string()));
     m.insert("errorMessage".into(), json!(s.error_message));
@@ -818,23 +934,21 @@ pub fn status_json_native(task: &Task) -> Value {
         Some(v) => v.contains(&i),
     };
     let files = if let Some(meta) = &*task.bt_meta.lock().unwrap() {
-        let total_done = s.completed;
+        // 每文件已完成字节由 piece 位图推导（未选文件恒 0），
+        // 不再按「文件占比 × 总进度」估算
+        let bitfield = task.bt_bitfield.lock().unwrap().clone();
+        let complete = s.total_len.is_some_and(|t| t > 0 && s.completed >= t);
+        let per_file = bt_files_done_bytes(&meta.info, &bitfield, sel.as_deref(), complete);
         meta.info
             .files
             .iter()
             .enumerate()
             .map(|(i, f)| {
-                let frac = if meta.info.total_length() == 0 {
-                    0
-                } else {
-                    (f.length as u128 * total_done as u128 / meta.info.total_length() as u128)
-                        as u64
-                };
                 json!({
                     "index": i + 1,
                     "path": format!("{}/{}", meta.info.name, f.path.join("/")),
                     "length": f.length,
-                    "completedLength": frac,
+                    "completedLength": per_file.get(i).copied().unwrap_or(0),
                     "selected": is_selected(i),
                     "uris": [],
                 })
@@ -861,7 +975,9 @@ pub fn status_json_native(task: &Task) -> Value {
     // 分片信息：BT 来自元信息；HTTP 来自分片跟踪（写线程按落盘区间
     // 增量维护），未知总长或不支持 Range 时为空。
     // partial_bitfield：HTTP 分片部分下载位图（BT 任务为空）。
-    let (num_pieces, piece_length, status_bitfield, partial_bitfield) = {
+    // wanted_bitfield：BT 需下载片位图（全选/无选择为空）——界面据此把
+    // 「未选择，无需下载」的片与「未下载」区分开。
+    let (num_pieces, piece_length, status_bitfield, partial_bitfield, wanted_bitfield) = {
         let meta = task.bt_meta.lock().unwrap();
         if let Some(m) = &*meta {
             (
@@ -869,11 +985,18 @@ pub fn status_json_native(task: &Task) -> Value {
                 m.info.piece_length,
                 task.bt_bitfield.lock().unwrap().clone(),
                 Vec::new(),
+                wanted_bitfield(&m.info, sel.as_deref()),
             )
         } else {
             match task.http_pieces.read().unwrap().as_ref() {
-                Some(p) => (p.num_pieces() as u64, p.piece_len(), p.bitfield(), p.partial_bitfield()),
-                None => (0, 0, Vec::new(), Vec::new()),
+                Some(p) => (
+                    p.num_pieces() as u64,
+                    p.piece_len(),
+                    p.bitfield(),
+                    p.partial_bitfield(),
+                    Vec::new(),
+                ),
+                None => (0, 0, Vec::new(), Vec::new(), Vec::new()),
             }
         }
     };
@@ -901,6 +1024,8 @@ pub fn status_json_native(task: &Task) -> Value {
         "averageSpeed": average_speed_of(task),
         "bitfield": bitfield_hex(&status_bitfield),
         "partialBitfield": bitfield_hex(&partial_bitfield),
+        // 需下载片位图（未选择文件覆盖的片为 0；全选时为空串）
+        "wantedBitfield": bitfield_hex(&wanted_bitfield),
         "connections": s.connections,
         "errorCode": s.error_code,
         "errorMessage": s.error_message,
@@ -923,4 +1048,102 @@ pub fn status_json_native(task: &Task) -> Value {
         "infoHash": hash,
         "bittorrent": bittorrent_json(task, hash.as_deref()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xfer_bencode::FileEntry;
+
+    /// 构造测试用 info：片长 10，文件长度按参数（片哈希用占位，仅几何参与计算）。
+    fn info_of(lengths: &[u64]) -> Info {
+        let files: Vec<FileEntry> = lengths
+            .iter()
+            .enumerate()
+            .map(|(i, len)| FileEntry {
+                path: vec![format!("f{i}.bin")],
+                length: *len,
+            })
+            .collect();
+        let total: u64 = lengths.iter().sum();
+        let count = total.div_ceil(10) as usize;
+        Info {
+            name: "t".into(),
+            piece_length: 10,
+            pieces: vec![[0u8; 20]; count],
+            files,
+            private: false,
+        }
+    }
+
+    fn bits_from(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn files_done_bytes_attributes_per_piece_segment() {
+        // 文件 15 / 10 / 5，片长 10：片 1 跨 0-1，片 2 跨 1-2
+        let info = info_of(&[15, 10, 5]);
+        // 位图 0b111xxxxx → 三片全完成
+        let bf = bits_from("e0");
+        assert_eq!(
+            bt_files_done_bytes(&info, &bf, None, false),
+            vec![15, 10, 5]
+        );
+        // 只完成片 0（0x80）：未选文件的字节不得因「整体有进度」被估算出来
+        let bf0 = bits_from("80");
+        assert_eq!(bt_files_done_bytes(&info, &bf0, None, false), vec![10, 0, 0]);
+        // 只完成片 1（0x40，跨文件 0/1）：两侧各计自己那 5 字节
+        let bf1 = bits_from("40");
+        assert_eq!(bt_files_done_bytes(&info, &bf1, None, false), vec![5, 5, 0]);
+    }
+
+    #[test]
+    fn files_done_bytes_zeroes_unselected_files() {
+        let info = info_of(&[15, 10, 5]);
+        let all_done = bits_from("e0");
+        // 只勾选文件 1：文件 0/2 恒为 0，文件 1 为自身长度
+        let per_file = bt_files_done_bytes(&info, &all_done, Some(&[1]), false);
+        assert_eq!(per_file, vec![0, 10, 0]);
+        assert_eq!(per_file.iter().sum::<u64>(), 10);
+    }
+
+    #[test]
+    fn files_done_bytes_without_bitfield_falls_back_to_complete_flag() {
+        let info = info_of(&[15, 10, 5]);
+        // 位图缺失（旧会话）+ 任务已完成 → 选中的文件按整文件完成，未选为 0；
+        // 绝不能退回「按比例估算」
+        assert_eq!(
+            bt_files_done_bytes(&info, &[], Some(&[1]), true),
+            vec![0, 10, 0]
+        );
+        // 位图缺失且任务未完成 → 全部 0（无片数据无法细分）
+        assert_eq!(
+            bt_files_done_bytes(&info, &[], Some(&[1]), false),
+            vec![0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn wanted_bitfield_marks_pieces_of_selected_files() {
+        let info = info_of(&[15, 10, 5]);
+        // 全选 / 无选择：空串（界面不区分「未选择」）
+        assert!(wanted_bitfield(&info, None).is_empty());
+        // 只勾选文件 1（片 1 全在其中、片 2 跨文件 1/2）→ 0b011xxxxx
+        assert_eq!(bitfield_hex(&wanted_bitfield(&info, Some(&[1]))), "60");
+        // 只勾选文件 0（片 0 全在其中、片 1 跨文件 0/1）→ 0b110xxxxx
+        assert_eq!(bitfield_hex(&wanted_bitfield(&info, Some(&[0]))), "c0");
+        // 勾选全部文件 = 全 1 位图（与 bitfield 全满一致）
+        assert_eq!(bitfield_hex(&wanted_bitfield(&info, Some(&[0, 1, 2]))), "e0");
+    }
+
+    #[test]
+    fn wanted_bitfield_empty_for_zero_length_file() {
+        // 长度为 0 的文件不覆盖任何片：只勾选它时无片需要下载
+        let info = info_of(&[10, 0, 10]);
+        assert_eq!(bitfield_hex(&wanted_bitfield(&info, Some(&[1]))), "00");
+    }
 }

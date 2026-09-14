@@ -214,6 +214,60 @@ impl PieceLayout {
             }
         }
     }
+
+    /// 每文件已完成字节（与 [`files_done_bytes`] 同源，取值 ≤ 各文件长度）。
+    pub fn files_done_bytes(&self, have: impl Fn(u32) -> bool) -> Vec<u64> {
+        let bounds: Vec<(u64, u64)> = self.files.iter().map(|f| (f.offset, f.length)).collect();
+        files_done_bytes(self.piece_length, self.total_length(), &bounds, have)
+    }
+}
+
+/// 每文件「已完成字节」：逐片查位图，累加已完成片落在各文件内的段长。
+///
+/// `file_bounds` 为 (全局起始偏移, 长度) 且按偏移升序（与 [`PieceLayout`]
+/// 同源）；`have(i)` 判定第 i 片是否已校验完成。返回与 `file_bounds`
+/// 等长的向量，第 i 项 = 文件 i 内已被已完成片覆盖的字节数（≤ 文件长度）。
+///
+/// 为什么不用「文件长度 × 总进度 / 总长度」估算（曾如此，导致两个口径
+/// 问题）：估算与片的实际归属无关，跨文件边界的片会同时被两侧文件计入，
+/// 于是未选中的文件也会显示进度、任务级 completedLength 会超过
+/// totalLength（进度 >100%）。逐片按段长归属统计则严格守恒：
+/// 所有文件之和 = 已完成片覆盖的字节数，选中文件之和 ≤ selected_length。
+pub fn files_done_bytes(
+    piece_length: u64,
+    total_length: u64,
+    file_bounds: &[(u64, u64)],
+    have: impl Fn(u32) -> bool,
+) -> Vec<u64> {
+    let mut out = vec![0u64; file_bounds.len()];
+    if piece_length == 0 || total_length == 0 || file_bounds.is_empty() {
+        return out;
+    }
+    let count = total_length.div_ceil(piece_length);
+    // 片与文件都按偏移升序，用单调游标把复杂度控制在 O(片数 + 文件数)
+    // （大种子下 O(片数 × 文件数) 的逐片重扫会拖慢 1Hz 状态上报）。
+    let mut fi = 0usize;
+    for i in 0..count {
+        if !have(i as u32) {
+            continue;
+        }
+        let p_start = i * piece_length;
+        let p_end = (p_start + piece_length).min(total_length);
+        while fi < file_bounds.len() && file_bounds[fi].0 + file_bounds[fi].1 <= p_start {
+            fi += 1;
+        }
+        let mut j = fi;
+        while j < file_bounds.len() && file_bounds[j].0 < p_end {
+            let (f_start, f_len) = file_bounds[j];
+            let seg_start = p_start.max(f_start);
+            let seg_end = p_end.min(f_start + f_len);
+            if seg_end > seg_start {
+                out[j] += seg_end - seg_start;
+            }
+            j += 1;
+        }
+    }
+    out
 }
 
 /// piece 存储：按需打开文件句柄，支持随机读写。
@@ -550,6 +604,56 @@ mod tests {
         let m2 = l.wanted_piece_mask(Some(&[7])).unwrap();
         assert_eq!(m2.done_count(), 0);
         assert_eq!(l.selected_length(Some(&[7])), 0);
+    }
+
+    #[test]
+    fn files_done_bytes_attributes_boundary_pieces_per_file() {
+        // 布局：a.bin 15 / b.bin 10 / c.bin 5，片长 10（片 1 跨 a/b，片 2 跨 b/c）
+        let l = layout3();
+        let all = |_i: u32| true;
+
+        // 全部完成：每文件恰好等于自身长度，总和 = 总长（口径守恒）
+        let done = l.files_done_bytes(all);
+        assert_eq!(done, vec![15, 10, 5]);
+        assert_eq!(done.iter().sum::<u64>(), l.total_length());
+
+        // 只有片 0（0..10 全在 a.bin）：b/c 不得因为"整体有进度"而被估算出字节
+        let only0 = |i: u32| i == 0;
+        assert_eq!(l.files_done_bytes(only0), vec![10, 0, 0]);
+
+        // 只有片 1（跨 a 尾 5 + b 头 5）：两侧各计自己那 5 字节
+        let only1 = |i: u32| i == 1;
+        assert_eq!(l.files_done_bytes(only1), vec![5, 5, 0]);
+
+        // 只有片 2（跨 b 尾 5 + c 全 5）
+        let only2 = |i: u32| i == 2;
+        assert_eq!(l.files_done_bytes(only2), vec![0, 5, 5]);
+
+        // 未完成的片不计（含跨边界片未完成时两侧都是 0）
+        let none = |_i: u32| false;
+        assert_eq!(l.files_done_bytes(none), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn files_done_bytes_never_exceeds_file_length() {
+        // 单个 5 字节文件、片长 4：末片只剩 1 字节，全完成时不得按片长虚报
+        let l = PieceLayout::new(4, vec![(vec!["only.bin".into()], 5)]);
+        let done = l.files_done_bytes(|_| true);
+        assert_eq!(done, vec![5]);
+    }
+
+    #[test]
+    fn files_done_bytes_zero_length_file_stays_zero() {
+        let l = PieceLayout::new(
+            10,
+            vec![
+                (vec!["a.bin".into()], 10),
+                (vec!["empty.bin".into()], 0),
+                (vec!["b.bin".into()], 10),
+            ],
+        );
+        let done = l.files_done_bytes(|_| true);
+        assert_eq!(done, vec![10, 0, 10]);
     }
 
     #[test]

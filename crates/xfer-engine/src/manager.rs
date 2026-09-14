@@ -1613,6 +1613,18 @@ impl TaskManager {
         (seed_mode, seed_ratio)
     }
 
+    /// BT 做种时长（全局选项 `bt-seed-time`，分钟；0 = 不限时）。
+    /// 到时后任务由引擎自动停止做种转为完成。
+    fn bt_seed_time_minutes(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .global_options
+            .get("bt-seed-time")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
     /// BT/DHT 监听端口（全局选项 `bt-listen-port` / `dht-listen-port`；
     /// 0 = 系统分配）。端口被占时引擎侧自动回退临时端口。
     fn bt_listen_ports(&self) -> (u16, u16) {
@@ -1693,6 +1705,7 @@ impl TaskManager {
         let mut inner = self.inner.lock().unwrap();
         let mut rate_changed = false;
         let mut bt_modes_changed = false;
+        let mut seed_time_changed = false;
         // bt-trackers：全量替换语义（应用端每次推送完整列表），
         // 原始值可能是数组或换行/逗号分隔的字符串，需在字符串化前处理
         let mut tracker_replace: Option<Vec<String>> = None;
@@ -1809,10 +1822,18 @@ impl TaskManager {
                     | "bt-adaptive"
                     | "bt-seed-mode"
                     | "bt-seed-ratio"
+                    | "bt-seed-time"
                     | "bt-enable-lpd"
                     | "bt-port-mapping"
             ) {
                 // HTTP 分片参数 / BT 连接参数 / BT 做种配置：存储后在下载时生效
+                if k == "bt-seed-time" && v.trim().parse::<u64>().is_err() {
+                    tracing::warn!(value = %v, "bt-seed-time 取值无效（应为分钟数），已忽略该键");
+                    continue;
+                }
+                if k == "bt-seed-time" {
+                    seed_time_changed = true;
+                }
             } else {
                 tracing::debug!(option = %k, "全局选项暂未支持，已忽略");
             }
@@ -1905,9 +1926,21 @@ impl TaskManager {
         if bt_modes_changed {
             self.apply_bt_modes()?;
         }
+        if seed_time_changed {
+            self.apply_seed_time();
+        }
         self.kick();
         self.save_session_now();
         Ok(())
+    }
+
+    /// 把当前全局 `bt-seed-time`（分钟）热下发到所有活动 BT 引擎，
+    /// 使已处于做种 / 即将完成下载的任务也按新时长计时。
+    fn apply_seed_time(&self) {
+        let secs = self.bt_seed_time_minutes().saturating_mul(60);
+        for engine in self.bt_engines.lock().unwrap().values() {
+            engine.set_seed_duration(secs);
+        }
     }
 
     /// 读取全局限速配置（下载/上传，bytes/s，0 = 不限制；缺失 = 0）。
@@ -3513,8 +3546,10 @@ async fn drive_bt_download(
         selected_files = Some(Vec::new());
     }
     // BT 做种配置：全局选项 bt-seed-mode（默认 false = 完成即结束），
-    // bt-seed-ratio（分享率上限，0 = 不限/持续做种到手动停止）。
+    // bt-seed-ratio（分享率上限，0 = 不限/持续做种到手动停止），
+    // bt-seed-time（做种时长，分钟，0 = 不限时；到时自动停止做种）。
     let (seed_mode, seed_ratio) = _mgr.bt_seed_config();
+    let seed_duration = _mgr.bt_seed_time_minutes().saturating_mul(60);
     // BT/DHT 监听端口（0 = 系统分配）与发现开关（LSD/端口映射默认开）
     let (listen_port, dht_port) = _mgr.bt_listen_ports();
     let (enable_lpd, enable_port_mapping) = _mgr.bt_discovery_flags();
@@ -3537,7 +3572,7 @@ async fn drive_bt_download(
         download_limit: dl_limit,
         upload_limit: ul_limit,
         seed_mode,
-        seed_duration: 0,
+        seed_duration,
         seed_ratio,
         // 磁力解析后用户勾选的文件（None = 全部；等待勾选时为 Some(空) 占位）
         selected_files,
@@ -4144,6 +4179,37 @@ mod tests {
     fn normalize_dir_resolves_relative_to_cwd() {
         let expected = std::env::current_dir().unwrap().join("rel/dir");
         assert_eq!(normalize_dir("rel/dir"), expected);
+    }
+
+    #[tokio::test]
+    async fn bt_seed_time_option_stored_and_readable() {
+        let dir = std::env::temp_dir().join(format!("xfer-seedtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = TaskManager::start(dir.clone(), 1);
+
+        // 默认 0（不限时）
+        assert_eq!(mgr.bt_seed_time_minutes(), 0);
+
+        // 合法值：存储并可读取（分钟）
+        mgr.change_global_option(&serde_json::json!({"bt-seed-time": 120}))
+            .expect("bt-seed-time 合法值应被接受");
+        assert_eq!(mgr.bt_seed_time_minutes(), 120);
+        assert_eq!(
+            mgr.get_global_option()["bt-seed-time"],
+            serde_json::json!("120")
+        );
+
+        // 非法值：告警跳过，不中断整批、不覆盖旧值
+        mgr.change_global_option(&serde_json::json!({"bt-seed-time": "abc", "bt-seed-mode": true}))
+            .expect("非法值应跳过该键而不失败");
+        assert_eq!(mgr.bt_seed_time_minutes(), 120);
+        assert_eq!(
+            mgr.get_global_option()["bt-seed-mode"],
+            serde_json::json!("true")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
