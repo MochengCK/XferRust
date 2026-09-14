@@ -2148,9 +2148,14 @@ mod tests {
         let len = 16 * 1024 * 1024 + 12345usize;
         let tail_begin = (len - 2 * 1024 * 1024) as u64;
         let data = Arc::new(sample(len));
+        // 2ms/8KB 块的确定性延迟：本地回环太快时，「观察到 >3/4」与
+        // cancel 落地之间的窗口（10ms 轮询 + 派发）足以让剩余 25% 在
+        // 无延迟服务器上直接下完 → 取消落在完成后返回 Ok 而非
+        // Err(Cancelled)（CI 曾因此假失败）。2ms/块下剩余 25% 至少
+        // 需要 ~170ms，取消必然先于完成。
         let srv = start_server_ex(
             data.clone(),
-            Duration::ZERO,
+            Duration::from_millis(2),
             None,
             1,
             false,
@@ -2176,9 +2181,10 @@ mod tests {
             }
         });
         let mut done_any = false;
-        // 30s 上限：并行跑测试套件时机器负载高，10s 会偶发误报
-        for _ in 0..600 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        // 10ms 轮询压缩「观察→取消」的未观察窗口；30s 上限兜底：
+        // 并行跑测试套件时机器负载高，短上限会偶发误报
+        for _ in 0..3000 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
             if stats.completed.load(Ordering::Relaxed) > len as u64 * 3 / 4 {
                 done_any = true;
                 break;
