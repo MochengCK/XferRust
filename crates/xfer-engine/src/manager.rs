@@ -3366,9 +3366,16 @@ fn read_session_file(path: &std::path::Path) -> Option<Value> {
 /// 不与下载落盘热路径争抢任务锁。
 async fn speed_ticker(task: Arc<Task>, events: broadcast::Sender<EngineEvent>) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
-    // 滑动窗口：每秒记录一次 (completed, uploaded) 累计快照，
+    // 滑动窗口：每秒记录一次 (received, uploaded) 累计快照，
     // 速度 = (最新 - 窗口最早样本) / 跨越秒数。窗口 3 个样本
     // （跨度 2-3s）；样本数未满窗口时按实际跨度折算。
+    // 速度采样用**接收字节**（received_live）：BT 按片落盘（256KiB 粒度），
+    // 低速率下某秒可能 0 片完成 → 按完成字节采样会把窗口污染成 0
+    // （peer 明明在几百 KB/s 传输，任务速度却显示 0/只在 MB 级可见）。
+    // HTTP 任务 received_atomic 未上报时按 0 处理——但 HTTP 的
+    // completed_atomic 由 split sampler 字节级实时刷新，走 completed
+    // 回退路径（见下方取值逻辑），不受影响。
+    // 平均速度（avg_bytes）仍按完成字节累计：其语义是「落盘完成量/时长」。
     const WINDOW_SECS: usize = 3;
     let mut samples: VecDeque<(u64, u64)> = VecDeque::with_capacity(WINDOW_SECS + 1);
     // 平均速度累计的基准：本次下载运行启动时的完成字节快照。ticker 在
@@ -3377,10 +3384,22 @@ async fn speed_ticker(task: Arc<Task>, events: broadcast::Sender<EngineEvent>) {
     // 而 1 秒时长照记，短任务均值系统性偏低；resume 基线（此前已下载
     // 的字节）恰在该快照中，不会重复计入。
     let mut last_completed: Option<u64> = Some(task.completed_live());
+    // 采样源标记：BT 驱动上报接收字节后切到 received（字节级实时），
+    // 引擎未运行/重启瞬间回退 completed（含 resume 基线）。两种计数器
+    // 绝对值不可比（received 从 0 起算、completed 含历史），切换瞬间
+    // 必须清空窗口重新积累样本，否则差值无意义。
+    let mut last_source_received = false;
     loop {
         interval.tick().await;
         let completed = task.completed_live();
-        samples.push_back((completed, task.uploaded_live()));
+        let received = task.received_live();
+        let source_received = received > 0;
+        if source_received != last_source_received {
+            samples.clear();
+            last_source_received = source_received;
+        }
+        let dl_sample = if source_received { received } else { completed };
+        samples.push_back((dl_sample, task.uploaded_live()));
         while samples.len() > WINDOW_SECS + 1 {
             samples.pop_front();
         }
@@ -3569,6 +3588,8 @@ async fn drive_bt_download(
                 task.completed_atomic.store(p.done, Ordering::Relaxed);
                 task.connections_atomic.store(conn_count as u64, Ordering::Relaxed);
                 task.uploaded_atomic.store(engine.uploaded(), Ordering::Relaxed);
+                // 接收字节（字节级实时）：speed_ticker 的速度窗口采样源
+                task.received_atomic.store(engine.received_total(), Ordering::Relaxed);
                 *task.bt_peers.lock().unwrap() = peers;
                 // 分片位图同步（分片展示用）：暂停后任务字段保留最后状态
                 if let Some(bf) = engine.bitfield() {

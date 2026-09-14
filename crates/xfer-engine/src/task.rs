@@ -189,6 +189,11 @@ pub struct Task {
     pub speed_atomic: AtomicU64,
     /// 无锁上传字节计数器：BT 上报任务 store（engine.uploaded()）。
     pub uploaded_atomic: AtomicU64,
+    /// 无锁**接收**字节计数器：BT 上报任务 store（engine.received_total()），
+    /// 字节级实时（含未落盘块）。speed_ticker 的速度窗口用它采样——
+    /// BT 按片落盘，低速率下某秒 0 片完成会让完成字节差值归零
+    /// （peer 明明在传输，任务速度却显示 0）。
+    pub received_atomic: AtomicU64,
     /// 无锁上传速度计数器：speed_ticker 按上传字节差值 store。
     pub upload_speed_atomic: AtomicU64,
     /// 单任务下载限速（bytes/s，0 = 跟随全局）：`max-download-limit`
@@ -264,6 +269,7 @@ impl Task {
             connections_atomic: AtomicU64::new(0),
             speed_atomic: AtomicU64::new(0),
             uploaded_atomic: AtomicU64::new(0),
+            received_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
             task_dl_limit: AtomicU64::new(dl0),
             task_ul_limit: AtomicU64::new(ul0),
@@ -324,6 +330,7 @@ impl Task {
             connections_atomic: AtomicU64::new(0),
             speed_atomic: AtomicU64::new(0),
             uploaded_atomic: AtomicU64::new(0),
+            received_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
             task_dl_limit: AtomicU64::new(dl0),
             task_ul_limit: AtomicU64::new(ul0),
@@ -384,6 +391,7 @@ impl Task {
             connections_atomic: AtomicU64::new(0),
             speed_atomic: AtomicU64::new(0),
             uploaded_atomic: AtomicU64::new(0),
+            received_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
             task_dl_limit: AtomicU64::new(dl0),
             task_ul_limit: AtomicU64::new(ul0),
@@ -504,6 +512,13 @@ impl Task {
         } else {
             self.shared.lock().unwrap().uploaded
         }
+    }
+
+    /// 实时累计**接收**字节（本轮运行，字节级）：仅 BT 驱动上报。
+    /// 无回退到 shared.completed——语义是「本轮收到的字节数」，
+    /// 与完成字节（含 resume 历史）无关。
+    pub fn received_live(&self) -> u64 {
+        self.received_atomic.load(Ordering::Relaxed)
     }
 }
 

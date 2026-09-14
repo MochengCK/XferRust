@@ -1025,6 +1025,12 @@ pub struct TorrentEngine {
     ul_limit: AtomicU64,
     /// 累计上传字节数（实际发出的 piece 数据）。
     uploaded_bytes: AtomicU64,
+    /// 本轮运行累计**接收**的字节数（实际收到的 piece 块，含未落盘）。
+    /// 任务级瞬时速度采样源：BT 按片落盘（done_bytes 片级粒度），
+    /// 低速率下某秒可能 0 片完成 → 按完成字节采样会把速度窗口
+    /// 污染成 0（peer 明明在传输）。字节级计数与 peer 级 disp 采样
+    /// 同源，任务速度不再归零。
+    received_bytes: AtomicU64,
     /// 冷启动突发标记（首轮连接后清除）。
     cold_start_done: AtomicBool,
     /// BT 智能调度器（按吞吐边际收益动态调整目标连接数）。
@@ -1185,6 +1191,7 @@ impl TorrentEngine {
             dl_limit: AtomicU64::new(download_limit),
             ul_limit: AtomicU64::new(upload_limit),
             uploaded_bytes: AtomicU64::new(0),
+            received_bytes: AtomicU64::new(0),
             cold_start_done: AtomicBool::new(false),
             scheduler: Mutex::new(PeerScheduler::new(sched_cfg)),
             choke_epoch: Instant::now(),
@@ -1250,6 +1257,7 @@ impl TorrentEngine {
             dl_limit: AtomicU64::new(download_limit),
             ul_limit: AtomicU64::new(upload_limit),
             uploaded_bytes: AtomicU64::new(0),
+            received_bytes: AtomicU64::new(0),
             cold_start_done: AtomicBool::new(false),
             scheduler: Mutex::new(PeerScheduler::new(sched_cfg)),
             choke_epoch: Instant::now(),
@@ -2759,6 +2767,11 @@ impl TorrentEngine {
         self.uploaded_bytes.load(Ordering::Relaxed)
     }
 
+    /// 本轮运行累计接收字节数（实际收到的 piece 块，字节级实时）。
+    pub fn received_total(&self) -> u64 {
+        self.received_bytes.load(Ordering::Relaxed)
+    }
+
     /// 实际监听端口（0 = 监听器尚未就绪）。
     pub fn listen_port(&self) -> u16 {
         self.actual_listen_port.load(Ordering::Relaxed)
@@ -4201,6 +4214,8 @@ impl TorrentEngine {
                             // recent_speed 恒为 0 → 调度把正常下载的 seed 当死
                             // 节点批量断开换血 → 0 字节 + 连接数被砍到 1。
                             ctx.cell.downloaded.fetch_add(blen, Ordering::Relaxed);
+                            // 引擎级接收字节（任务级瞬时速度采样源，见字段注释）
+                            self.received_bytes.fetch_add(blen, Ordering::Relaxed);
                             *ctx.cell.last_block_at.lock().unwrap() = Instant::now();
                             ctx.last_request_at = None;
                             ctx.stale_count = 0;
