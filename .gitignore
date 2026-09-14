@@ -6,3 +6,6 @@
 
 # 临时测试产物
 test.bin
+
+# 发布说明模板（本地参考用，不上传）
+.github/RELEASE_TEMPLATE.md

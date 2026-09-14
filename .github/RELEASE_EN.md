@@ -1,87 +1,125 @@
-**Summary**: Building on v0.3.0, this release continues along four themes — completing HTTP download capabilities, frontend protocol integration, observability, and session persistence. HTTP downloads gain real piece bitmaps on par with BT (`numPieces` / `pieceLength` / `bitfield`, advancing live with bytes landed) and a global rate limiter (cross-task shared token bucket, `1M`/`500K` units accepted, hot-reloaded at runtime); `task.getTrackers` is upgraded with per-tracker announce state (protocol / status / seeders / next announce time). On the protocol-integration side: task status now carries an aria2-style `bittorrent` object and an `infoHash` field (frontend BT detection and task naming depend on them), command-line runtime options are passed through (`--key=value`, with app-side toggles like `--enable-upnp` auto-mapped), and `engine.changeOptions` supports full tracker-list replacement (`bt-trackers`) plus a subscription auto-update switch. On the observability side: download speed now refreshes every second via a 3-second sliding window, BT piece bitfields and per-peer bitfields are exposed, BT peer IP banning (timed/permanent) is added, along with two aria2-compatible RPCs `task.changeUri` / `task.getServers`. This round also adds a per-task average speed (`averageSpeed`, accumulated during active phases and persisted across sessions), refines HTTP piece granularity (even a few-MB file lights up pieces promptly), and fixes/extends the file-selection pipeline (`task.changeOption` now actually applies `select-file`, `files[].selected` reports the real selection, HTTP/HTTPS tasks support file selection), with single-file magnets auto-resuming at full selection once metadata is ready. This round also adds per-task rate limiting (`max-download-limit` / `max-upload-limit`, covering both HTTP and BT, with per-task limits overriding the global one (unset follows global), hot-reloaded, persisted across sessions) and the `bt-file-selection` flow for `.torrent` additions. This round also adds piece tri-state display (`partialBitfield`: partial-download piece bitmap, UI distinguishes not-started / in-progress / completed) and piece bitmap session persistence (completed tasks keep their piece maps after restart). CI gains a linux-arm64 (aarch64 musl static) build matrix. This round reworks per-task rate-limit composition to "per-task overrides global" (a set task limit takes precedence and may be higher or lower than the global one; unset follows global), and tightens session-restore semantics: all non-terminal tasks are restored as paused after restart and no longer auto-start. This round also makes the engine command line accept externally supplied default options — any `--key=value` is accepted as a global default (unimplemented keys are no longer warned and dropped) — and splits the macOS engine-core artifacts per architecture (aarch64 / x86_64 packaged separately, with the TUI remaining a universal dual-architecture binary). This round also adds the file-verification RPC `task.verifyFiles` (existence / size / streaming-hash checks executed natively by the engine, returning a structured result).
+**Summary**
+
+- New task file-verification RPC `task.verifyFiles` (existence / size / streaming hash, executed natively by the engine)
+- UDP hole punching (`ut_holepunch`) aligned with the libtorrent standard — relays through double NATs with standard clients such as qBittorrent
+- HTTP piece bitmaps, global & per-task rate limiting, per-task average speed, command-line option passthrough
+- File selection (`select-file`) works end-to-end; `.torrent` additions support the `bt-file-selection` flow
+- Piece tri-state display (`partialBitfield`) with session persistence; BT peer IP banning; tracker announce state
+- `task.getPeers` gains per-peer dial / transport stats and a banned group display
+- Fixed magnet/torrent tasks skipping "awaiting file selection" and downloading directly, garbled Chinese task names, inaccurate average speed
+- All non-terminal tasks are restored as paused after restart; per-task rate limits now override the global one
 
 ## New Features
 
 ### Task BT Identity (bittorrent / infoHash)
 
-- Task status responses (`task.tell` / `task.list`, both the aria2-style and native numeric encodings) now carry a `bittorrent` object and an `infoHash` field: non-BT tasks report `bittorrent` as `null` (the frontend detects BT tasks by the truthiness of `task.bittorrent`); when metadata is ready (.torrent / magnet metadata fetched) it is `{"info": {"name", "hash"}}`; while magnet metadata is still being fetched it is `{}` (the frontend shows "fetching metadata" accordingly)
-- `infoHash` is the hex encoding of the info dictionary hash: .torrent tasks report the hash computed when the metadata was parsed, magnet tasks report the `bt_info_hash` obtained from the handshake / metadata exchange
+- Task status responses (`task.tell` / `task.list`, both the aria2-style and native numeric encodings) now carry a `bittorrent` object and an `infoHash` field
+- Non-BT tasks report `bittorrent` as `null`; when metadata is ready it is `{"info": {"name", "hash"}}`; while magnet metadata is being fetched it is `{}` (the frontend shows "fetching metadata")
+- `infoHash` is the hex encoding of the info dictionary hash: .torrent tasks report the hash computed at parse time, magnet tasks report the `bt_info_hash` from the handshake / metadata exchange
 
 ### Global Tracker List & Subscription Switch Passthrough
 
-- `engine.changeOptions` gains `bt-trackers`: accepts a string array or a newline/comma-separated string, with full-replacement semantics (the app pushes the complete list each time); synchronized to all active BT tasks with the same delta semantics as manual add/remove (added URLs injected, removed URLs pruned), sourced as `manual`
-- New switch `auto-update-trackers` controls tracker subscription auto-update (boolean semantics; `"false"` / `"0"` both mean off)
+- `engine.changeOptions` gains `bt-trackers`: a string array or newline/comma-separated string with full-replacement semantics, synchronized to all active BT tasks with the same delta semantics as manual add/remove
+- New switch `auto-update-trackers` controls tracker subscription auto-update (`"false"` / `"0"` both mean off)
 
-### Command-Line Runtime Option Passthrough & External Defaults
+### Command-Line Runtime Option Passthrough
 
-- The engine command line now accepts `--key=value` runtime global options injected into the same store as `engine.changeOptions` (CLI values override same-named session-restored values): `split`, `max-connection-per-server`, `min-split-size`, overall rate limits, `bt-max-peers`, `bt-adaptive`, `bt-seed-mode`, `bt-seed-ratio`, `bt-encryption`, `bt-protocol`, `bt-listen-port`, `dht-listen-port`, `bt-enable-lpd`, `bt-port-mapping`
-- App-side toggles are auto-mapped: `--enable-upnp` / `--enable-nat-pmp` → `bt-port-mapping`, `--enable-utp` → `bt-protocol` (`tcp+utp` / `tcp`), so the host application no longer needs a second round of RPC dispatch at engine startup
-- Externally supplied default options: any `--key=value` is now accepted without error — implemented keys take effect at startup, while keys not yet implemented by the engine are no longer "warned and dropped"; they are stored in the global options store just the same (readable via `engine.getOptions`, persisted with the session), with semantics left to the caller. Host applications can pass their entire configuration through the engine command line, and options added in future engine upgrades are picked up automatically without touching the launch arguments; only bare positional arguments (not starting with `--`) are treated as invalid and ignored with a warning
+- The engine command line accepts `--key=value` runtime global options injected into the same store as `engine.changeOptions` (CLI values override session-restored ones): `split`, `max-connection-per-server`, `min-split-size`, overall rate limits, `bt-max-peers`, `bt-adaptive`, `bt-seed-mode`, `bt-seed-ratio`, `bt-encryption`, `bt-protocol`, `bt-listen-port`, `dht-listen-port`, `bt-enable-lpd`, `bt-port-mapping`
+- App-side toggles are auto-mapped: `--enable-upnp` / `--enable-nat-pmp` → `bt-port-mapping`, `--enable-utp` → `bt-protocol`
+- Any unknown `--key=value` is accepted as a global default (see Behavior Changes), so host applications can pass their entire configuration through the command line
 
 ### Piece Display, Real-Time Speed & Peer Management
 
-- Real-time download speed: speed sampling has changed from "a 3-second window average updated every 3 seconds" to a **3-second sliding window refreshed every second** — the window average still smooths out the 0↔spike jitter caused by piece-level batched writes, but the speed value now updates every second, so the frontend no longer shows a speed number frozen for long stretches
-- BT piece bitfield exposure: the `bitfield` field in task status responses (`task.tell` / `task.list`) is no longer always an empty string — it reports the real "downloaded pieces" bitmap (aria2-compatible hex encoding: 1 bit per piece, high bit first within each byte); the driver syncs at 1 Hz and the last known state is preserved while paused, letting clients render piece progress maps
-- Per-peer bitfield: each peer in `task.getPeers` gains a `bitfield` field (hex bitmap of the pieces the peer owns, all ones for seeds), enabling per-peer piece distribution rendering
-- BT peer IP banning: new RPCs `task.banPeer` (auto-unbans after `duration` seconds, `<= 0` means permanent; banning immediately disconnects the IP's existing connections and clears pending dials) / `task.unbanPeer` (global semantics, applies to all BT tasks); the ban list persists across sessions and stays effective after restart
-- Global ban-list option: `engine.changeOptions` gains `bt-ip-ban-list` (IP array or newline/comma-separated string, full replacement of permanent bans), passable from the app's preference settings
-- HTTP task URI change: new RPC `task.changeUri` (aria2-compatible semantics: for waiting/paused tasks, removes `delUris` and appends `addUris` for the given `fileIndex`; active tasks are rejected and the client falls back to re-creating the task)
-- Server list: new RPC `task.getServers` (HTTP tasks return aria2-compatible server entries with `currentUri` / `downloadSpeed` / `downloadLength`; BT tasks return an empty array)
+- Download speed now uses a **3-second sliding window refreshed every second**: the window average smooths piece-level write jitter while the value updates every second
+- BT piece bitfield exposure: `bitfield` reports the real "downloaded pieces" bitmap (aria2-compatible hex encoding), synced at 1 Hz, preserving the last known state while paused
+- Per-peer bitfield: each peer in `task.getPeers` gains a `bitfield` field (pieces the peer owns, all ones for seeds)
+- BT peer IP banning: `task.banPeer` (auto-unbans after `duration` seconds, `<= 0` permanent; immediately disconnects existing connections) / `task.unbanPeer`; the ban list persists across sessions
+- Global ban-list option: `engine.changeOptions` gains `bt-ip-ban-list` (IP array or newline/comma-separated string, full replacement of permanent bans)
+- New `task.changeUri` (aria2-compatible: removes `delUris` / appends `addUris` per `fileIndex` for waiting/paused tasks, rejected when active) and `task.getServers` (HTTP tasks return server entries, BT returns an empty array)
 
 ### Per-Task Average Speed (averageSpeed)
 
-- Task status responses (`task.tell` / `task.list`, both the aria2-style and native numeric encodings) gain an `averageSpeed` field (bytes/sec): the driver-side 1 Hz ticker accumulates "completed-byte deltas + active time" every second while the task is actively downloading, with the average = accumulated bytes / active seconds; seeding and paused phases neither accumulate nor dilute it
-- The accumulated data persists across sessions, so the average speed does not drift after restart-and-resume; the app's progress window and task details read this field directly for real-time refresh, with no client-side sampling/estimation needed
+- Task status responses gain an `averageSpeed` field (bytes/sec): accumulated every second during active download phases; seeding and paused phases neither accumulate nor dilute it
+- The accumulated data persists across sessions, so the average does not drift after restart-and-resume; the app reads this field directly instead of sampling
 
 ### File Selection (select-file) End-to-End
 
-- `task.changeOption` now actually applies `select-file` (aria2 semantics: comma-separated 1-based file indices, empty = select all): previously the key was only stored in task options and never applied — after saving a selection the detail view reopened showing "none selected", and the selection never took effect. It is now applied immediately: running BT tasks hot-apply it (recomputing the required-piece bitmap and totals), while paused/waiting tasks pick it up on their next start
-- `files[].selected` now reports the real selection: the native encoding previously hardcoded `true`, and the aria2-compatible encoding now outputs `"true"` / `"false"` strings accordingly
-- File selection extends to HTTP/HTTPS tasks: single-file layout (file count is always 1), with the selection persisted and applied on the next start; magnet tasks with metadata not yet ready still return an error
-- `task.add` (`addUri` / `addTorrent`) accepts `select-file` for pre-selecting files; invalid/out-of-range values degrade to a warning without aborting the task addition
-- `.torrent` additions support the `bt-file-selection` flow: sharing the same state machine as magnets — the waiting flag is set at add time, the 1Hz ticker auto-pauses once metadata is ready (immediately available for torrent files), and the download resumes via `select-file` after the client confirms the file selection
-- Single-file magnets auto-resume: when metadata arrives and the layout is a single file (nothing to select), the engine clears the waiting flag and re-queues the task with a restart intent, resuming at full selection without user action; multi-file magnets keep the "metadata ready → auto-pause awaiting selection" flow
+- `task.changeOption` now actually applies `select-file` (aria2 semantics: comma-separated 1-based file indices, empty = select all): running BT tasks hot-apply it, paused/waiting tasks pick it up on their next start
+- `files[].selected` reports the real selection: the native encoding previously hardcoded `true`; the aria2 encoding now outputs `"true"` / `"false"`
+- File selection extends to HTTP/HTTPS tasks: single-file layout, persisted and applied on the next start
+- `task.add` accepts `select-file` for pre-selection; invalid/out-of-range values degrade to a warning without aborting the addition
+- `.torrent` additions support the `bt-file-selection` flow: the same state machine as magnets — auto-pause once metadata is ready, resume via `select-file` after the client confirms the selection
+- Single-file magnets auto-resume: when the layout is a single file, the engine resumes at full selection without user action
 
 ### HTTP Piece Bitmap & Global Rate Limiting
 
-- HTTP task piece bitmap: `task.tell` / `task.list` (both the aria2-style and native numeric encodings) now report real piece data for HTTP tasks — `numPieces` / `pieceLength` / `bitfield` (aria2-compatible hex encoding). Piece length is a display granularity, decoupled from the segment granularity (`min-split-size`): it takes `min(min-split-size, max(total/2048, 64KB))` — even a few-MB file lights up pieces promptly (previously the piece length was fixed to `min-split-size`, so one piece equaled an entire segment and a few-MB download left the bitmap all zeros), while large files keep the existing `min-split-size` granularity. The write side accounts bytes incrementally per landed range, covering both the multi-connection writer thread and the single-connection sequential path; the bitmap is invalidated and rebuilt when a server ignores Range and resends the full body; the control-file watermark pre-fills the bitmap on resume so it stays consistent with what is actually on disk; omitted when total length is unknown or Range is unsupported; the last known state is preserved while paused. Previously HTTP tasks always reported `numPieces=0` / an empty `bitfield`, leaving piece maps blank in the task list and detail views
-- HTTP global rate limiting: an asynchronous token-bucket limiter is injected into every download connection — multi-connection workers consume tokens in their read loops and the single-connection path consumes per chunk before writing; when tokens run out the connection awaits asynchronously, letting TCP backpressure converge naturally. Previously the limits were only forwarded to BT engines — HTTP downloads were entirely unthrottled
-- Per-task rate limiting: `task.changeOption` accepts `max-download-limit` / `max-upload-limit` (aria2 semantics, `1M`/`500K` units pass through); the effective value follows per-task-override semantics (a set task limit takes precedence and may be higher or lower than the global one; 0 = unset follows global), hot-reloaded at runtime and persisted across sessions. Each HTTP task owns a limiter carrying the composed rate (shared by the single-connection and split multi-connection paths; re-synced immediately on global or task-level changes), while BT engines receive the composed values directly; `task.getOption` reports the current per-task limits. Global limits now apply universally across HTTP/HTTPS and BT
-- Speed-limit value parsing upgraded: `max-overall-download-limit` / `max-overall-upload-limit` accept aria2-style units (`1M` / `500K` / plain byte integers), matching the format the desktop stores (previously only plain integers were accepted; unit-suffixed values were rejected or silently treated as unlimited)
-- One invalid key no longer aborts the whole settings batch: in `changeOptions`, illegal values for speed limits / `bt-encryption` / `bt-protocol` / port options degrade to a warning and skip that key while the rest of the batch applies as usual — previously a single bad key made the whole changeOptions call fail, so saving one speed limit would break every other system setting
-- Tracker announce state: `task.getTrackers` is upgraded from URL-only entries to per-tracker state — `protocol` (http / https / udp / ws), `status` (working / not-working / waiting), `seeders` / `leechers` (the tracker-reported complete / incomplete), `peers`, `lastAnnounceTime` / `nextAnnounceTime` (derived from the successful response interval) and `error` (the latest failure reason); the BT engine records per-URL results while aggregating each announce round, and URLs not yet announced stay `waiting`
+- HTTP tasks report real piece data: `numPieces` / `pieceLength` / `bitfield` (aria2-compatible hex encoding)
+- Piece length is a display granularity decoupled from the segment granularity: `min(min-split-size, max(total/2048, 64KB))` — even a few-MB file lights up pieces promptly, large files keep the `min-split-size` granularity
+- The write side accounts bytes incrementally per landed range on both multi-connection and single-connection paths; the bitmap is rebuilt when a server ignores Range and resends the full body; control-file watermarks pre-fill the bitmap on resume so it stays consistent with disk; omitted when total length is unknown or Range is unsupported
+- HTTP global rate limiting: an asynchronous token bucket is injected into every download connection, letting TCP backpressure converge naturally. Previously HTTP downloads were entirely unthrottled
+- Speed-limit value parsing upgraded: overall limits accept aria2-style units (`1M` / `500K` / plain bytes), previously only plain integers
+- One invalid key no longer aborts the whole settings batch: illegal values in `changeOptions` degrade to a warning and skip that key
 
-## New Features (continued)
+### Per-Task Rate Limiting (max-download-limit / max-upload-limit)
 
-### Piece Tri-State Display (partialBitfield)
+- `task.changeOption` accepts `max-download-limit` / `max-upload-limit` (aria2 semantics, `1M`/`500K` units pass through), covering HTTP and BT, hot-reloaded and persisted across sessions
+- The effective value follows per-task-override semantics (see Behavior Changes); `task.getOption` reports the current per-task limits
+- Each HTTP task owns a limiter shared by the single-connection and split paths; BT engines receive the composed values directly
 
-- Task status responses (`task.tell` / `task.list`, both the aria2-style and native numeric encodings) gain a `partialBitfield` field: HTTP tasks report a partial-download piece bitmap (pieces with bytes landed > 0 but not yet complete are marked 1), BT tasks always report an empty string. Combined with the existing `bitfield` (fully complete pieces), the UI can render a tri-state piece map: not-started (gray), in-progress (yellow), completed (green). `PieceTrack` gains a `partial_bitfield()` method that iterates per-piece landed byte counts, flagging pieces where `0 < done[i] < len_at(i)`
+### Tracker Announce State
 
-### Piece Bitmap Session Persistence
+- `task.getTrackers` is upgraded from URL-only entries to per-tracker state: `protocol` (http/https/udp/ws), `status` (working/not-working/waiting), `seeders` / `leechers`, `peers`, `lastAnnounceTime` / `nextAnnounceTime`, `error`
+- The BT engine records per-URL results during each announce round; URLs not yet announced stay `waiting`
 
-- Session serialization (`session_json`) now saves `btBitfield` (BT piece bitmap hex), `httpNumPieces` / `httpPieceLen` (HTTP piece dimensions); session restoration (`restore_tasks`) rebuilds `bt_bitfield` and `http_pieces` (`PieceTrack`) from these fields, backfilling piece state based on completed bytes (completed tasks get a full bitmap). Previously piece bitmaps were not persisted — after restart, completed tasks lost their piece maps (`numPieces=0` / empty `bitfield`)
+### Piece Tri-State Display & Persistence
+
+- Task status responses gain `partialBitfield`: HTTP tasks report a partial-download piece bitmap (pieces with bytes landed > 0 but not complete), BT tasks always report an empty string; combined with `bitfield` the UI can render not-started / in-progress / completed tri-state maps
+- Session serialization saves `btBitfield`, `httpNumPieces` / `httpPieceLen`; restoration rebuilds the bitmaps and backfills piece state from completed bytes — previously completed tasks lost their piece maps after restart
 
 ### Task File Verification (task.verifyFiles)
 
-- New native RPC `task.verifyFiles`: runs file integrity checks for a task — existence checks, file size comparison, and streaming hash computation (SHA-256 / SHA-1 / SHA-512 / MD5; the `algorithm` parameter accepts `size` / `sha256` / `sha1` / `md5` / `sha512`, case-insensitive)
-- Path resolution and disk reads happen entirely in the engine: BT multi-file entries are joined to the task directory as "name/relative-path", HTTP tasks use the task's actual on-disk path; unselected BT files (outside `select-file`) are excluded from verification. Returns a structured result: `status` (`ok` / `missing` / `sizeMismatch`), `count`, `missing` / `mismatched` (problem file lists) and `hashes` (`path` display path + `digest` hex; empty for `size` verification)
-- `engine.getVersion`'s `features` list adds `"verify-files"`
-- `xfer-storage` adds `file_digest_hex` (streaming file hash returning a hex digest), sharing the underlying `file_digest` implementation with the existing `verify_file_hash` (expected-value comparison)
+- New native RPC `task.verifyFiles`: runs existence checks, file size comparison, and streaming hash computation (`algorithm` accepts `size` / `sha256` / `sha1` / `md5` / `sha512`, case-insensitive)
+- Path resolution and disk reads happen entirely in the engine: BT multi-file entries are joined as "name/relative-path", HTTP tasks use the actual on-disk path; unselected BT files are excluded
+- Returns a structured result: `status` (`ok` / `missing` / `sizeMismatch`), `count`, `missing` / `mismatched` and `hashes` (`path` + hex `digest`, empty for `size` verification)
+- `engine.getVersion`'s `features` adds `"verify-files"`; `xfer-storage` adds `file_digest_hex` sharing the underlying implementation with `verify_file_hash`
+
+### UDP Hole Punching Standardization (ut_holepunch, libtorrent de-facto standard)
+
+- Wire format aligned with libtorrent: `msg_type(1) + addr_type(1) + addr(4/16) + port(2)`, with only `failed` appending a 4-byte error code; message types and error codes exactly match `bt_peer_connection`. The previous private format could not be parsed by any standard client
+- Relay (rendezvous) semantics aligned: resolve the target connection first (exact endpoint match + same-IP fallback), replying the appropriate `failed` when unreachable / unsupported / self-targeted; on success both sides receive a connect
+- Initiator side added: once direct-dial retries are exhausted, the engine asks any connected peer advertising `ut_holepunch` to relay (capped at 2 rounds per target, 2 relays per round); previously it only ever answered relay requests, making double-NAT traversal with standard clients impossible
+- Holepunch messages from peers that did not advertise `ut_holepunch` are ignored; PEX `added.f` flags corrected to libtorrent semantics (0x08 = holepunch-capable, 0x04 = uTP)
+
+### Peer Info Extensions & Ban Display (task.getPeers)
+
+- Each peer gains dial / transport stats fields: `downSpeed` / `upSpeed` / `tcpFails` / `utpFails` / `udpFails` / `attempting`
+- New banned group: bans are recorded per IP (`addr` holds only the address, `port` empty) and report `remainingSecs` (0 = permanent), `source` and `banReason` (`manual` = banned by hand / `ban_list` = pushed via the ban list); one `getPeers` call returns all four groups — connected / attempting / disconnected / banned
+- Ban entries distinguish their origin: `task.banPeer` is recorded as manual, `bt-ip-ban-list` pushes as list entries; persisted across sessions, with legacy session files defaulting to list entries
+
+### Charset-Aware Text Decoding (xfer-types::text)
+
+- New text decoding module: explicit charset → strict UTF-8 → GB18030 → lossy, used uniformly by magnet / .torrent / HTTP parsing
+- Magnet `dn` percent-encoding, .torrent `name` and path segments, and HTTP `Content-Disposition: filename*` (RFC 5987, honoring declared gb2312/gbk charsets) and URL-path percent-encoding all go through this module
 
 ## Bug Fixes
 
-- Fix completed tasks losing piece progress after restart: piece bitmaps (`bt_bitfield` / `http_pieces`) were not saved or restored across sessions; after restart `numPieces=0` / empty `bitfield`, leaving the UI piece map blank. Session files now persist piece data and restoration rebuilds the bitmap
-- Fix saved file selections not taking effect and the detail view reopening with "none selected": the `select-file` key in `changeOption` was previously only stored, never applied, and the native encoding hardcoded `files[].selected` to `true`; see "File Selection (select-file) End-to-End"
-- Fix HTTP piece bitmaps staying all-zero for files of just a few MB: the piece length was previously fixed to `min-split-size`, so a small file's entire download could not light up a single piece; see "HTTP Piece Bitmap & Global Rate Limiting"
-- Fix HTTP tasks falsely reporting `seeder=true` on completion: `seeder` now means "this endpoint is a BT task and its payload is complete"; it used to be computed as "completed ≥ total" for every task type, so finished HTTP tasks tripped the flag and the client marked normal downloads as "seeding" and re-emitted the BT completion event
-- Fix HTTP tasks always reporting empty piece data (`numPieces=0` / empty `bitfield`); see "HTTP Piece Bitmap & Global Rate Limiting"
-- Fix speed-limit settings not taking effect: unit-suffixed values (e.g. `1M`) were rejected or silently treated as unlimited, and the HTTP download path had no rate-limit enforcement at all; see "HTTP Piece Bitmap & Global Rate Limiting"
-- Fix per-task speed limits being unable to raise throughput: the effective value previously took min(per-task, global), so a task limit set above the global one was clamped back to the global value (e.g. global 1MB with a per-task limit of 5MB still ran at 1MB). The composition now follows per-task-override semantics — a set task limit (>0) takes precedence and may be higher or lower than the global one; unset (0) follows global. Global and per-task changes are re-composed and pushed to active transport paths immediately
-- Fix tasks auto-starting after restart: session restore previously restored active tasks as waiting and re-queued them for download immediately. Restore semantics are now tightened: all non-terminal tasks (active / waiting / paused) are restored as paused and require a manual resume; progress, piece bitmaps and resume data are saved with the session, so resuming continues from the previous progress
+- Fix magnet/.torrent tasks skipping "awaiting file selection" and downloading directly: `task.add` previously passed through only `dir` / `out` / `checksum`, silently dropping task-level options such as `bt-file-selection` / `select-file`; all options except reserved protocol keys are now passed through, so the auto-pause-awaiting-selection flow works again
+- Fix inaccurate task average speed: the formula `bytes/(ms/1000)` inflated the average when active time was under 2 seconds due to integer truncation (nearly 2x error at ms=1999, inflated early readings); it now computes `bytes*1000/ms`. Speed sampling also starts at the moment the task starts, so the first 1 Hz tick's bytes count toward the average (previously dropped, systematically underreporting short tasks)
+- Fix the "awaiting file selection" state appearing late after magnet metadata is ready: the metadata-fetch loop's tracker announce (which can block up to a 15s timeout) and its 1-second polling were not cancellation-aware, deferring the pause intent until the round finished; cancellation is now handled first and the pause takes effect immediately
+- Fix garbled Chinese task/file names (displayed as a run of `????`): Chinese sites commonly percent-encode the magnet `dn` in GBK, old Chinese torrents store `name` and path segments as GBK bytes (previously rejected outright as "info missing name"), and HTTP `filename*` headers declaring gb2312/gbk were decoded as UTF-8 — all now go through charset-aware decoding, see "Charset-Aware Text Decoding"
+- Fix completed tasks losing piece progress after restart: piece bitmaps were not saved or restored across sessions, see "Piece Tri-State Display & Persistence"
+- Fix saved file selections not taking effect and the detail view reopening with "none selected": `select-file` was previously only stored, never applied, see "File Selection (select-file) End-to-End"
+- Fix HTTP piece bitmaps staying all-zero for files of just a few MB: the piece length was previously fixed to `min-split-size`, see "HTTP Piece Bitmap & Global Rate Limiting"
+- Fix HTTP tasks falsely reporting `seeder=true` on completion: `seeder` now means "this endpoint is a BT task and its payload is complete"; it used to be computed as "completed ≥ total" for every task type, making the client mark normal downloads as "seeding"
+- Fix speed-limit settings not taking effect: unit-suffixed values were rejected or silently treated as unlimited, and the HTTP download path had no rate-limit enforcement at all, see "HTTP Piece Bitmap & Global Rate Limiting"
+
+## Behavior Changes
+
+- Per-task rate limits now override the global one: a set task limit takes precedence and may be higher or lower than the global value; unset (0) follows global. Previously the effective value was min(per-task, global), so a task limit above the global one was clamped back
+- Session restore is tightened: all non-terminal tasks (active / waiting / paused) are restored as paused and no longer auto-start; resume data is saved with the session, so a manual resume continues from the previous progress
+- Unknown engine command-line options are no longer "warned and dropped": any `--key=value` is accepted as a global default, readable via `engine.getOptions` and persisted with the session; only bare positional arguments are treated as invalid
 
 ## Build & Release
 
-- CI build matrix gains `linux-arm64` (aarch64-unknown-linux-musl): artifacts `xfer-tui-linux-arm64.tar.gz` / `xferrust-linux-arm64.tar.gz` are published with each Release
-- musl static linking: no glibc version dependency and no bundled lib/ directory needed — extract and run
-- macOS engine-core artifacts are now split per architecture: the TUI remains a universal dual-architecture binary (`xfer-tui-darwin-universal.tar.gz`), while the engine core is no longer merged and ships as two separate packages, `xferrust-darwin-aarch64.tar.gz` and `xferrust-darwin-x86_64.tar.gz` — embedding clients can fetch the artifact matching their target architecture directly, with no need to thin-extract from the universal binary
-- linux-arm64 cross-compilation now uses cargo-zigbuild, replacing the unreliable musl.cc download source
+- CI build matrix gains `linux-arm64` (aarch64-unknown-linux-musl static linking — no glibc dependency, no bundled lib/ directory), cross-compiled with cargo-zigbuild
+- macOS engine-core artifacts are split per architecture: the TUI remains a universal dual-architecture binary, while the engine core ships as `xferrust-darwin-aarch64.tar.gz` and `xferrust-darwin-x86_64.tar.gz` — embedding clients fetch the matching artifact directly, no thin extraction needed

@@ -28,16 +28,17 @@ use xfer_types::PeerId;
 /// PEX 消息扩展名称（握手中协商用）。
 pub const PEX_EXT_NAME: &str = "ut_pex";
 
-/// PEX peer 标志位。
+/// PEX peer 标志位（与 libtorrent `pex_flags.hpp` 一致）。
 pub mod flags {
     /// 0x01: 加密支持（BEP 10）。
     pub const ENCRYPTION: u8 = 0x01;
-    /// 0x02: SeedEx / uTP 提示（部分实现）。
+    /// 0x02: Seed（做种/upload-only）。
     pub const SEED_EX: u8 = 0x02;
     /// 0x04: uTP 支持（BEP 29）——关键正确性位。
     pub const UTP: u8 = 0x04;
-    /// 0x08: 可连接（reachable）。
-    pub const REACHABLE: u8 = 0x08;
+    /// 0x08: 支持 ut_holepunch 扩展——libtorrent 据此把该 peer
+    /// 用作 NAT 穿透中介（rendezvous）候选。
+    pub const HOLEPUNCH: u8 = 0x08;
 }
 
 /// PEX 消息中的单个 peer。

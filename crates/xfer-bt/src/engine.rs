@@ -227,6 +227,152 @@ const UT_METADATA_REQUEST: i64 = 0;
 const UT_METADATA_DATA: i64 = 1;
 const UT_METADATA_REJECT: i64 = 2;
 
+// ---- ut_holepunch（libtorrent 事实标准扩展，与 qBittorrent / Deluge 等互通） ----
+/// 本端为 ut_holepunch 分配的扩展消息 ID（ut_pex=1、ut_metadata=2 之后）。
+/// BEP 10 语义：各端自报 ID，发消息用对端广告的 ID。
+const UT_HOLEPUNCH_EXT_ID: u8 = 3;
+/// 消息类型（报文首字节，与 libtorrent hp_message 枚举一致）。
+const HP_RENDEZVOUS: u8 = 0;
+const HP_CONNECT: u8 = 1;
+const HP_FAILED: u8 = 2;
+/// failed 错误码（4 字节大端，与 libtorrent hp_error 枚举一致）。
+const HP_ERR_NO_SUCH_PEER: u32 = 1;
+const HP_ERR_NOT_CONNECTED: u32 = 2;
+const HP_ERR_NO_SUPPORT: u32 = 3;
+const HP_ERR_NO_SELF: u32 = 4;
+/// 打洞整体超时。uTP SYN 内部重传提供周期性穿透尝试，
+/// 太短会让「NAT 映射刚建立就被判失败」，太长则挂住任务。
+const HOLEPUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+/// 单次 uTP 建链尝试的等待时间（含 SYN 重传）。
+const HOLEPUNCH_UTP_TIMEOUT: Duration = Duration::from_secs(4);
+///两次建链尝试之间的间隔。
+const HOLEPUNCH_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+/// 同一地址每会话的打洞尝试上限（避免对一个死地址无限重试）。
+const MAX_HOLEPUNCH_ATTEMPTS: u32 = 2;
+/// 同一目标地址每会话的中介请求（rendezvous）轮数上限。
+const MAX_HOLEPUNCH_RENDEZVOUS: u32 = 2;
+/// 每轮中介请求最多询问的已连接 peer 数。
+const HOLEPUNCH_RELAYS_PER_ROUND: usize = 2;
+
+/// 打洞消息（libtorrent ut_holepunch 二进制报文的解析结果）。
+///
+/// 报文布局（与 libtorrent `bt_peer_connection::write_holepunch_msg` 一致）：
+/// `msg_type(1) + addr_type(1) + addr(4/16) + port(2)`，
+/// 仅 failed 追加 `err_code(4, u32 大端)`。addr_type 0 = IPv4 / 1 = IPv6。
+/// 即 IPv4 rendezvous/connect 为 8 字节、failed 为 12 字节。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HolepunchMsg {
+    /// 请本端作中介：向两端各发 connect（含对方 endpoint）。
+    Rendezvous { ip: std::net::IpAddr, port: u16 },
+    /// 你应该对这个 endpoint 发起 uTP 连接（SYN 兼作打洞探测包）。
+    Connect { ip: std::net::IpAddr, port: u16 },
+    /// Rendezvous 无法执行；地址字段回显原请求，附错误码。
+    Failed {
+        ip: std::net::IpAddr,
+        port: u16,
+        err_code: u32,
+    },
+    /// 无法解析的消息（忽略但记录）。
+    Invalid,
+}
+
+impl HolepunchMsg {
+    fn addr(&self) -> Option<SocketAddr> {
+        match self {
+            HolepunchMsg::Rendezvous { ip, port }
+            | HolepunchMsg::Connect { ip, port }
+            | HolepunchMsg::Failed { ip, port, .. } => Some(SocketAddr::new(*ip, *port)),
+            HolepunchMsg::Invalid => None,
+        }
+    }
+}
+
+/// 解析 ut_holepunch 消息体（libtorrent 标准二进制格式）。
+///
+/// 宽容解析：rendezvous / connect 允许携带尾部多余字节（部分对端会额外
+/// 补零）；failed 的 err_code 不全时视为无效。
+fn parse_holepunch_msg(payload: &[u8]) -> HolepunchMsg {
+    if payload.len() < 2 {
+        return HolepunchMsg::Invalid;
+    }
+    let msg_type = payload[0];
+    // addr_type：0 = IPv4（4 字节）/ 1 = IPv6（16 字节），其余无效。
+    // 返回 (地址, 端口字段的起始偏移)。
+    let (ip, port_off) = match payload[1] {
+        0 => {
+            if payload.len() < 8 {
+                return HolepunchMsg::Invalid;
+            }
+            (
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    payload[2],
+                    payload[3],
+                    payload[4],
+                    payload[5],
+                )),
+                6usize,
+            )
+        }
+        1 => {
+            if payload.len() < 20 {
+                return HolepunchMsg::Invalid;
+            }
+            let mut oct = [0u8; 16];
+            oct.copy_from_slice(&payload[2..18]);
+            (std::net::IpAddr::V6(std::net::Ipv6Addr::from(oct)), 18usize)
+        }
+        _ => return HolepunchMsg::Invalid,
+    };
+    let port = u16::from_be_bytes([payload[port_off], payload[port_off + 1]]);
+    match msg_type {
+        HP_RENDEZVOUS => HolepunchMsg::Rendezvous { ip, port },
+        HP_CONNECT => HolepunchMsg::Connect { ip, port },
+        HP_FAILED => {
+            if payload.len() < port_off + 2 + 4 {
+                return HolepunchMsg::Invalid;
+            }
+            HolepunchMsg::Failed {
+                ip,
+                port,
+                err_code: u32::from_be_bytes([
+                    payload[port_off + 2],
+                    payload[port_off + 3],
+                    payload[port_off + 4],
+                    payload[port_off + 5],
+                ]),
+            }
+        }
+        _ => HolepunchMsg::Invalid,
+    }
+}
+
+/// 构造 ut_holepunch 消息体（libtorrent 标准二进制格式）。
+fn build_holepunch_msg(msg: &HolepunchMsg) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(24);
+    let (msg_type, ip, port) = match msg {
+        HolepunchMsg::Rendezvous { ip, port } => (HP_RENDEZVOUS, *ip, *port),
+        HolepunchMsg::Connect { ip, port } => (HP_CONNECT, *ip, *port),
+        HolepunchMsg::Failed { ip, port, .. } => (HP_FAILED, *ip, *port),
+        HolepunchMsg::Invalid => return buf,
+    };
+    buf.push(msg_type);
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            buf.push(0u8);
+            buf.extend_from_slice(&v4.octets());
+        }
+        std::net::IpAddr::V6(v6) => {
+            buf.push(1u8);
+            buf.extend_from_slice(&v6.octets());
+        }
+    }
+    buf.extend_from_slice(&port.to_be_bytes());
+    if let HolepunchMsg::Failed { err_code, .. } = msg {
+        buf.extend_from_slice(&err_code.to_be_bytes());
+    }
+    buf
+}
+
 /// 无元数据阶段（磁力链接）的元数据分片累积器。
 #[derive(Debug, Default)]
 struct MetadataAccum {
@@ -551,6 +697,10 @@ pub struct PeerState {
     pub ut_metadata_id: u8,
     /// 本端为对端分配的 ut_metadata 扩展消息 ID。
     pub our_ut_metadata_id: u8,
+    /// 对端 ut_holepunch 扩展消息 ID（0 = 未协商/不支持）。
+    pub ut_holepunch_id: u8,
+    /// 本端为对端分配的 ut_holepunch 扩展消息 ID。
+    pub our_ut_holepunch_id: u8,
     /// Allowed Fast 集合（对端允许我们快速下载的片索引）。
     pub allowed_fast_set: HashSet<u32>,
     /// 本端已向对端发送的 Allowed Fast 集合。
@@ -590,6 +740,8 @@ pub enum PeerSource {
     Lsd,
     /// 被动入站连接（对端主动连入）。
     Incoming,
+    /// UDP 打洞建立（双方均在 NAT 后，经 ut_holepunch 介绍后走 uTP）。
+    Holepunch,
 }
 
 impl PeerSource {
@@ -600,6 +752,7 @@ impl PeerSource {
             PeerSource::Pex => "pex",
             PeerSource::Lsd => "lsd",
             PeerSource::Incoming => "incoming",
+            PeerSource::Holepunch => "holepunch",
         }
     }
 }
@@ -652,6 +805,18 @@ pub struct PeerInfo {
     /// 高位在前，即 BEP 3 bitfield 的 hex 编码）。seed 为全 1；
     /// 位图未知（磁力元数据未就绪）为空串。
     pub bitfield: String,
+    /// 该对端向本端的即时速率（B/s，1Hz 采样折算）。
+    pub down_speed: u64,
+    /// 本端向该对端的即时速率（B/s，1Hz 采样折算）。
+    pub up_speed: u64,
+    /// 本会话对该地址的 TCP 拨号失败次数（累计，成功不清零）。
+    pub tcp_fails: u32,
+    /// 本会话对该地址的 uTP 拨号失败次数（累计）。
+    pub utp_fails: u32,
+    /// UDP 打洞失败次数（预留，当前引擎无 UDP 打洞路径，恒 0）。
+    pub udp_fails: u32,
+    /// 正在尝试连接（pending 队列中、尚未建立会话）。
+    pub attempting: bool,
 }
 
 struct PeerCell {
@@ -662,6 +827,12 @@ struct PeerCell {
     uploaded: AtomicU64,
     /// 上次速率采样时的 downloaded 快照。
     prev_downloaded: Mutex<u64>,
+    /// RPC 展示用的 1Hz 速率采样（下载/上传）：peers_info 每次调用
+    /// 计算与上次的字节差并按毫秒折算，代替调度器 10s 窗口的 recent_speed
+    /// （那个窗口是给慢速淘汰用的，更新太慢，表格里速度会显得卡住）。
+    disp_prev_down: AtomicU64,
+    disp_prev_up: AtomicU64,
+    disp_prev_ms: AtomicU64,
     /// 本 peer 占用的片队列（头 = 正在请求的片）。
     /// 单片上限 = 片大小（常见 256KiB），高延迟链路上远小于带宽延迟积，
     /// 吞吐被钉死（实测 ~1MB/s）；多片并行才能填满流水线。
@@ -677,6 +848,12 @@ struct PeerCell {
     /// 待发送给该 peer 的 Have 片号队列：
     /// `broadcast_have` 入队，该 peer 的消息循环每轮出队发送。
     have_out_queue: Mutex<Vec<u32>>,
+    /// 待发送给该 peer 的 BEP 10 扩展消息队列：(对端扩展 id, 消息体)。
+    ///
+    /// 供**其它会话**主动向该 peer 投递扩展消息（ut_holepunch 的中介转发：
+    /// 收到 A 的 Rendezvous 后要把 Connect 转告 B，而 B 的 stream 由 B 自己
+    /// 的消息循环持有）。由 1s 的 ext_timer 出队发送。
+    ext_out_queue: Mutex<Vec<(u8, Vec<u8>)>>,
     /// 逐 peer 停机信号：淘汰/剪除/注销时置位，会话立即退出。
     /// 缺了它，被注销的会话仍在后台下载（选片不查 peers 表）——
     /// 淘汰只是"除名"不是"断开"，连接泄漏且调度换血全部空转。
@@ -873,6 +1050,18 @@ pub struct TorrentEngine {
     /// 出站拨号失败/会话异常中断计数（失败地址回填 pending 重试，
     /// 超过次数放弃，等 tracker/PEX 重新发现时清零）。
     dial_failures: Mutex<HashMap<SocketAddr, u32>>,
+    /// 逐地址拨号失败统计（tcp, utp, udp 打洞），getPeers 展示用。
+    /// 与上面的 dial_failures（重试预算，重新发现/成功后清零）分开：
+    /// 展示计数会话期累计、成功连接不清零，否则连上后历史失败就看不到了。
+    dial_fail_stats: Mutex<HashMap<SocketAddr, (u32, u32, u32)>>,
+    /// 打洞在途目标（同一地址同时只允许一个打洞任务）。
+    holepunch_inflight: Mutex<HashSet<SocketAddr>>,
+    /// 逐地址打洞尝试次数（上限 [`MAX_HOLEPUNCH_ATTEMPTS`]）。
+    holepunch_attempts: Mutex<HashMap<SocketAddr, u32>>,
+    /// 逐地址已发起的中介请求轮数（上限 [`MAX_HOLEPUNCH_RENDEZVOUS`]）。
+    holepunch_rp_sent: Mutex<HashMap<SocketAddr, u32>>,
+    /// 打洞成功次数（建链成功；展示与调试用）。
+    holepunch_successes: AtomicU64,
     /// 本会话已断开 peer 的最后快照（getPeers 的 disconnected 分组），
     /// 上限 [`MAX_DISCONNECTED_PEERS`]，超出淘汰最旧。
     disconnected_peers: Mutex<Vec<PeerInfo>>,
@@ -1011,6 +1200,11 @@ impl TorrentEngine {
             choke_epoch: Instant::now(),
             optimistic_unchoke: Mutex::new(None),
             dial_failures: Mutex::new(HashMap::new()),
+            dial_fail_stats: Mutex::new(HashMap::new()),
+            holepunch_inflight: Mutex::new(HashSet::new()),
+            holepunch_attempts: Mutex::new(HashMap::new()),
+            holepunch_rp_sent: Mutex::new(HashMap::new()),
+            holepunch_successes: AtomicU64::new(0),
             disconnected_peers: Mutex::new(Vec::new()),
             banned: Mutex::new(HashMap::new()),
             last_resume_save: Mutex::new(Instant::now() - Duration::from_secs(60)),
@@ -1071,6 +1265,11 @@ impl TorrentEngine {
             choke_epoch: Instant::now(),
             optimistic_unchoke: Mutex::new(None),
             dial_failures: Mutex::new(HashMap::new()),
+            dial_fail_stats: Mutex::new(HashMap::new()),
+            holepunch_inflight: Mutex::new(HashSet::new()),
+            holepunch_attempts: Mutex::new(HashMap::new()),
+            holepunch_rp_sent: Mutex::new(HashMap::new()),
+            holepunch_successes: AtomicU64::new(0),
             disconnected_peers: Mutex::new(Vec::new()),
             banned: Mutex::new(HashMap::new()),
             last_resume_save: Mutex::new(Instant::now() - Duration::from_secs(60)),
@@ -2232,6 +2431,8 @@ impl TorrentEngine {
                 our_ut_pex_id: 0,
                 ut_metadata_id: 0,
                 our_ut_metadata_id: UT_METADATA_EXT_ID,
+                ut_holepunch_id: 0,
+                our_ut_holepunch_id: UT_HOLEPUNCH_EXT_ID,
                 allowed_fast_set: HashSet::new(),
                 am_allowed_fast_set: HashSet::new(),
                 last_data_transfer: now,
@@ -2247,6 +2448,9 @@ impl TorrentEngine {
             downloaded: AtomicU64::new(0),
             uploaded: AtomicU64::new(0),
             prev_downloaded: Mutex::new(0),
+            disp_prev_down: AtomicU64::new(0),
+            disp_prev_up: AtomicU64::new(0),
+            disp_prev_ms: AtomicU64::new(0),
             queued: Mutex::new(Vec::new()),
             // `pipeline = 0` 才表示自适应：不能从 16 个块开始，否则高 RTT
             // 链路在窗口反馈到来前就被 256KiB 的初始在途量卡住。显式配置
@@ -2260,6 +2464,7 @@ impl TorrentEngine {
             source,
             transport: Mutex::new(TransportKind::Tcp),
             have_out_queue: Mutex::new(Vec::new()),
+            ext_out_queue: Mutex::new(Vec::new()),
             kill: CancellationToken::new(),
         });
         self.peers.write().unwrap().insert(addr, cell.clone());
@@ -2294,6 +2499,7 @@ impl TorrentEngine {
         }
         // 保留断开前的最后快照（getPeers 的 disconnected 分组，参考 C++ 版语义）
         let st = cell.state.lock().unwrap();
+        let (tcp_fails, utp_fails, udp_fails) = fail_stats_of(&self.dial_fail_stats, &cell.addr);
         let info = PeerInfo {
             addr: cell.addr.to_string(),
             peer_id: st
@@ -2312,6 +2518,12 @@ impl TorrentEngine {
             connected_secs: st.connected_at.elapsed().as_secs(),
             progress: peer_progress(&st),
             bitfield: peer_bitfield_hex(&st),
+            down_speed: 0,
+            up_speed: 0,
+            tcp_fails,
+            utp_fails,
+            udp_fails,
+            attempting: false,
         };
         drop(st);
         let mut dc = self.disconnected_peers.lock().unwrap();
@@ -2635,6 +2847,8 @@ impl TorrentEngine {
             .as_ref()
             .map(|s| s.piece_count())
             .unwrap_or(0);
+        // 拨号失败展示统计（tcp, utp）——只读锁，随函数结束释放
+        let fail_stats = self.dial_fail_stats.lock().unwrap();
         let mut out: Vec<PeerInfo> = self
             .peers
             .read()
@@ -2644,6 +2858,27 @@ impl TorrentEngine {
                 let st = c.state.lock().unwrap();
                 let progress = peer_progress(&st);
                 let bitfield = peer_bitfield_hex_with(&st, store_pieces);
+                // 拨号失败历史（展示统计）
+                let (tcp_fails, utp_fails, udp_fails) =
+                    fail_stats.get(&c.addr).copied().unwrap_or((0, 0, 0));
+                // RPC 展示速率：1Hz 采样折算（B/s）。peers_info 每 1s 被
+                // 进度上报调用一次，正好充当采样节拍；调度器用的 10s 窗口
+                // recent_speed 更新太慢，不适合直接展示。
+                let now_ms = unix_millis();
+                let prev_ms = c.disp_prev_ms.swap(now_ms, Ordering::Relaxed);
+                let down_now = c.downloaded.load(Ordering::Relaxed);
+                let up_now = c.uploaded.load(Ordering::Relaxed);
+                let prev_down = c.disp_prev_down.swap(down_now, Ordering::Relaxed);
+                let prev_up = c.disp_prev_up.swap(up_now, Ordering::Relaxed);
+                let (down_speed, up_speed) = if prev_ms > 0 && now_ms > prev_ms {
+                    let dt = now_ms - prev_ms;
+                    (
+                        down_now.saturating_sub(prev_down) * 1000 / dt,
+                        up_now.saturating_sub(prev_up) * 1000 / dt,
+                    )
+                } else {
+                    (0, 0)
+                };
                 PeerInfo {
                     addr: c.addr.to_string(),
                     peer_id: st
@@ -2662,6 +2897,12 @@ impl TorrentEngine {
                     connected_secs: st.connected_at.elapsed().as_secs(),
                     progress,
                     bitfield,
+                    down_speed,
+                    up_speed,
+                    tcp_fails,
+                    utp_fails,
+                    udp_fails,
+                    attempting: false,
                 }
             })
             .collect();
@@ -2670,6 +2911,39 @@ impl TorrentEngine {
             if !out.iter().any(|p| p.addr == info.addr) {
                 out.push(info.clone());
             }
+        }
+        drop(dc);
+        drop(fail_stats);
+        // 尝试中：pending 队列里尚未建立会话的地址（attempting 分组）
+        let pending = self.pending.lock().unwrap();
+        for (addr, source) in pending.iter() {
+            if out.iter().any(|p| p.addr == addr.to_string()) {
+                continue;
+            }
+            let (tcp_fails, utp_fails, udp_fails) = fail_stats_of(&self.dial_fail_stats, addr);
+            out.push(PeerInfo {
+                addr: addr.to_string(),
+                peer_id: None,
+                client: String::new(),
+                choked: false,
+                interested: false,
+                seed: false,
+                downloaded: 0,
+                encrypted: false,
+                connected: false,
+                source: *source,
+                uploaded: 0,
+                protocol: String::new(),
+                connected_secs: 0,
+                progress: None,
+                bitfield: String::new(),
+                down_speed: 0,
+                up_speed: 0,
+                tcp_fails,
+                utp_fails,
+                udp_fails,
+                attempting: true,
+            });
         }
         out
     }
@@ -2849,6 +3123,7 @@ impl TorrentEngine {
                     }
                     Err(err) => {
                         tracing::debug!(peer = %addr, error = %err, "uTP 拨号失败，回退 TCP");
+                        self.note_dial_fail(addr, false);
                     }
                 }
             }
@@ -2868,8 +3143,14 @@ impl TorrentEngine {
                     }
                     return DialOutcome::Done;
                 }
-                Ok(Err(err)) => tracing::debug!(peer = %addr, error = %err, "TCP 拨号失败"),
-                Err(_) => tracing::debug!(peer = %addr, "TCP 拨号超时({:?})", CONNECT_TIMEOUT),
+                Ok(Err(err)) => {
+                    tracing::debug!(peer = %addr, error = %err, "TCP 拨号失败");
+                    self.note_dial_fail(addr, true);
+                }
+                Err(_) => {
+                    tracing::debug!(peer = %addr, "TCP 拨号超时({:?})", CONNECT_TIMEOUT);
+                    self.note_dial_fail(addr, true);
+                }
             }
         }
         DialOutcome::Failed
@@ -2878,6 +3159,298 @@ impl TorrentEngine {
     /// 会话失败后的地址回填——计入失败次数并塞回 pending，
     /// 给地址有限次数的重试机会（超过即放弃，等 tracker/PEX 重新发现，
     /// 重新发现会清零计数）。引擎停机或主动淘汰（kill）不回填。
+    /// 记录一次拨号失败（展示统计，会话期累计；连接成功不清零——
+    /// 用户可以看到"这个 peer 连了几次才连上"的完整历史）。
+    fn note_dial_fail(&self, addr: SocketAddr, is_tcp: bool) {
+        let mut stats = self.dial_fail_stats.lock().unwrap();
+        let e = stats.entry(addr).or_insert((0, 0, 0));
+        if is_tcp {
+            e.0 += 1;
+        } else {
+            e.1 += 1;
+        }
+    }
+
+    /// 记录一次 UDP 打洞失败（展示统计第三分量）。
+    fn note_udp_punch_fail(&self, addr: SocketAddr) {
+        let mut stats = self.dial_fail_stats.lock().unwrap();
+        stats.entry(addr).or_insert((0, 0, 0)).2 += 1;
+    }
+
+    // ------------------------------------------------------------------
+    // ut_holepunch：UDP 打洞（NAT 穿透，libtorrent 事实标准）
+    // ------------------------------------------------------------------
+
+    /// 处理对端发来的 ut_holepunch 消息（libtorrent 标准扩展）。
+    ///
+    /// 三种消息的落地动作：
+    /// - **Rendezvous**：本端被请求作中介——向发起方与目标各发一条
+    ///   connect（各含对方的 endpoint），无法执行时回 failed（地址字段回显）。
+    /// - **Connect**：要求本端对指定 endpoint 发起 uTP 连接（SYN 兼作
+    ///   打洞探测包，多次重传即周期性穿透尝试）。
+    /// - **Failed**：记录原因（1=NoSuchPeer 2=NotConnected 3=NoSupport 4=NoSelf）。
+    ///
+    /// 语义与 libtorrent `bt_peer_connection::on_holepunch` 一致：
+    /// 先解析目标连接，再决定回 failed 还是双向 connect；未在扩展握手中
+    /// 广告 ut_holepunch 的对端发来的消息直接忽略（libtorrent 同款防线）。
+    fn handle_holepunch_message(self: &Arc<Self>, payload: &[u8], cell: &Arc<PeerCell>) {
+        // 对端未广告 ut_holepunch → 不接收（避免与不支持的对端无意义互动）
+        if cell.state.lock().unwrap().ut_holepunch_id == 0 {
+            tracing::debug!(peer = %cell.addr, "对端未广告 ut_holepunch，忽略其消息");
+            return;
+        }
+        match parse_holepunch_msg(payload) {
+            HolepunchMsg::Rendezvous { ip, port } => {
+                let target = SocketAddr::new(ip, port);
+                let requester = cell.addr;
+                // 中介收到的目标地址端口来自发起方的 announce/PEX 视角，
+                // 与本端观察到的连接源端口可能不同：先精确匹配，再同 IP 回退。
+                let Some(relay_cell) = self.find_connected_peer(&target) else {
+                    // 封禁 IP 同样视为不存在（不会向封禁对端转发任何消息）
+                    self.queue_holepunch_to(
+                        &requester,
+                        &HolepunchMsg::Failed {
+                            ip,
+                            port,
+                            err_code: HP_ERR_NOT_CONNECTED,
+                        },
+                    );
+                    return;
+                };
+                // 目标即发起方自身连接 → NoSelf
+                if relay_cell.addr == requester {
+                    self.queue_holepunch_to(
+                        &requester,
+                        &HolepunchMsg::Failed {
+                            ip,
+                            port,
+                            err_code: HP_ERR_NO_SELF,
+                        },
+                    );
+                    return;
+                }
+                // 目标连接存在但不支持 ut_holepunch → 无法转告 → NoSupport
+                if relay_cell.state.lock().unwrap().ut_holepunch_id == 0 {
+                    self.queue_holepunch_to(
+                        &requester,
+                        &HolepunchMsg::Failed {
+                            ip,
+                            port,
+                            err_code: HP_ERR_NO_SUPPORT,
+                        },
+                    );
+                    return;
+                }
+                // 与 libtorrent 相同的双向 connect：
+                // 发起方 → 对 rp 里的目标地址打洞；目标 → 对发起方的
+                // endpoint（本端观察到的外部地址）打洞。
+                self.queue_holepunch_to(
+                    &requester,
+                    &HolepunchMsg::Connect {
+                        ip: target.ip(),
+                        port: target.port(),
+                    },
+                );
+                self.queue_holepunch_to(
+                    &relay_cell.addr,
+                    &HolepunchMsg::Connect {
+                        ip: requester.ip(),
+                        port: requester.port(),
+                    },
+                );
+            }
+            HolepunchMsg::Connect { ip, port } => {
+                // 收到 connect：对指定 endpoint 发起 uTP 连接（打洞）。
+                let target = SocketAddr::new(ip, port);
+                self.spawn_holepunch(target);
+            }
+            HolepunchMsg::Failed {
+                ip,
+                port,
+                err_code,
+            } => {
+                tracing::debug!(
+                    peer = %cell.addr,
+                    target = %SocketAddr::new(ip, port),
+                    err_code,
+                    "对端拒绝 UDP 打洞（1=NoSuchPeer 2=NotConnected 3=NoSupport 4=NoSelf）"
+                );
+            }
+            HolepunchMsg::Invalid => {
+                tracing::debug!(peer = %cell.addr, "无法解析的 ut_holepunch 消息");
+            }
+        }
+    }
+
+    /// 查找与目标 endpoint 的既有连接：先精确匹配（libtorrent `find_peer`
+    /// 语义），再按同 IP 回退——中介视角的连接源端口常与发起方 announce
+    /// 的端口不一致（NAT），按 IP 匹配可显著提高中介成功率。
+    fn find_connected_peer(&self, target: &SocketAddr) -> Option<Arc<PeerCell>> {
+        let peers = self.peers.read().unwrap();
+        if let Some(c) = peers.get(target) {
+            return Some(c.clone());
+        }
+        peers
+            .values()
+            .find(|c| c.addr.ip() == target.ip())
+            .cloned()
+    }
+
+    /// 请求已连接且支持 ut_holepunch 的 peer 作中介，向 target 发起
+    /// 标准打洞介绍（libtorrent 语义：A→C rp(B) → C→A connect(B) +
+    /// C→B connect(A)）。libtorrent 询问 PEX 介绍人；本端无介绍人
+    /// 记录，询问任意支持该扩展的已连接 peer（不超过 [`HOLEPUNCH_RELAYS_PER_ROUND`]）。
+    fn request_holepunch_rendezvous(self: &Arc<Self>, target: &SocketAddr) {
+        // 每目标会话期最多 MAX_HOLEPUNCH_RENDEZVOUS 轮，防止反复失败刷屏
+        let round = {
+            let mut m = self.holepunch_rp_sent.lock().unwrap();
+            let n = m.entry(*target).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if round > MAX_HOLEPUNCH_RENDEZVOUS {
+            return;
+        }
+        let relays: Vec<SocketAddr> = {
+            let peers = self.peers.read().unwrap();
+            peers
+                .values()
+                .filter(|c| {
+                    c.addr != *target && c.state.lock().unwrap().ut_holepunch_id != 0
+                })
+                .take(HOLEPUNCH_RELAYS_PER_ROUND)
+                .map(|c| c.addr)
+                .collect()
+        };
+        for relay in relays {
+            let sent = self.queue_holepunch_to(
+                &relay,
+                &HolepunchMsg::Rendezvous {
+                    ip: target.ip(),
+                    port: target.port(),
+                },
+            );
+            tracing::debug!(
+                relay = %relay,
+                target = %target,
+                sent,
+                "请求 ut_holepunch 中介（rendezvous）"
+            );
+        }
+    }
+
+    /// 向指定 peer 投递一条 ut_holepunch 消息（跨会话，由对端自己的
+    /// 消息循环尽快发出）。对端未协商该扩展时静默失败。
+    fn queue_holepunch_to(&self, target: &SocketAddr, msg: &HolepunchMsg) -> bool {
+        let cell = {
+            let peers = self.peers.read().unwrap();
+            match peers.get(target) {
+                Some(c) => c.clone(),
+                None => return false,
+            }
+        };
+        // 用**对端广告的** ext_id 发送（BEP 10 语义：各用各的编号）
+        let ext_id = cell.state.lock().unwrap().ut_holepunch_id;
+        if ext_id == 0 {
+            return false;
+        }
+        cell.ext_out_queue
+            .lock()
+            .unwrap()
+            .push((ext_id, build_holepunch_msg(msg)));
+        true
+    }
+
+    /// 对目标地址发起一次 UDP 打洞（后台任务，立即返回）。
+    ///
+    /// 同一地址同时只允许一个在途打洞；每地址最多 [`MAX_HOLEPUNCH_ATTEMPTS`]
+    /// 次。判定失败时计入展示统计（`udpFails`），失败原因不阻断其它 peer。
+    fn spawn_holepunch(self: &Arc<Self>, target: SocketAddr) {
+        // 已连接 / 已封禁 / 引擎停机 → 无需打洞
+        if self.peers.read().unwrap().contains_key(&target) {
+            return;
+        }
+        if self.is_banned(&target.ip()) {
+            return;
+        }
+        if self.shutdown.is_cancelled() {
+            return;
+        }
+        if !self.holepunch_inflight.lock().unwrap().insert(target) {
+            return;
+        }
+        {
+            let mut attempts = self.holepunch_attempts.lock().unwrap();
+            let n = attempts.entry(target).or_insert(0);
+            *n += 1;
+            if *n > MAX_HOLEPUNCH_ATTEMPTS {
+                drop(attempts);
+                self.holepunch_inflight.lock().unwrap().remove(&target);
+                tracing::debug!(peer = %target, "打洞尝试次数已达上限，放弃");
+                return;
+            }
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            let ok = me.clone().holepunch_attempt(target).await;
+            me.holepunch_inflight.lock().unwrap().remove(&target);
+            if ok {
+                me.holepunch_successes.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(peer = %target, "UDP 打洞成功（uTP 握手完成）");
+            } else {
+                me.note_udp_punch_fail(target);
+                tracing::debug!(peer = %target, "UDP 打洞失败");
+            }
+        });
+    }
+
+    /// 打洞主体：反复发起 uTP 连接，直到成功或超时。
+    ///
+    /// uTP SYN 自身就是探测包：每次尝试让本端 NAT 为「uTP 端口 ↔ 目标」
+    /// 建立映射，SYN 重传提供周期性穿透；对端同时也在打洞时，任一侧
+    /// SYN 穿透即握手完成。无需额外的裸 UDP 报文。
+    async fn holepunch_attempt(self: Arc<Self>, target: SocketAddr) -> bool {
+        let Some(handle) = self.utp.lock().unwrap().clone() else {
+            return false;
+        };
+        let deadline = Instant::now() + HOLEPUNCH_TIMEOUT;
+        loop {
+            if self.shutdown.is_cancelled() || Instant::now() >= deadline {
+                return false;
+            }
+            if let Ok(stream) = handle.connect_established(target, HOLEPUNCH_UTP_TIMEOUT).await {
+                return self.adopt_holepunched(target, stream);
+            }
+            if Instant::now() + HOLEPUNCH_RETRY_INTERVAL >= deadline {
+                return false;
+            }
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return false,
+                _ = tokio::time::sleep(HOLEPUNCH_RETRY_INTERVAL) => {}
+            }
+        }
+    }
+
+    /// 打洞成功后的接线：注册为 Holepunch 来源的 peer 并跑常规 BT 会话。
+    fn adopt_holepunched(self: &Arc<Self>, target: SocketAddr, stream: UtpStream) -> bool {
+        if self.shutdown.is_cancelled() {
+            return false;
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            let cell = me.register_peer(target, PeerSource::Holepunch);
+            let result = me
+                .clone()
+                .run_peer(target, stream, true, None)
+                .await;
+            me.unregister_peer(&target, cell);
+            if let Err(e) = result {
+                tracing::debug!(peer = %target, error = %e, "打洞建立的会话结束");
+            }
+        });
+        true
+    }
+
     fn retry_later(self: &Arc<Self>, addr: SocketAddr, source: PeerSource) {
         if self.shutdown.is_cancelled() {
             return;
@@ -2890,6 +3463,14 @@ impl TorrentEngine {
         };
         if attempts > MAX_DIAL_RETRIES {
             tracing::debug!(peer = %addr, attempts, "连续失败放弃重试，等待重新发现");
+            // 打洞兜底：TCP/uTP 直连都失败，且配置允许 uTP 时：
+            // 1) 直接对目标发起 uTP 打洞（对端同时也在打洞时直接成功）；
+            // 2) 请求已连接且支持 ut_holepunch 的 peer 作中介（libtorrent
+            //    标准语义，可穿透双 NAT：C→A connect(B) + C→B connect(A)）。
+            if self.bt_protocol().allows_utp() && self.utp.lock().unwrap().is_some() {
+                self.spawn_holepunch(addr);
+                self.request_holepunch_rendezvous(&addr);
+            }
             return;
         }
         let mut pending = self.pending.lock().unwrap();
@@ -3295,6 +3876,9 @@ impl TorrentEngine {
         // PEX 每 60s 发送一次
         let mut pex_timer = tokio::time::interval(PEX_INTERVAL);
         pex_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // ut_holepunch 中介转发等跨会话扩展消息：1s 出队，避免依赖 10s 的 choke 轮
+        let mut ext_timer = tokio::time::interval(Duration::from_secs(1));
+        ext_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let piece_count = self.store.lock().unwrap().as_ref().unwrap().piece_count();
         let mut pex_exchange = xfer_discovery::pex::PexExchange::new();
 
@@ -3326,8 +3910,7 @@ impl TorrentEngine {
                 }
                 _ = choke_timer.tick() => {
                     // Choking 算法决策
-                    self.decide_choking(stream, &ctx.cell).await?;
-                    // 出队并发送 broadcast_have 积攒的 Have 消息
+                    self.decide_choking(stream, &ctx.cell).await?;                    // 出队并发送 broadcast_have 积攒的 Have 消息
                     let haves: Vec<u32> =
                         std::mem::take(&mut *ctx.cell.have_out_queue.lock().unwrap());
                     for p in haves {
@@ -3370,6 +3953,17 @@ impl TorrentEngine {
                 _ = pex_timer.tick() => {
                     // PEX 消息发送（BEP 11）
                     self.send_pex_message(stream, &ctx.cell, &mut pex_exchange).await?;
+                }
+                _ = ext_timer.tick() => {
+                    // 跨会话投递的扩展消息出队发送（ut_holepunch 中介转发 Connect）
+                    let pending: Vec<(u8, Vec<u8>)> =
+                        std::mem::take(&mut *ctx.cell.ext_out_queue.lock().unwrap());
+                    for (ext_id, payload) in pending {
+                        stream
+                            .write_all(&Message::Extended { ext_id, payload }.encode())
+                            .await
+                            .map_err(|e| format!("扩展消息发送失败: {e}"))?;
+                    }
                 }
                 msg = reader.read_message(stream) => {
                     let Some(msg) = msg.map_err(|e| format!("读取失败: {e}"))? else {
@@ -3514,6 +4108,9 @@ impl TorrentEngine {
                                 // 广告了 ut_metadata=2 却从不响应 = 蜂群"坏公民"）
                                 self.serve_ut_metadata(stream, &payload, &ctx.cell)
                                     .await?;
+                            } else if ext_id == UT_HOLEPUNCH_EXT_ID {
+                                // NAT 穿透打洞（对端用我方广告的 id 发来）
+                                self.handle_holepunch_message(&payload, &ctx.cell);
                             } else {
                                 self.handle_extension_message(ext_id, &payload, &ctx.cell);
                             }
@@ -3707,6 +4304,11 @@ impl TorrentEngine {
             b"ut_metadata".to_vec(),
             Value::Int(UT_METADATA_EXT_ID as i64),
         );
+        // NAT 穿透：声明 ut_holepunch（libtorrent 标准），对端才会向我们发起打洞
+        m.insert(
+            b"ut_holepunch".to_vec(),
+            Value::Int(UT_HOLEPUNCH_EXT_ID as i64),
+        );
         let mut dict = BTreeMap::new();
         dict.insert(b"m".to_vec(), Value::Dict(m));
         dict.insert(
@@ -3751,11 +4353,17 @@ impl TorrentEngine {
                             st.ut_metadata_id = *id as u8;
                             st.our_ut_metadata_id = UT_METADATA_EXT_ID;
                         }
+                        if let Some(Value::Int(id)) = m.get(b"ut_holepunch".as_slice()) {
+                            let mut st = cell.state.lock().unwrap();
+                            st.ut_holepunch_id = *id as u8;
+                            st.our_ut_holepunch_id = UT_HOLEPUNCH_EXT_ID;
+                        }
                         let st = cell.state.lock().unwrap();
                         tracing::debug!(
                             peer = %cell.addr,
                             ut_pex_id = st.ut_pex_id,
                             ut_metadata_id = st.ut_metadata_id,
+                            ut_holepunch_id = st.ut_holepunch_id,
                             "对端扩展握手完成"
                         );
                     }
@@ -4537,13 +5145,19 @@ impl TorrentEngine {
                 .filter(|c| !is_loopback(&c.addr)) // 不通告回环地址
                 .map(|c| {
                     let st = c.state.lock().unwrap();
-                    // 本引擎只走 TCP，不能带 UTP 标志，否则对端会尝试
-                    // 永远连不通的 uTP 连接
-                    let flags = if st.encrypted {
-                        xfer_discovery::pex::flags::ENCRYPTION
-                    } else {
-                        0
-                    };
+                    // flags（BEP 11）：加密 / uTP / holepunch 能力位。
+                    // holepunch 位让 libtorrent 系客户端把我们已连接的 peer
+                    // 当作可用的中介候选；uTP 位标记该 peer 经 uTP 连接。
+                    let mut flags = 0;
+                    if st.encrypted {
+                        flags |= xfer_discovery::pex::flags::ENCRYPTION;
+                    }
+                    if *c.transport.lock().unwrap() == TransportKind::Utp {
+                        flags |= xfer_discovery::pex::flags::UTP;
+                    }
+                    if st.ut_holepunch_id != 0 {
+                        flags |= xfer_discovery::pex::flags::HOLEPUNCH;
+                    }
                     (c.addr, st.peer_id.unwrap_or(PeerId([0; 20])), flags)
                 })
                 .collect()
@@ -5287,6 +5901,22 @@ fn peer_client_desc(st: &PeerState) -> String {
     client_name_from_peer_id(st.peer_id)
 }
 
+/// 读取某地址的拨号失败展示统计（tcp, utp, udp 打洞）。
+fn fail_stats_of(
+    stats: &Mutex<HashMap<SocketAddr, (u32, u32, u32)>>,
+    addr: &SocketAddr,
+) -> (u32, u32, u32) {
+    stats.lock().unwrap().get(addr).copied().unwrap_or((0, 0, 0))
+}
+
+/// 当前 Unix 毫秒（getPeers 展示速率的采样时间戳）。
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 对端下载进度百分比（PeerInfo.progress）。
 ///
 /// - 对端是 seed（HaveAll/完成）→ 100；
@@ -5508,6 +6138,358 @@ mod tests {
         encode(&Value::Dict(d))
     }
 
+    // ---- ut_holepunch：libtorrent 标准消息编解码 ----
+
+    /// 构造标准 IPv4 rendezvous 报文（libtorrent 线格式 8 字节）。
+    fn std_v4_rendezvous(ip: [u8; 4], port: u16) -> Vec<u8> {
+        let mut buf = vec![HP_RENDEZVOUS, 0];
+        buf.extend_from_slice(&ip);
+        buf.extend_from_slice(&port.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn holepunch_rendezvous_roundtrip_ipv4() {
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7));
+        let msg = HolepunchMsg::Rendezvous { ip, port: 6881 };
+        let encoded = build_holepunch_msg(&msg);
+        // 标准报文：IPv4 rendezvous 固定 8 字节（type + addr_type + addr + port）
+        assert_eq!(encoded.len(), 8, "IPv4 rendezvous 必须是 8 字节");
+        assert_eq!(parse_holepunch_msg(&encoded), msg);
+        // 与手工构造的标准字节序列逐字节一致（libtorrent 兼容性）
+        assert_eq!(encoded, std_v4_rendezvous([203, 0, 113, 7], 6881));
+        // ip 为 4 字节裸地址而非文本
+        assert!(encoded.windows(4).any(|w| w == [203, 0, 113, 7]));
+    }
+
+    #[test]
+    fn holepunch_connect_roundtrip() {
+        let connect = HolepunchMsg::Connect {
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 9)),
+            port: 51413,
+        };
+        let encoded = build_holepunch_msg(&connect);
+        assert_eq!(encoded.len(), 8, "IPv4 connect 必须是 8 字节");
+        assert_eq!(parse_holepunch_msg(&encoded), connect);
+        assert_eq!(encoded[0], HP_CONNECT);
+    }
+
+    #[test]
+    fn holepunch_failed_roundtrip_with_error_code() {
+        let failed = HolepunchMsg::Failed {
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 3)),
+            port: 6881,
+            err_code: HP_ERR_NOT_CONNECTED,
+        };
+        let encoded = build_holepunch_msg(&failed);
+        // 标准报文：failed = 8 字节头 + 4 字节错误码 = 12 字节
+        assert_eq!(encoded.len(), 12);
+        // 端口在 offset 6..8，错误码在 offset 8..12（libtorrent 布局）
+        assert_eq!(&encoded[6..8], &6881u16.to_be_bytes());
+        assert_eq!(&encoded[8..12], &HP_ERR_NOT_CONNECTED.to_be_bytes());
+        assert_eq!(parse_holepunch_msg(&encoded), failed);
+    }
+
+    #[test]
+    fn holepunch_roundtrip_ipv6() {
+        let ip = std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+        let msg = HolepunchMsg::Rendezvous { ip, port: 51413 };
+        let encoded = build_holepunch_msg(&msg);
+        // 标准报文：IPv6 rendezvous 固定 20 字节
+        assert_eq!(encoded.len(), 20);
+        assert_eq!(parse_holepunch_msg(&encoded), msg);
+        let failed = HolepunchMsg::Failed {
+            ip,
+            port: 51413,
+            err_code: HP_ERR_NO_SUPPORT,
+        };
+        assert_eq!(build_holepunch_msg(&failed).len(), 24);
+        assert_eq!(parse_holepunch_msg(&build_holepunch_msg(&failed)), failed);
+    }
+
+    #[test]
+    fn holepunch_parses_invalid_payloads_as_invalid() {
+        // 空 / 截断 / 未知 msg_type / 未知 addr_type 均不得 panic，一律 Invalid
+        assert_eq!(parse_holepunch_msg(b""), HolepunchMsg::Invalid);
+        assert_eq!(parse_holepunch_msg(&[HP_RENDEZVOUS]), HolepunchMsg::Invalid);
+        assert_eq!(
+            parse_holepunch_msg(&[HP_RENDEZVOUS, 0, 1, 2, 3]), // 不足 8 字节
+            HolepunchMsg::Invalid
+        );
+        assert_eq!(
+            parse_holepunch_msg(&[99, 0, 1, 2, 3, 4, 5, 6]),
+            HolepunchMsg::Invalid
+        );
+        assert_eq!(
+            parse_holepunch_msg(&[HP_RENDEZVOUS, 7, 1, 2, 3, 4, 5, 6]),
+            HolepunchMsg::Invalid
+        );
+        // failed 缺错误码 → Invalid
+        assert_eq!(
+            parse_holepunch_msg(&[HP_FAILED, 0, 1, 2, 3, 4, 5, 6]),
+            HolepunchMsg::Invalid
+        );
+        // IPv6 截断（不足 20 字节）→ Invalid
+        assert_eq!(
+            parse_holepunch_msg(&[HP_CONNECT, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            HolepunchMsg::Invalid
+        );
+    }
+
+    #[test]
+    fn holepunch_parses_standard_client_messages() {
+        // qBittorrent/Deluge（libtorrent）发来的 rendezvous 就是 8 字节裸报文：
+        // type(0) + addr_type(0) + ip(203.0.113.7) + port(6881)，端口在 offset 6..8
+        let msg = std_v4_rendezvous([203, 0, 113, 7], 6881);
+        assert_eq!(
+            parse_holepunch_msg(&msg),
+            HolepunchMsg::Rendezvous {
+                ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
+                port: 6881,
+            }
+        );
+        // rendezvous/connect 带尾部补零字节也应宽容解析
+        let mut padded = msg.clone();
+        padded.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(
+            parse_holepunch_msg(&padded),
+            parse_holepunch_msg(&msg),
+            "尾部多余字节应被忽略"
+        );
+    }
+
+    #[test]
+    fn holepunch_invalid_msg_encodes_empty() {
+        // Invalid 不参与编码（返回空体，调用方不应发送）
+        assert!(build_holepunch_msg(&HolepunchMsg::Invalid).is_empty());
+    }
+
+    /// 构造测试用 PeerCell（hp_id = 对端扩展握手广告的 ut_holepunch id）。
+    fn make_holepunch_cell(addr: SocketAddr, hp_id: u8) -> Arc<PeerCell> {
+        Arc::new(PeerCell {
+            addr,
+            state: Mutex::new(PeerState {
+                ut_holepunch_id: hp_id,
+                ..empty_peer_state()
+            }),
+            downloaded: AtomicU64::new(0),
+            uploaded: AtomicU64::new(0),
+            prev_downloaded: Mutex::new(0),
+            disp_prev_down: AtomicU64::new(0),
+            disp_prev_up: AtomicU64::new(0),
+            disp_prev_ms: AtomicU64::new(0),
+            queued: Mutex::new(Vec::new()),
+            pipeline: Mutex::new(0),
+            last_block_at: Mutex::new(Instant::now()),
+            source: PeerSource::Incoming,
+            transport: Mutex::new(TransportKind::Tcp),
+            have_out_queue: Mutex::new(Vec::new()),
+            ext_out_queue: Mutex::new(Vec::new()),
+            kill: CancellationToken::new(),
+        })
+    }
+
+    /// 取出 cell 的扩展消息队列并解析为 HolepunchMsg 列表。
+    fn drain_holepunch_queue(cell: &Arc<PeerCell>) -> Vec<HolepunchMsg> {
+        cell.ext_out_queue
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|(_, payload)| parse_holepunch_msg(&payload))
+            .collect()
+    }
+
+    #[test]
+    fn holepunch_relay_forwards_connect_both_ways() {
+        // 标准中介语义：A 请本端介绍 B → A 收 connect(B)，B 收 connect(A)
+        let engine = TorrentEngine::new_magnet([7u8; 20], TorrentConfig::default()).unwrap();
+        let a = make_holepunch_cell(
+            "203.0.113.1:30000".parse().unwrap(),
+            4, // 对端（libtorrent 系）广告的 ut_holepunch ext id
+        );
+        let b = make_holepunch_cell("203.0.113.2:6881".parse().unwrap(), 4);
+        engine.peers.write().unwrap().insert(a.addr, a.clone());
+        engine.peers.write().unwrap().insert(b.addr, b.clone());
+
+        let rp = build_holepunch_msg(&HolepunchMsg::Rendezvous {
+            ip: b.addr.ip(),
+            port: b.addr.port(),
+        });
+        engine.handle_holepunch_message(&rp, &a);
+
+        let to_a = drain_holepunch_queue(&a);
+        assert_eq!(
+            to_a,
+            vec![HolepunchMsg::Connect {
+                ip: b.addr.ip(),
+                port: b.addr.port(),
+            }],
+            "发起方应收到 connect（目标地址）"
+        );
+        let to_b = drain_holepunch_queue(&b);
+        assert_eq!(
+            to_b,
+            vec![HolepunchMsg::Connect {
+                ip: a.addr.ip(),
+                port: a.addr.port(),
+            }],
+            "目标应收到 connect（发起方地址）"
+        );
+    }
+
+    #[test]
+    fn holepunch_relay_fails_when_target_unknown() {
+        let engine = TorrentEngine::new_magnet([7u8; 20], TorrentConfig::default()).unwrap();
+        let a = make_holepunch_cell("203.0.113.1:30000".parse().unwrap(), 4);
+        engine.peers.write().unwrap().insert(a.addr, a.clone());
+
+        let rp = build_holepunch_msg(&HolepunchMsg::Rendezvous {
+            ip: "192.0.2.50".parse().unwrap(),
+            port: 6881,
+        });
+        engine.handle_holepunch_message(&rp, &a);
+        assert_eq!(
+            drain_holepunch_queue(&a),
+            vec![HolepunchMsg::Failed {
+                ip: "192.0.2.50".parse().unwrap(),
+                port: 6881,
+                err_code: HP_ERR_NOT_CONNECTED,
+            }],
+            "目标未连接应回 failed(not_connected)"
+        );
+    }
+
+    #[test]
+    fn holepunch_relay_no_support_when_target_lacks_extension() {
+        // 目标已连接但未广告 ut_holepunch → failed(no_support)，不转发 connect
+        let engine = TorrentEngine::new_magnet([7u8; 20], TorrentConfig::default()).unwrap();
+        let a = make_holepunch_cell("203.0.113.1:30000".parse().unwrap(), 4);
+        let b = make_holepunch_cell("203.0.113.2:6881".parse().unwrap(), 0);
+        engine.peers.write().unwrap().insert(a.addr, a.clone());
+        engine.peers.write().unwrap().insert(b.addr, b.clone());
+
+        let rp = build_holepunch_msg(&HolepunchMsg::Rendezvous {
+            ip: b.addr.ip(),
+            port: b.addr.port(),
+        });
+        engine.handle_holepunch_message(&rp, &a);
+        assert_eq!(
+            drain_holepunch_queue(&a),
+            vec![HolepunchMsg::Failed {
+                ip: b.addr.ip(),
+                port: b.addr.port(),
+                err_code: HP_ERR_NO_SUPPORT,
+            }],
+        );
+        assert!(
+            drain_holepunch_queue(&b).is_empty(),
+            "不支持扩展的目标不应收到任何消息"
+        );
+    }
+
+    #[test]
+    fn holepunch_relay_no_self() {
+        // 目标就是发起方自身连接 → failed(no_self)
+        let engine = TorrentEngine::new_magnet([7u8; 20], TorrentConfig::default()).unwrap();
+        let a = make_holepunch_cell("203.0.113.1:30000".parse().unwrap(), 4);
+        engine.peers.write().unwrap().insert(a.addr, a.clone());
+
+        let rp = build_holepunch_msg(&HolepunchMsg::Rendezvous {
+            ip: a.addr.ip(),
+            port: a.addr.port(),
+        });
+        engine.handle_holepunch_message(&rp, &a);
+        assert_eq!(
+            drain_holepunch_queue(&a),
+            vec![HolepunchMsg::Failed {
+                ip: a.addr.ip(),
+                port: a.addr.port(),
+                err_code: HP_ERR_NO_SELF,
+            }],
+        );
+    }
+
+    #[test]
+    fn holepunch_ignores_peers_without_extension() {
+        // 未广告 ut_holepunch 的对端发来的消息一律忽略（libtorrent 同款防线）
+        let engine = TorrentEngine::new_magnet([7u8; 20], TorrentConfig::default()).unwrap();
+        let a = make_holepunch_cell("203.0.113.1:30000".parse().unwrap(), 0);
+        let b = make_holepunch_cell("203.0.113.2:6881".parse().unwrap(), 4);
+        engine.peers.write().unwrap().insert(a.addr, a.clone());
+        engine.peers.write().unwrap().insert(b.addr, b.clone());
+
+        let rp = build_holepunch_msg(&HolepunchMsg::Rendezvous {
+            ip: b.addr.ip(),
+            port: b.addr.port(),
+        });
+        engine.handle_holepunch_message(&rp, &a);
+        assert!(drain_holepunch_queue(&a).is_empty());
+        assert!(drain_holepunch_queue(&b).is_empty());
+    }
+
+    #[tokio::test]
+    async fn holepunch_connect_message_triggers_punch() {
+        // 收到 connect → 对目标地址发起一次打洞（计数 1）
+        let engine = TorrentEngine::new_magnet([7u8; 20], TorrentConfig::default()).unwrap();
+        let a = make_holepunch_cell("203.0.113.1:30000".parse().unwrap(), 4);
+        engine.peers.write().unwrap().insert(a.addr, a.clone());
+
+        let target: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        let connect = build_holepunch_msg(&HolepunchMsg::Connect {
+            ip: target.ip(),
+            port: target.port(),
+        });
+        engine.handle_holepunch_message(&connect, &a);
+        assert_eq!(
+            engine.holepunch_attempts.lock().unwrap().get(&target),
+            Some(&1),
+            "connect 应触发对目标的一次打洞尝试"
+        );
+    }
+
+    #[tokio::test]
+    async fn holepunch_rendezvous_request_targets_capable_peers_only() {
+        // 发起侧：直连失败后向支持 ut_holepunch 的已连 peer 请求中介，
+        // 轮数受 MAX_HOLEPUNCH_RENDEZVOUS 限制
+        let engine = TorrentEngine::new_magnet([7u8; 20], TorrentConfig::default()).unwrap();
+        let capable = make_holepunch_cell("203.0.113.1:30000".parse().unwrap(), 4);
+        let incapable = make_holepunch_cell("203.0.113.2:30001".parse().unwrap(), 0);
+        engine
+            .peers
+            .write()
+            .unwrap()
+            .insert(capable.addr, capable.clone());
+        engine
+            .peers
+            .write()
+            .unwrap()
+            .insert(incapable.addr, incapable.clone());
+
+        let target: SocketAddr = "192.0.2.99:6881".parse().unwrap();
+        engine.request_holepunch_rendezvous(&target);
+        assert_eq!(
+            drain_holepunch_queue(&capable),
+            vec![HolepunchMsg::Rendezvous {
+                ip: target.ip(),
+                port: target.port(),
+            }],
+        );
+        assert!(drain_holepunch_queue(&incapable).is_empty());
+
+        // 第二轮允许，第三轮封顶
+        engine.request_holepunch_rendezvous(&target);
+        assert_eq!(drain_holepunch_queue(&capable).len(), 1);
+        engine.request_holepunch_rendezvous(&target);
+        assert!(
+            drain_holepunch_queue(&capable).is_empty(),
+            "超过 MAX_HOLEPUNCH_RENDEZVOUS 轮后不再请求"
+        );
+        assert_eq!(
+            engine.holepunch_rp_sent.lock().unwrap().get(&target),
+            Some(&3)
+        );
+    }
+
     #[test]
     fn metadata_accum_piece_count_and_assemble() {
         let mut acc = MetadataAccum::default();
@@ -5536,7 +6518,14 @@ mod tests {
             hs.windows(11).any(|w| w == b"ut_metadata"),
             "扩展握手应声明 ut_metadata"
         );
-        assert!(hs.windows(6).any(|w| w == b"ut_pex"));
+        assert!(
+            hs.windows(6).any(|w| w == b"ut_pex"),
+            "扩展握手应声明 ut_pex"
+        );
+        assert!(
+            hs.windows(12).any(|w| w == b"ut_holepunch"),
+            "扩展握手应声明 ut_holepunch（标准打洞互通前提）"
+        );
     }
 
     /// 构造零值 PeerState（测试用）。
@@ -5564,6 +6553,8 @@ mod tests {
             our_ut_pex_id: 0,
             ut_metadata_id: 0,
             our_ut_metadata_id: UT_METADATA_EXT_ID,
+            ut_holepunch_id: 0,
+            our_ut_holepunch_id: UT_HOLEPUNCH_EXT_ID,
             allowed_fast_set: HashSet::new(),
             am_allowed_fast_set: HashSet::new(),
             last_data_transfer: now,
@@ -5836,6 +6827,8 @@ mod tests {
             our_ut_pex_id: 0,
             ut_metadata_id: 0,
             our_ut_metadata_id: 0,
+            ut_holepunch_id: 0,
+            our_ut_holepunch_id: 0,
             allowed_fast_set: HashSet::new(),
             am_allowed_fast_set: HashSet::new(),
             last_data_transfer: now,

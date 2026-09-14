@@ -246,6 +246,8 @@ impl UtpManager {
 
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        // 打洞事件广播：容量 64 足够（同时打洞的目标数远小于此），
+        // 无订阅者时 send 失败被忽略，不影响主循环。
 
         let manager = UtpManager {
             socket,
@@ -254,7 +256,10 @@ impl UtpManager {
             tick_interval: Duration::from_millis(1),
         };
 
-        let handle = UtpManagerHandle { local_addr, cmd_tx };
+        let handle = UtpManagerHandle {
+            local_addr,
+            cmd_tx,
+        };
 
         // 启动管理器任务
         tokio::spawn(async move {
@@ -347,6 +352,8 @@ impl UtpManager {
                         ManagerCmd::Shutdown => {
                             break;
                         }
+                        // BEP 55：发裸打洞包。发送失败只记 debug——
+                        // 打洞本就是尽力而为，失败由上层超时计数收敛。
                     }
                 }
             }
@@ -695,6 +702,7 @@ impl UtpManagerHandle {
     pub async fn shutdown(&self) {
         let _ = self.cmd_tx.send(ManagerCmd::Shutdown).await;
     }
+
 }
 
 #[cfg(test)]
@@ -819,6 +827,5 @@ mod tests {
         );
         client_handle.shutdown().await;
     }
-
 
 }

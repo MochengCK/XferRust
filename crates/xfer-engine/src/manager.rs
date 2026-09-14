@@ -191,11 +191,28 @@ struct Inner {
     tracker_subscriptions: Vec<TrackerSubscription>,
     /// 是否启用 Tracker 订阅自动更新（默认 true）。
     auto_update_trackers: bool,
-    /// 全局 BT 封禁名单：IP → 过期时刻（None = 永久）。作用于所有
+    /// 全局 BT 封禁名单：IP → 封禁条目。作用于所有
     /// BT 任务（aria2 banPeer 的全局语义），随会话持久化。
-    bt_bans: HashMap<IpAddr, Option<Instant>>,
+    bt_bans: HashMap<IpAddr, BtBanEntry>,
     // 全局下载限速不再用共享令牌桶承载：每个任务持有自己的限速器，
     // rate 由 apply_task_rate_limits 按 eff_limit（单任务优先，未设置跟随全局）合成同步。
+}
+
+/// BT IP 封禁条目（全局封禁名单的一项）。
+#[derive(Debug, Clone, Copy)]
+struct BtBanEntry {
+    /// 过期时刻；None = 永久封禁。
+    expires: Option<Instant>,
+    /// 是否由用户手动封禁（`task.banPeer`）。false = 来自封禁名单下发
+    /// （订阅/全量替换），用于界面区分「手动封禁」与「在封禁列表中」。
+    manual: bool,
+}
+
+impl BtBanEntry {
+    /// 是否仍在封禁期（None = 永久，恒为真）。
+    fn is_active(&self, now: Instant) -> bool {
+        self.expires.map(|t| t > now).unwrap_or(true)
+    }
 }
 
 /// Tracker 订阅源：远程 URL 返回纯文本（每行一个 tracker URL）。
@@ -413,7 +430,7 @@ impl TaskManager {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let mut restored: HashMap<IpAddr, Option<Instant>> = HashMap::new();
+            let mut restored: HashMap<IpAddr, BtBanEntry> = HashMap::new();
             for entry in bans {
                 let Some(ip) = entry.get("ip").and_then(Value::as_str).and_then(|s| s.parse().ok())
                 else {
@@ -426,7 +443,18 @@ impl TaskManager {
                     }
                     _ => continue, // 已过期：丢弃
                 };
-                restored.insert(ip, expires);
+                // 旧会话文件无 manual 字段：缺省视为名单下发（非手动）
+                let manual = entry
+                    .get("manual")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                restored.insert(
+                    ip,
+                    BtBanEntry {
+                        expires,
+                        manual,
+                    },
+                );
             }
             if !restored.is_empty() {
                 mgr.inner.lock().unwrap().bt_bans = restored;
@@ -726,17 +754,18 @@ impl TaskManager {
         let bt_ip_bans: Vec<Value> = inner
             .bt_bans
             .iter()
-            .filter(|(_, e)| e.map(|t| t > now).unwrap_or(true))
+            .filter(|(_, e)| e.is_active(now))
             .map(|(ip, e)| {
                 json!({
                     "ip": ip.to_string(),
-                    "expires": e.map(|t| {
+                    "expires": e.expires.map(|t| {
                         t.duration_since(Instant::now()).as_secs()
                             + std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0)
                     }).unwrap_or(0),
+                    "manual": e.manual,
                 })
             })
             .collect();
@@ -1856,9 +1885,15 @@ impl TaskManager {
                 let mut inner = self.inner.lock().unwrap();
                 inner
                     .bt_bans
-                    .retain(|ip, e| !(e.is_none() && !parsed_set.contains(ip)));
+                    .retain(|ip, e| !(e.expires.is_none() && !parsed_set.contains(ip)));
                 for ip in &parsed {
-                    inner.bt_bans.insert(*ip, None);
+                    inner.bt_bans.insert(
+                        *ip,
+                        BtBanEntry {
+                            expires: None,
+                            manual: false,
+                        },
+                    );
                 }
             }
             self.apply_bans_to_running();
@@ -2197,9 +2232,33 @@ impl TaskManager {
                     "connectedSecs": p.connected_secs,
                     "progress": p.progress,
                     "bitfield": p.bitfield,
+                    "downSpeed": p.down_speed,
+                    "upSpeed": p.up_speed,
+                    "tcpFails": p.tcp_fails,
+                    "utpFails": p.utp_fails,
+                    "udpFails": p.udp_fails,
+                    "attempting": p.attempting,
                 })
             })
             .collect();
+        // 全局封禁名单（banned 分组）：封禁按 IP 记录、无端口，因此
+        // `addr` 只有地址、`port` 留空由界面按「无端口」渲染。
+        // 一次 getPeers 同时给出在线/尝试中/已断开/已封禁四类。
+        let mut arr = arr;
+        for (ip, remaining, manual) in self.banned_peer_list() {
+            arr.push(json!({
+                "addr": ip.to_string(),
+                "connected": false,
+                "banned": true,
+                "attempting": false,
+                "remainingSecs": remaining,
+                "source": if manual { "manual" } else { "auto" },
+                "banReason": if manual { "manual" } else { "ban_list" },
+                "tcpFails": 0,
+                "utpFails": 0,
+                "udpFails": 0,
+            }));
+        }
         Ok(Value::Array(arr))
     }
 
@@ -2326,10 +2385,16 @@ impl TaskManager {
         };
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.bt_bans.insert(parsed, expires);
+            inner.bt_bans.insert(
+                parsed,
+                BtBanEntry {
+                    expires,
+                    manual: true,
+                },
+            );
             // 顺手清理其它已过期条目，避免名单无限增长
             let now = Instant::now();
-            inner.bt_bans.retain(|_, e| e.map(|t| t > now).unwrap_or(true));
+            inner.bt_bans.retain(|_, e| e.is_active(now));
         }
         self.apply_bans_to_running();
         self.save_session_now();
@@ -2364,10 +2429,32 @@ impl TaskManager {
     fn bt_bans_snapshot(&self) -> Vec<(IpAddr, Option<Instant>)> {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
+        inner.bt_bans.retain(|_, e| e.is_active(now));
         inner
             .bt_bans
-            .retain(|_, e| e.map(|t| t > now).unwrap_or(true));
-        inner.bt_bans.iter().map(|(k, v)| (*k, *v)).collect()
+            .iter()
+            .map(|(k, v)| (*k, v.expires))
+            .collect()
+    }
+
+    /// 封禁名单的完整快照（含来源），供 getPeers 的 banned 分组展示。
+    ///
+    /// 返回 (IP, 剩余秒数（0 = 永久）, 是否手动封禁)。
+    pub fn banned_peer_list(&self) -> Vec<(IpAddr, u64, bool)> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        inner.bt_bans.retain(|_, e| e.is_active(now));
+        inner
+            .bt_bans
+            .iter()
+            .map(|(ip, e)| {
+                let remaining = e
+                    .expires
+                    .map(|t| t.saturating_duration_since(now).as_secs())
+                    .unwrap_or(0);
+                (*ip, remaining, e.manual)
+            })
+            .collect()
     }
 
     /// 把当前封禁名单下发到指定 BT 引擎（任务启动路径）。
