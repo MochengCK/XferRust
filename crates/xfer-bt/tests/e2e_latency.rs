@@ -41,15 +41,24 @@ fn sha1_of(b: &[u8]) -> [u8; 20] {
 }
 
 /// 参考 seed：握手 → Bitfield + Unchoke → 按请求回块（无任何限速）。
-async fn serve_seed(listener: TcpListener, data: Arc<Vec<u8>>, info_hash: InfoHash) {
+/// `first_request_at`：收到首个 Request 的时刻（测试以此为计时起点，
+/// 排除 announce / 拨号 / 握手的开销——慢 CI 上这部分抖动足以淹没
+/// 2.5s 阈值与实际传输耗时的差距）。
+async fn serve_seed(
+    listener: TcpListener,
+    data: Arc<Vec<u8>>,
+    info_hash: InfoHash,
+    first_request_at: Arc<std::sync::Mutex<Option<Instant>>>,
+) {
     let peer_id = PeerId::azureus_prefix(&[0xAA; 12]);
     loop {
         let Ok((stream, _)) = listener.accept().await else {
             return;
         };
         let data = data.clone();
+        let first_request_at = first_request_at.clone();
         tokio::spawn(async move {
-            let _ = handle_seed(stream, &data, info_hash, peer_id).await;
+            let _ = handle_seed(stream, &data, info_hash, peer_id, first_request_at).await;
         });
     }
 }
@@ -59,6 +68,7 @@ async fn handle_seed(
     data: &[u8],
     info_hash: InfoHash,
     peer_id: PeerId,
+    first_request_at: Arc<std::sync::Mutex<Option<Instant>>>,
 ) -> std::io::Result<()> {
     let mut reader = PeerReader::new();
     let hs = loop {
@@ -90,6 +100,12 @@ async fn handle_seed(
                 begin,
                 length,
             }) => {
+                {
+                    let mut t = first_request_at.lock().unwrap();
+                    if t.is_none() {
+                        *t = Some(Instant::now());
+                    }
+                }
                 let off = index as usize * PIECE_LEN + begin as usize;
                 let end = (off + length as usize).min(data.len());
                 if off >= data.len() {
@@ -217,7 +233,14 @@ async fn latency_link_throughput_requires_multipiece_window() {
     // 3. seed + 延迟代理（引擎只经代理访问 seed）
     let sl = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let seed_addr = sl.local_addr().unwrap();
-    tokio::spawn(serve_seed(sl, Arc::new(data.clone()), info_hash));
+    let first_request_at: Arc<std::sync::Mutex<Option<Instant>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    tokio::spawn(serve_seed(
+        sl,
+        Arc::new(data.clone()),
+        info_hash,
+        first_request_at.clone(),
+    ));
 
     let pl = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = pl.local_addr().unwrap();
@@ -255,12 +278,18 @@ async fn latency_link_throughput_requires_multipiece_window() {
         selected_files: None,
     };
     let engine = TorrentEngine::new(meta, cfg).unwrap();
-    let start = Instant::now();
     let r = tokio::time::timeout(Duration::from_secs(30), engine.clone().run(CancellationToken::new()))
         .await
         .expect("下载超时（30s）");
     r.expect("下载失败");
-    let elapsed = start.elapsed();
+    // 计时窗口 = seed 收到首个 Request → 下载完成：只测数据传输阶段，
+    // 排除 announce / 拨号 / 握手在慢 CI 上的抖动（那部分含 ~400ms
+    // 代理延迟 + 调度噪声，足以把 ~1s 的正常传输推过 2.5s 阈值）。
+    let t0 = first_request_at
+        .lock()
+        .unwrap()
+        .expect("seed 应已收到 Request");
+    let elapsed = t0.elapsed();
     eprintln!("latency regression elapsed: {elapsed:?}");
 
     // 文件逐字节一致

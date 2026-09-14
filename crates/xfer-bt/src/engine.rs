@@ -236,7 +236,8 @@ const HP_RENDEZVOUS: u8 = 0;
 const HP_CONNECT: u8 = 1;
 const HP_FAILED: u8 = 2;
 /// failed 错误码（4 字节大端，与 libtorrent hp_error 枚举一致）。
-const HP_ERR_NO_SUCH_PEER: u32 = 1;
+/// 本端只会回 not_connected / no_support / no_self（no_such_peer 语义
+/// 由 not_connected 覆盖：查不到连接即视为不存在）。
 const HP_ERR_NOT_CONNECTED: u32 = 2;
 const HP_ERR_NO_SUPPORT: u32 = 3;
 const HP_ERR_NO_SELF: u32 = 4;
@@ -274,17 +275,6 @@ enum HolepunchMsg {
     },
     /// 无法解析的消息（忽略但记录）。
     Invalid,
-}
-
-impl HolepunchMsg {
-    fn addr(&self) -> Option<SocketAddr> {
-        match self {
-            HolepunchMsg::Rendezvous { ip, port }
-            | HolepunchMsg::Connect { ip, port }
-            | HolepunchMsg::Failed { ip, port, .. } => Some(SocketAddr::new(*ip, *port)),
-            HolepunchMsg::Invalid => None,
-        }
-    }
 }
 
 /// 解析 ut_holepunch 消息体（libtorrent 标准二进制格式）。

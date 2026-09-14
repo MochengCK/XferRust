@@ -2136,7 +2136,7 @@ impl TaskManager {
                     .enumerate()
                     // 未选择的文件不属于本次下载，不参与校验
                     .filter(|(i, _)| is_selected(*i))
-                    .map(|(i, f)| {
+                    .map(|(_, f)| {
                         let label = format!("{}/{}", meta.info.name, f.path.join("/"));
                         let abs = if Path::new(&label).is_absolute() {
                             PathBuf::from(&label)
