@@ -1224,6 +1224,11 @@ async fn run_engine(
         }
     }
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.to_path_buf(),
         peer_id: PeerId::azureus_prefix(&[7u8; 12]),
         listen_port,
@@ -1843,6 +1848,11 @@ async fn spec_magnet_ut_metadata_full_download() {
     tokio::spawn(seeder.serve(sl));
 
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.clone(),
         peer_id: PeerId::azureus_prefix(&[9u8; 12]),
         listen_port: 0,

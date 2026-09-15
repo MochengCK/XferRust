@@ -252,6 +252,11 @@ fn meta_of(tb: &[u8]) -> TorrentMeta {
 
 async fn run_download(meta: TorrentMeta, dir: &std::path::Path) -> Result<(), String> {
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.to_path_buf(),
         peer_id: PeerId::azureus_prefix(&[3u8; 12]),
         listen_port: 0,

@@ -265,6 +265,11 @@ async fn magnet_download_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.clone(),
         peer_id: PeerId::azureus_prefix(&[3u8; 12]),
         listen_port: 0,
@@ -296,6 +301,122 @@ async fn magnet_download_end_to_end() {
     assert!(engine.has_metadata());
     let out = std::fs::read(dir.join("data.bin")).unwrap();
     assert_eq!(out, data);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 磁力保存为种子 + 加载已保存种子（bt-save-metadata / bt-load-saved-metadata）：
+/// 1. 元数据到手后 `<下载目录>/<infohash>.torrent` 应存在且可解析、info_hash 一致；
+/// 2. 以「仅加载种子、无 tracker 无网络」的方式重建引擎（load_saved_metadata=true），
+///    应能直接从磁盘恢复元数据并下载数据——验证种子保存的复用闭环。
+#[tokio::test]
+async fn magnet_saves_torrent_and_reloads_from_disk() {
+    let data: Vec<u8> = (0..(2 * PIECE_LEN + 31)).map(|i| (i % 61) as u8).collect();
+    let pieces: Vec<u8> = data.chunks(PIECE_LEN).flat_map(sha1_of).collect();
+    let info = dict(BTreeMap::from([
+        (b"name".to_vec(), bytes("reload.bin")),
+        (b"piece length".to_vec(), int(PIECE_LEN as i64)),
+        (b"length".to_vec(), int(data.len() as i64)),
+        (b"pieces".to_vec(), bytes(pieces)),
+    ]));
+    let info_bytes = encode(&info);
+    let info_hash = sha1_of(&info_bytes);
+
+    // seed server（提供元数据 + 数据）
+    let (sl, saddr) = bind_random().await;
+    tokio::spawn(serve_magnet_seed(
+        sl,
+        Arc::new(data.clone()),
+        Arc::new(info_bytes.clone()),
+        InfoHash::from_bytes(&info_hash),
+        PeerId::azureus_prefix(&[0x0C; 12]),
+        Arc::new(AtomicUsize::new(0)),
+    ));
+
+    let dir = std::env::temp_dir().join(format!("magnet-save-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 阶段一：save_metadata=true 的磁力任务，下载完成
+    let (taddr, seed_ref) = start_tracker().await;
+    *seed_ref.write().unwrap() = Some(saddr);
+    let cfg1 = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: true,
+        load_saved_metadata: false,
+        dir: dir.clone(),
+        peer_id: PeerId::azureus_prefix(&[3u8; 12]),
+        listen_port: 0,
+        max_peers: 8,
+        adaptive: false,
+        numwant: 50,
+        announce_urls: vec![format!("http://{taddr}/announce")],
+        udp_announce_urls: Vec::new(),
+        pipeline: 0,
+        enable_dht: false,
+        dht_port: 0,
+        enable_lpd: false,
+        enable_port_mapping: false,
+        encryption: xfer_bt::EncryptionMode::PlaintextOnly,
+        bt_protocol: xfer_bt::BtProtocol::TcpOnly,
+        download_limit: 0,
+        upload_limit: 0,
+        seed_mode: false,
+        seed_duration: 0,
+        seed_ratio: 0.0,
+        selected_files: None,
+    };
+    let engine1 = TorrentEngine::new_magnet(info_hash, cfg1).unwrap();
+    let r1 = engine1.clone().run(CancellationToken::new()).await;
+    assert!(r1.is_ok(), "磁力下载失败: {r1:?}");
+
+    // 断言：种子文件已保存且 info_hash 一致、可被 parse_torrent 解析
+    let torrent_path = dir.join(format!("{}.torrent", hex::encode(info_hash)));
+    assert!(torrent_path.is_file(), "应已保存种子文件: {}", torrent_path.display());
+    let saved = std::fs::read(&torrent_path).unwrap();
+    let meta = xfer_bencode::parse_torrent(&saved).unwrap();
+    assert_eq!(meta.info_hash, info_hash, "保存的种子 info_hash 应一致");
+    assert_eq!(meta.info.name, "reload.bin");
+
+    // 阶段二：模拟「重启后直接加载已保存种子」——无 tracker、无网络（seed 已停），
+    // load_saved_metadata=true 时引擎应从 .torrent 恢复元数据（无需 ut_metadata）
+    *seed_ref.write().unwrap() = None; // 移除 tracker 返回的地址，杜绝网络路径
+    let cfg2 = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: true,
+        dir: dir.clone(),
+        peer_id: PeerId::azureus_prefix(&[4u8; 12]),
+        listen_port: 0,
+        max_peers: 8,
+        adaptive: false,
+        numwant: 50,
+        announce_urls: vec![format!("http://{taddr}/announce")],
+        udp_announce_urls: Vec::new(),
+        pipeline: 0,
+        enable_dht: false,
+        dht_port: 0,
+        enable_lpd: false,
+        enable_port_mapping: false,
+        encryption: xfer_bt::EncryptionMode::PlaintextOnly,
+        bt_protocol: xfer_bt::BtProtocol::TcpOnly,
+        download_limit: 0,
+        upload_limit: 0,
+        seed_mode: false,
+        seed_duration: 0,
+        seed_ratio: 0.0,
+        selected_files: None,
+    };
+    let engine2 = TorrentEngine::new_magnet(info_hash, cfg2).unwrap();
+    // 构造完成即应已从磁盘恢复元数据（new_magnet 内 try_load_saved_torrent）
+    assert!(
+        engine2.has_metadata(),
+        "load_saved_metadata 应直接从磁盘恢复元数据"
+    );
+    assert_eq!(engine2.meta().unwrap().info.name, "reload.bin");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -370,6 +491,11 @@ async fn magnet_selection_creates_only_selected_files() {
     // ---- 阶段一：占位空选择（磁力等待勾选）----
     // 只取元数据：不创建任何文件/目录，不得误判完成
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.clone(),
         peer_id: PeerId::azureus_prefix(&[0x32; 12]),
         announce_urls: vec![tracker_url.clone()],
@@ -416,6 +542,11 @@ async fn magnet_selection_creates_only_selected_files() {
     ]))))
     .unwrap();
     let cfg2 = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.clone(),
         peer_id: PeerId::azureus_prefix(&[0x33; 12]),
         announce_urls: vec![tracker_url],
@@ -483,6 +614,11 @@ async fn magnet_reuses_connection_after_metadata() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.clone(),
         peer_id: PeerId::azureus_prefix(&[5u8; 12]),
         listen_port: 0,

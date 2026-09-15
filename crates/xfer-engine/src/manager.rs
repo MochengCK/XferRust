@@ -252,7 +252,8 @@ pub struct TaskManager {
     /// 待立即刷新的订阅源 id（与 sub_kick 配对使用，唤醒时整体取走）。
     sub_pending: Mutex<Vec<String>>,
     events: broadcast::Sender<EngineEvent>,
-    client: reqwest::Client,
+    /// HTTP 客户端（按 `user-agent` / `all-proxy` 全局选项构建，变更时重建）。
+    client: std::sync::RwLock<reqwest::Client>,
     /// RPC shutdown 触发的整体退出令牌。
     shutdown_token: CancellationToken,
 }
@@ -285,7 +286,7 @@ impl TaskManager {
             sub_kick: Notify::new(),
             sub_pending: Mutex::new(Vec::new()),
             events: tx,
-            client: xfer_http::build_client(),
+            client: std::sync::RwLock::new(xfer_http::build_client()),
             shutdown_token: CancellationToken::new(),
         })
     }
@@ -1640,16 +1641,54 @@ impl TaskManager {
         (listen_port, dht_port)
     }
 
-    /// 发现渠道开关（全局选项）：`bt-enable-lpd`（LSD 本地发现）、
-    /// `bt-port-mapping`（UPnP/NAT-PMP 端口映射），默认均启用。
-    fn bt_discovery_flags(&self) -> (bool, bool) {
+    /// 发现渠道开关（全局选项）：
+    /// - `enable-dht`（DHT，默认开；private 种子恒关）
+    /// - `enable-dht6`（DHT over IPv6，BEP 32，默认开）
+    /// - `enable-peer-exchange`（PEX，BEP 11，默认开）
+    /// - `bt-enable-lpd`（LSD 本地发现，默认开）
+    /// - `bt-port-mapping`（UPnP/NAT-PMP 端口映射，默认开）
+    fn bt_network_flags(&self) -> (bool, bool, bool, bool, bool) {
         let g = self.inner.lock().unwrap().global_options.clone();
         let on = |k: &str, default: bool| {
             g.get(k)
                 .map(|v| v != "false" && v != "0")
                 .unwrap_or(default)
         };
-        (on("bt-enable-lpd", true), on("bt-port-mapping", true))
+        (
+            on("enable-dht", true),
+            on("enable-dht6", true),
+            on("enable-peer-exchange", true),
+            on("bt-enable-lpd", true),
+            on("bt-port-mapping", true),
+        )
+    }
+
+    /// 磁盘缓存上限（全局选项 `disk-cache`，字节；0 = 关闭直写）。
+    /// 解析失败（非法值）按关闭处理，设置页负责校验合法值。
+    fn disk_cache_bytes(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap()
+            .global_options
+            .get("disk-cache")
+            .and_then(|v| parse_size_bytes(v))
+            .unwrap_or(0)
+    }
+
+    /// 磁力保存为种子（全局选项 `bt-save-metadata`，默认关）。
+    fn save_metadata_enabled(&self) -> bool {
+        let g = self.inner.lock().unwrap().global_options.clone();
+        g.get("bt-save-metadata")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(false)
+    }
+
+    /// 磁力启动时加载已保存种子（全局选项 `bt-load-saved-metadata`，默认关）。
+    fn load_saved_metadata_enabled(&self) -> bool {
+        let g = self.inner.lock().unwrap().global_options.clone();
+        g.get("bt-load-saved-metadata")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(false)
     }
 
     fn resolve_path(&self, task: &Arc<Task>, probe: &xfer_http::Probe) -> PathBuf {
@@ -1672,7 +1711,17 @@ impl TaskManager {
             };
             let candidate = task.dir.join(&name);
             let existing = existing_len(&candidate);
-            let can_resume = probe.accepts_ranges
+            // continue=false（设置页「断点续传」关闭）时即使服务器支持
+            // Range 也强制重新下载：文件冲突按「重命名新文件」处理，
+            // 已有文件保持不变（与 aria2 语义一致）。
+            let continue_enabled = {
+                let g = self.inner.lock().unwrap().global_options.clone();
+                g.get("continue")
+                    .map(|v| v != "false" && v != "0")
+                    .unwrap_or(true)
+            };
+            let can_resume = continue_enabled
+                && probe.accepts_ranges
                 && existing > 0
                 && probe.total_len.is_none_or(|t| existing < t);
             let disk_conflict = !can_resume && existing > 0;
@@ -1706,6 +1755,7 @@ impl TaskManager {
         let mut rate_changed = false;
         let mut bt_modes_changed = false;
         let mut seed_time_changed = false;
+        let mut client_changed = false;
         // bt-trackers：全量替换语义（应用端每次推送完整列表），
         // 原始值可能是数组或换行/逗号分隔的字符串，需在字符串化前处理
         let mut tracker_replace: Option<Vec<String>> = None;
@@ -1825,14 +1875,33 @@ impl TaskManager {
                     | "bt-seed-time"
                     | "bt-enable-lpd"
                     | "bt-port-mapping"
+                    | "enable-dht"
+                    | "enable-dht6"
+                    | "enable-peer-exchange"
+                    | "bt-save-metadata"
+                    | "bt-load-saved-metadata"
+                    | "disk-cache"
+                    | "continue"
+                    | "user-agent"
+                    | "all-proxy"
+                    | "no-proxy"
             ) {
-                // HTTP 分片参数 / BT 连接参数 / BT 做种配置：存储后在下载时生效
+                // HTTP 分片参数 / BT 连接参数 / BT 做种配置 / 网络发现开关
+                // / 磁力存种子 / 磁盘缓存 / HTTP 续传与客户端配置：存储后
+                // 在下载时生效（user-agent/all-proxy 变更时重建 HTTP 客户端）
                 if k == "bt-seed-time" && v.trim().parse::<u64>().is_err() {
                     tracing::warn!(value = %v, "bt-seed-time 取值无效（应为分钟数），已忽略该键");
                     continue;
                 }
+                if k == "disk-cache" && parse_size_bytes(&v).is_none() {
+                    tracing::warn!(value = %v, "disk-cache 取值无效（应为字节数或 K/M/G 后缀），已忽略该键");
+                    continue;
+                }
                 if k == "bt-seed-time" {
                     seed_time_changed = true;
+                }
+                if k == "user-agent" || k == "all-proxy" || k == "no-proxy" {
+                    client_changed = true;
                 }
             } else {
                 tracing::debug!(option = %k, "全局选项暂未支持，已忽略");
@@ -1928,6 +1997,23 @@ impl TaskManager {
         }
         if seed_time_changed {
             self.apply_seed_time();
+        }
+        // HTTP 客户端配置（user-agent / all-proxy / no-proxy）变更：重建
+        // 客户端，后续新连接（含 tracker 订阅）即用新配置；进行中的连接
+        // 不受影响（reqwest 连接池按需复用）。
+        if client_changed {
+            let (ua, proxy) = {
+                let g = self.inner.lock().unwrap().global_options.clone();
+                (
+                    g.get("user-agent").cloned(),
+                    g.get("all-proxy").cloned(),
+                )
+            };
+            *self.client.write().unwrap() = xfer_http::build_client_with(
+                ua.as_deref(),
+                proxy.as_deref(),
+            );
+            tracing::info!("HTTP 客户端已按 user-agent / all-proxy 重建");
         }
         self.kick();
         self.save_session_now();
@@ -2072,19 +2158,88 @@ impl TaskManager {
             .cloned()
             .unwrap_or_else(|| "0".to_string());
         m.insert("dht-listen-port".into(), Value::String(dht_listen_port));
-        // 发现渠道开关：LSD 本地发现 / UPnP-NAT-PMP 端口映射（默认开）
-        let bt_lpd = inner
-            .global_options
-            .get("bt-enable-lpd")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
-        m.insert("bt-enable-lpd".into(), Value::String(bt_lpd.to_string()));
-        let bt_pmap = inner
-            .global_options
-            .get("bt-port-mapping")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
-        m.insert("bt-port-mapping".into(), Value::String(bt_pmap.to_string()));
+        // 发现渠道开关：DHT / DHT6 / PEX / LSD 本地发现 / UPnP-NAT-PMP（默认开）
+        let on_opt = |key: &str, default: bool| {
+            inner
+                .global_options
+                .get(key)
+                .map(|v| v != "false" && v != "0")
+                .unwrap_or(default)
+        };
+        m.insert(
+            "enable-dht".into(),
+            Value::String(on_opt("enable-dht", true).to_string()),
+        );
+        m.insert(
+            "enable-dht6".into(),
+            Value::String(on_opt("enable-dht6", true).to_string()),
+        );
+        m.insert(
+            "enable-peer-exchange".into(),
+            Value::String(on_opt("enable-peer-exchange", true).to_string()),
+        );
+        m.insert(
+            "bt-enable-lpd".into(),
+            Value::String(on_opt("bt-enable-lpd", true).to_string()),
+        );
+        m.insert(
+            "bt-port-mapping".into(),
+            Value::String(on_opt("bt-port-mapping", true).to_string()),
+        );
+        // 磁盘缓存（字节；默认 0 = 关闭）与磁力存/载种子（默认关）
+        m.insert(
+            "disk-cache".into(),
+            Value::String(
+                inner
+                    .global_options
+                    .get("disk-cache")
+                    .cloned()
+                    .unwrap_or_else(|| "0".to_string()),
+            ),
+        );
+        m.insert(
+            "bt-save-metadata".into(),
+            Value::String(on_opt("bt-save-metadata", false).to_string()),
+        );
+        m.insert(
+            "bt-load-saved-metadata".into(),
+            Value::String(on_opt("bt-load-saved-metadata", false).to_string()),
+        );
+        // HTTP 续传开关 / 客户端配置（UA / 代理）
+        m.insert(
+            "continue".into(),
+            Value::String(on_opt("continue", true).to_string()),
+        );
+        m.insert(
+            "user-agent".into(),
+            Value::String(
+                inner
+                    .global_options
+                    .get("user-agent")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        );
+        m.insert(
+            "all-proxy".into(),
+            Value::String(
+                inner
+                    .global_options
+                    .get("all-proxy")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        );
+        m.insert(
+            "no-proxy".into(),
+            Value::String(
+                inner
+                    .global_options
+                    .get("no-proxy")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        );
         // 全局 BT tracker 服务器列表
         m.insert(
             "bt-trackers".into(),
@@ -2994,7 +3149,8 @@ impl TaskManager {
     /// 刷新单个订阅源的核心逻辑（fetch + 同步 + 注入 + 状态更新）。
     /// 返回获取到的 tracker 数量；调用方负责持久化会话。
     async fn refresh_one_subscription(&self, id: &str, url: &str) -> Result<usize, String> {
-        let trackers = Self::fetch_subscription_trackers(&self.client, url).await;
+        let http_client = self.client.read().unwrap().clone();
+        let trackers = Self::fetch_subscription_trackers(&http_client, url).await;
         match trackers {
             Ok(list) if !list.is_empty() => {
                 let (added, removed) = {
@@ -3532,9 +3688,11 @@ async fn drive_bt_download(
 
     let mut rand12 = [0u8; 12];
     getrandom::fill(&mut rand12).map_err(|e| TaskFailure::Bt(format!("随机源失败: {e}")))?;
-    // DHT 始终启用（除非 private 种子），作为 tracker 的补充 peer 发现渠道。
-    // 即使有 tracker，DHT 也能发现更多 peer，且在 tracker 失效时是唯一来源。
-    let enable_dht = meta.as_ref().map(|m| !m.info.private).unwrap_or(true);
+    // 网络发现开关（全局选项）：DHT / DHT6 / PEX / LSD / 端口映射。
+    // DHT 恒开是默认行为（tracker 失效时的兜底发现渠道），private 种子除外；
+    // 用户可在设置中显式关闭（enable-dht=false），private 约束始终优先。
+    let (dht_enabled, dht_ipv6, pex, enable_lpd, enable_port_mapping) = _mgr.bt_network_flags();
+    let enable_dht = dht_enabled && meta.as_ref().map(|m| !m.info.private).unwrap_or(true);
     let (max_peers, adaptive) = _mgr.bt_options(task);
     let (dl_limit, ul_limit) = _mgr.rate_limits();
     let (encryption, bt_protocol) = _mgr.bt_modes(task);
@@ -3552,7 +3710,10 @@ async fn drive_bt_download(
     let seed_duration = _mgr.bt_seed_time_minutes().saturating_mul(60);
     // BT/DHT 监听端口（0 = 系统分配）与发现开关（LSD/端口映射默认开）
     let (listen_port, dht_port) = _mgr.bt_listen_ports();
-    let (enable_lpd, enable_port_mapping) = _mgr.bt_discovery_flags();
+    // 磁盘缓存 / 磁力存种子 / 磁力载种子（全局选项，任务级透传）
+    let disk_cache_bytes = _mgr.disk_cache_bytes();
+    let save_metadata = _mgr.save_metadata_enabled();
+    let load_saved_metadata = _mgr.load_saved_metadata_enabled();
     let cfg = TorrentConfig {
         dir: task.dir.clone(),
         peer_id: PeerId::azureus_prefix(&rand12),
@@ -3564,6 +3725,8 @@ async fn drive_bt_download(
         udp_announce_urls,
         pipeline: 0, // 自适应 16→256
         enable_dht,
+        enable_dht_ipv6: dht_ipv6,
+        enable_pex: pex,
         dht_port,
         enable_lpd,
         enable_port_mapping,
@@ -3576,6 +3739,9 @@ async fn drive_bt_download(
         seed_ratio,
         // 磁力解析后用户勾选的文件（None = 全部；等待勾选时为 Some(空) 占位）
         selected_files,
+        disk_cache_bytes,
+        save_metadata,
+        load_saved_metadata,
     };
     let engine = match (&meta, magnet_ih) {
         (Some(m), _) => TorrentEngine::new((**m).clone(), cfg).map_err(TaskFailure::Bt)?,
@@ -3756,7 +3922,10 @@ async fn drive_download(
         let mut attempt = 1u32;
         loop {
             let progress_before = task.completed_live();
-            match try_uri(mgr, &mgr.client, task, uri, idx, cancel).await {
+            // 克隆客户端：避免 RwLock 读锁跨 await 持有（guard 非 Send，
+            // 会导致 run_task 的 future 无法在线程间转移）
+            let http_client = mgr.client.read().unwrap().clone();
+            match try_uri(mgr, &http_client, task, uri, idx, cancel).await {
                 Ok(()) => return Ok(()),
                 Err(f) if f.is_cancelled() => return Err(f),
                 Err(TaskFailure::Http(xfer_http::HttpError::Io(e)))
@@ -3900,11 +4069,22 @@ async fn try_uri(
     }
 
     // —— 单连接路径（不支持 Range / 未知总长 / 分段回退）——
-    // 已存在部分文件：决定续传/重建
+    // 已存在部分文件：决定续传/重建（continue=false 时强制从头下载）
     let existing = existing_len(&path);
     let total = probe.total_len;
-    let can_resume =
-        !force_fresh && probe.accepts_ranges && existing > 0 && total.is_none_or(|t| existing < t);
+    let continue_enabled = mgr
+        .inner
+        .lock()
+        .unwrap()
+        .global_options
+        .get("continue")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
+    let can_resume = !force_fresh
+        && continue_enabled
+        && probe.accepts_ranges
+        && existing > 0
+        && total.is_none_or(|t| existing < t);
     let (start, mode) = if can_resume {
         (existing, SinkMode::Resume(existing))
     } else {
@@ -4208,6 +4388,78 @@ mod tests {
             mgr.get_global_option()["bt-seed-mode"],
             serde_json::json!("true")
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bt_network_and_storage_options_stored_and_readable() {
+        let dir = std::env::temp_dir().join(format!("xfer-netopts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = TaskManager::start(dir.clone(), 1);
+
+        // 网络发现开关（DHT / DHT6 / PEX / LSD / 端口映射）
+        mgr.change_global_option(&serde_json::json!({
+            "enable-dht": false,
+            "enable-dht6": true,
+            "enable-peer-exchange": false,
+            "bt-enable-lpd": true,
+            "bt-port-mapping": false,
+        }))
+        .expect("网络发现开关应被接受");
+        let (dht, dht6, pex, lpd, pmap) = mgr.bt_network_flags();
+        assert!(!dht && dht6 && !pex && lpd && !pmap);
+        assert_eq!(mgr.get_global_option()["enable-dht"], serde_json::json!("false"));
+        assert_eq!(mgr.get_global_option()["enable-dht6"], serde_json::json!("true"));
+        assert_eq!(
+            mgr.get_global_option()["enable-peer-exchange"],
+            serde_json::json!("false")
+        );
+
+        // 磁盘缓存（带单位解析）
+        mgr.change_global_option(&serde_json::json!({"disk-cache": "128M"}))
+            .unwrap();
+        assert_eq!(mgr.disk_cache_bytes(), 128 * 1024 * 1024);
+        assert_eq!(
+            mgr.get_global_option()["disk-cache"],
+            serde_json::json!("128M")
+        );
+        // 非法值：跳过并保留旧值
+        mgr.change_global_option(&serde_json::json!({"disk-cache": "12x"}))
+            .unwrap();
+        assert_eq!(mgr.disk_cache_bytes(), 128 * 1024 * 1024);
+
+        // 磁力存/载种子
+        mgr.change_global_option(&serde_json::json!({
+            "bt-save-metadata": true,
+            "bt-load-saved-metadata": true,
+        }))
+        .unwrap();
+        assert!(mgr.save_metadata_enabled());
+        assert!(mgr.load_saved_metadata_enabled());
+
+        // HTTP 续传开关 / UA / 代理
+        mgr.change_global_option(&serde_json::json!({
+            "continue": false,
+            "user-agent": "TestUA/1.0",
+            "all-proxy": "http://127.0.0.1:8080",
+            "no-proxy": "localhost",
+        }))
+        .unwrap();
+        let g = mgr.get_global_option();
+        assert_eq!(g["continue"], serde_json::json!("false"));
+        assert_eq!(g["user-agent"], serde_json::json!("TestUA/1.0"));
+        assert_eq!(g["all-proxy"], serde_json::json!("http://127.0.0.1:8080"));
+        assert_eq!(g["no-proxy"], serde_json::json!("localhost"));
+        // client 重建后仍可用（不 panic、UA 生效）
+        assert!(mgr
+            .client
+            .read()
+            .unwrap()
+            .get("http://127.0.0.1:1/")
+            .build()
+            .is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

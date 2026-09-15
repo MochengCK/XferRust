@@ -1,5 +1,8 @@
 **Summary**
 
+- New disk cache `disk-cache` (piece-level write-back buffering), magnet save/load as torrent (`bt-save-metadata` / `bt-load-saved-metadata`)
+- Peer-discovery switches now really take effect: `enable-dht` / `enable-dht6` (BEP 32, DHT over IPv6 dual-stack) / `enable-peer-exchange` (BEP 11)
+- HTTP client configuration takes effect: `continue` resume switch, `user-agent`, `all-proxy` / `no-proxy` proxy (client rebuilt on change)
 - New task file-verification RPC `task.verifyFiles` (existence / size / streaming hash, executed natively by the engine)
 - UDP hole punching (`ut_holepunch`) aligned with the libtorrent standard — relays through double NATs with standard clients such as qBittorrent
 - HTTP piece bitmaps, global & per-task rate limiting, per-task average speed, command-line option passthrough
@@ -10,6 +13,30 @@
 - All non-terminal tasks are restored as paused after restart; per-task rate limits now override the global one
 
 ## New Features
+
+### Disk Cache (disk-cache)
+
+- New global option `disk-cache` (bytes or K/M/G suffix such as `128M`; `0` = write-through off): BT piece data is first buffered in a memory write-back queue and flushed to disk in FIFO order, reducing small random writes
+- Read paths serve cached pieces directly from memory without touching disk; `flush_all` flushes the cache before syncing files, so the resume bitmap is only persisted after its data is on disk
+- Pieces larger than the cache limit degrade to direct writes; rewriting the same piece replaces the old entry without double counting; invalid values degrade to a warning without aborting the batch
+
+### Magnet Save / Load as Torrent (bt-save-metadata / bt-load-saved-metadata)
+
+- New global option `bt-save-metadata`: when magnet metadata arrives it is written to `<download-dir>/<hex-infohash>.torrent` (top-level dictionary hand-encoded with the original info bytes so the info_hash never shifts; atomic write via temp file + rename)
+- New global option `bt-load-saved-metadata`: on magnet task start, if a same-named `.torrent` exists in the download dir with a matching info_hash, the metadata is installed directly, skipping the peer fetch (magnet becomes a torrent task instantly)
+- Tasks created from a `.torrent` file are not re-saved (the original file already exists)
+
+### Peer-Discovery Switches (enable-dht / enable-dht6 / enable-peer-exchange)
+
+- New global option `enable-dht` (DHT, BEP 5): on by default; when off, BT tasks no longer join the DHT; private torrents never use DHT (the constraint wins)
+- New global option `enable-dht6` (DHT over IPv6, BEP 32): when on, DHT binds a dual-stack socket (`[::]`), bootstraps IPv6 nodes, replies to IPv6 requesters with `nodes6` / `peers6` and parses remote v6 nodes; if the machine has no IPv6 stack and binding fails, it automatically falls back to IPv4
+- New global option `enable-peer-exchange` (PEX, BEP 11): on by default; when off the extension handshake does not advertise `ut_pex` and PEX messages are neither sent nor received
+
+### HTTP Client Configuration (continue / user-agent / all-proxy / no-proxy)
+
+- New global option `continue` (HTTP resume switch, default on): when off, downloads always start from scratch even if the server supports Range; an existing file is kept and a new name is used (aria2 semantics)
+- New global options `user-agent` / `all-proxy` / `no-proxy`: the HTTP client is built from them (UA overrides the engine default, proxy is direct or via `all-proxy`); changing them rebuilds the client so new connections pick it up immediately
+- Desktop proxy settings (system / custom) and UA settings now really apply to download traffic
 
 ### Task BT Identity (bittorrent / infoHash)
 

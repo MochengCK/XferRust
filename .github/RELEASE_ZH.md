@@ -1,5 +1,8 @@
 **摘要**
 
+- 新增磁盘缓存 `disk-cache`（片级写回缓冲）、磁力保存 / 加载为种子（`bt-save-metadata` / `bt-load-saved-metadata`）
+- 网络发现开关真实生效：`enable-dht` / `enable-dht6`（BEP 32，DHT over IPv6 双栈）/ `enable-peer-exchange`（BEP 11）
+- HTTP 客户端配置生效：`continue` 断点续传开关、`user-agent`、`all-proxy` / `no-proxy` 代理（变更即重建客户端）
 - 新增任务文件校验 RPC `task.verifyFiles`（存在性 / 大小 / 流式哈希，引擎原生执行）
 - UDP 打洞 `ut_holepunch` 对齐 libtorrent 标准，可与 qBittorrent 等标准客户端互为中介穿透双 NAT
 - HTTP 分片位图、全局限速与任务级限速、任务平均速度、命令行选项直通
@@ -10,6 +13,30 @@
 - 重启后所有未完成任务恢复为暂停；单任务限速优先覆盖全局
 
 ## 新特性
+
+### 磁盘缓存（disk-cache）
+
+- 新增全局选项 `disk-cache`（字节数或 K/M/G 后缀，如 `128M`；0 = 关闭直写）：BT 片数据先聚合在内存写回缓冲，按 FIFO 逐出落盘，减少随机小写次数
+- 读路径对缓存命中的片直接返回内存数据，不访问磁盘；`flush_all` 先落缓存再刷盘，保证续传位图落盘时对应数据必已在磁盘
+- 片大于缓存上限时自动退化为直写；同一片重复写入替换旧条目不重复计数；非法值告警跳过不中断整批设置
+
+### 磁力保存 / 加载为种子（bt-save-metadata / bt-load-saved-metadata）
+
+- 新增全局选项 `bt-save-metadata`：磁力元数据到手即写 `<下载目录>/<16 进制 infohash>.torrent`（手工 bencode 拼接 info 原始字节，info_hash 不因重编码错位；原子写临时文件 + rename）
+- 新增全局选项 `bt-load-saved-metadata`：磁力任务启动时若下载目录存在同名 `.torrent` 且 info_hash 匹配，直接安装元数据免去从对端重新拉取（磁力任务秒变种子任务）
+- 从 `.torrent` 文件创建的任务不重复保存（原始文件已在）
+
+### 网络发现开关（enable-dht / enable-dht6 / enable-peer-exchange）
+
+- 新增全局选项 `enable-dht`（DHT，BEP 5）：默认开，关闭后 BT 任务不再参与 DHT；private 种子恒不使用 DHT（约束优先）
+- 新增全局选项 `enable-dht6`（DHT over IPv6，BEP 32）：开启时 DHT 绑定双栈 socket（`[::]`）、bootstrap 含 IPv6 节点、向 IPv6 请求方回 `nodes6` / `peers6` 并解析对端 v6 节点；机器无 IPv6 栈导致绑定失败时自动回退纯 IPv4
+- 新增全局选项 `enable-peer-exchange`（PEX，BEP 11）：默认开，关闭后扩展握手不声明 `ut_pex`、不发送也不接收 PEX 消息
+
+### HTTP 客户端配置（continue / user-agent / all-proxy / no-proxy）
+
+- 新增全局选项 `continue`（断点续传开关，默认开）：关闭后即使服务器支持 Range 也强制从头下载，已有文件按「重命名新文件」处理（aria2 语义）
+- 新增全局选项 `user-agent` / `all-proxy` / `no-proxy`：HTTP 客户端按配置构建（UA 覆盖引擎默认值、代理直连或经 `all-proxy` 转发）；运行中变更即重建客户端，新连接立即生效
+- 桌面端代理设置（系统 / 自定义）与 UA 设置现在真实作用于下载流量
 
 ### 任务状态 BT 标识（bittorrent / infoHash）
 

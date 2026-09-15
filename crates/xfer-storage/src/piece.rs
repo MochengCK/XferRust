@@ -3,6 +3,7 @@
 //! M2 范围：单种子下载所需的 piece 位图（BEP 3 bitfield 互转）、
 //! piece SHA-1 校验、按文件布局随机写（跨文件片切分落盘）。
 
+use std::collections::VecDeque;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -283,6 +284,22 @@ pub struct PieceStore {
     layout: PieceLayout,
     files: Vec<Option<OpenFile>>,
     map: PieceMap,
+    /// 片级写回缓存（FIFO）：数据已校验但尚未落盘的片。
+    ///
+    /// 磁盘缓存（`disk-cache` 引擎全局选项）的载体：随机写场景下把若干
+    /// 片聚合在内存中，减少 seek/小写次数。`cache_limit == 0` 时恒为空
+    /// （直写路径，与旧行为完全一致）。
+    write_cache: VecDeque<CachedPiece>,
+    /// 缓存中片数据的字节总数（= 各条目长度之和）。
+    write_cache_bytes: u64,
+    /// 缓存上限（字节；0 = 关闭缓存）。
+    cache_limit: u64,
+}
+
+/// 写回缓存中的一个片。
+struct CachedPiece {
+    index: u32,
+    data: Vec<u8>,
 }
 
 struct OpenFile {
@@ -358,7 +375,83 @@ impl PieceStore {
             layout,
             files,
             map: PieceMap::new(count),
+            write_cache: VecDeque::new(),
+            write_cache_bytes: 0,
+            cache_limit: 0,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // 磁盘缓存（写回缓冲）
+    // ------------------------------------------------------------------
+
+    /// 设置写回缓存上限（字节；0 = 关闭缓存、直写）。
+    ///
+    /// 缩小上限时把超出部分按 FIFO 逐出落盘（IO 失败向上传播，不静默
+    /// 丢数据）；设为 0 时把缓存全部落盘后关闭缓存。
+    pub fn set_write_cache_limit(&mut self, bytes: u64) -> std::io::Result<()> {
+        self.cache_limit = bytes;
+        self.evict_to_limit()
+    }
+
+    /// 缓存上限（字节）。
+    pub fn write_cache_limit(&self) -> u64 {
+        self.cache_limit
+    }
+
+    /// 缓存中尚未落盘的字节数。
+    pub fn write_cache_bytes(&self) -> u64 {
+        self.write_cache_bytes
+    }
+
+    /// 指定片当前是否驻留在缓存中（测试/调试用）。
+    pub fn write_cache_contains(&self, index: u32) -> bool {
+        self.write_cache.iter().any(|c| c.index == index)
+    }
+
+    /// 缓存中该片的数据（未命中返回 None）。
+    fn cache_get(&self, index: u32) -> Option<&[u8]> {
+        self.write_cache
+            .iter()
+            .find(|c| c.index == index)
+            .map(|c| c.data.as_slice())
+    }
+
+    /// 把缓存中的片全部落盘并清空缓存（按入队顺序写出）。
+    ///
+    /// 某片落盘失败时该片数据放回队首并立即返回错误：调用方（可能是
+    /// 忽略错误的 `flush_all`）不会因此丢掉尚未落盘的数据。
+    pub fn flush_write_cache(&mut self) -> std::io::Result<()> {
+        while let Some(oldest) = self.write_cache.pop_front() {
+            self.write_cache_bytes -= oldest.data.len() as u64;
+            if let Err(e) = self.write_piece_direct(oldest.index, &oldest.data) {
+                // 写盘失败：数据放回队首（维持 FIFO 序），不静默丢数据
+                self.write_cache_bytes += oldest.data.len() as u64;
+                self.write_cache.push_front(oldest);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// 逐出最旧的片直到缓存不超过上限。
+    ///
+    /// 逐出即落盘：只有真正写入成功才从缓存移除，写失败时把该片放回
+    /// 队首并返回错误（错误经 [`Self::write_piece`] 传播给调用方，数据
+    /// 仍在缓存中不丢失）。
+    fn evict_to_limit(&mut self) -> std::io::Result<()> {
+        while self.write_cache_bytes > self.cache_limit {
+            let Some(oldest) = self.write_cache.pop_front() else {
+                break;
+            };
+            self.write_cache_bytes -= oldest.data.len() as u64;
+            if let Err(e) = self.write_piece_direct(oldest.index, &oldest.data) {
+                self.write_cache_bytes += oldest.data.len() as u64;
+                self.write_cache.push_front(oldest);
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -420,7 +513,8 @@ impl PieceStore {
         n
     }
 
-    /// 校验并通过则落盘并标记；校验失败返回 Ok(false)（数据已丢弃）。
+    /// 校验并通过则落盘（或进入写回缓存）并标记；校验失败返回
+    /// Ok(false)（数据已丢弃）。
     pub fn accept_piece(
         &mut self,
         index: u32,
@@ -435,11 +529,35 @@ impl PieceStore {
         Ok(true)
     }
 
-    /// 无条件写入一片（测试/seed 场景）。
+    /// 写入一片（测试/seed 场景，无条件写入不校验）。
+    ///
+    /// 磁盘缓存开启（`set_write_cache_limit`）且片长不超过缓存上限时，
+    /// 数据先留在写回缓存中（超限按 FIFO 逐出落盘），否则直写磁盘；
+    /// 读路径（[`Self::read_piece`] / [`Self::read_block`]）对缓存命中的
+    /// 片直接返回缓存内容，因此缓存期间读取语义与已落盘一致。
     ///
     /// 未选文件一侧的分段被跳过（句柄缺席即不落盘、不创建文件）；
     /// 片校验在调用方针对完整片数据完成，跳过不影响完整性判定。
     pub fn write_piece(&mut self, index: u32, data: &[u8]) -> std::io::Result<()> {
+        if self.cache_limit == 0 || data.len() as u64 > self.cache_limit {
+            return self.write_piece_direct(index, data);
+        }
+        // 同片重复写入（重下/双路竞态）时替换旧条目，避免重复计数
+        if let Some(pos) = self.write_cache.iter().position(|c| c.index == index) {
+            if let Some(old) = self.write_cache.remove(pos) {
+                self.write_cache_bytes -= old.data.len() as u64;
+            }
+        }
+        self.write_cache.push_back(CachedPiece {
+            index,
+            data: data.to_vec(),
+        });
+        self.write_cache_bytes += data.len() as u64;
+        self.evict_to_limit()
+    }
+
+    /// 绕过缓存直接写磁盘（逐出 / flush / 缓存关闭时使用）。
+    fn write_piece_direct(&mut self, index: u32, data: &[u8]) -> std::io::Result<()> {
         let segs = self.layout.piece_segments(index);
         let mut written = 0usize;
         for (fi, off, len) in segs {
@@ -456,8 +574,24 @@ impl PieceStore {
     /// 读取一片（跨文件拼接）。
     ///
     /// 未选文件一侧的分段按缺席跳过：返回的数据短于片长（仅 seed
-    /// 场景可能触及，调用方按短读容忍处理）。
+    /// 场景可能触及，调用方按短读容忍处理）。缓存命中时按同一规则
+    /// 从缓存切片，不访问磁盘。
     pub fn read_piece(&mut self, index: u32) -> std::io::Result<Vec<u8>> {
+        if let Some(cached) = self.cache_get(index) {
+            let mut out = Vec::new();
+            let mut written = 0usize;
+            for (fi, _off, len) in self.layout.piece_segments(index) {
+                let end = (written + len as usize).min(cached.len());
+                let seg = &cached[written.min(cached.len())..end];
+                written += len as usize;
+                // 未选文件一侧按缺席跳过（与磁盘路径同语义）
+                if self.files[fi].is_none() {
+                    continue;
+                }
+                out.extend_from_slice(seg);
+            }
+            return Ok(out);
+        }
         let mut out = Vec::new();
         for (fi, off, len) in self.layout.piece_segments(index) {
             let Some(f) = self.files[fi].as_mut() else {
@@ -475,11 +609,36 @@ impl PieceStore {
     /// 读取一片中指定偏移和长度的块（seed 模式上传用）。
     ///
     /// `begin` 是片内偏移，`length` 是请求长度。
-    /// 自动处理跨文件边界。
+    /// 自动处理跨文件边界。片驻留写回缓存时从缓存取（不碰磁盘）。
     pub fn read_block(&mut self, index: u32, begin: u32, length: u32) -> std::io::Result<Vec<u8>> {
         let piece_start = index as u64 * self.layout.piece_length;
         let block_start = piece_start + begin as u64;
         let block_end = block_start + length as u64;
+
+        // 缓存命中：按与磁盘路径相同的分段规则从缓存切片
+        if let Some(cached) = self.cache_get(index) {
+            let mut out = Vec::with_capacity(length as usize);
+            for (fi, f_layout) in self.layout.files.iter().enumerate() {
+                let f_start = f_layout.offset;
+                let f_end = f_layout.offset + f_layout.length;
+                if block_end <= f_start || block_start >= f_end {
+                    continue;
+                }
+                // 未选文件一侧按缺席跳过（返回短块，对端容忍截断）
+                if self.files[fi].is_none() {
+                    continue;
+                }
+                // 片内偏移 = 段起点的全局偏移 - 片起点
+                let rel = (block_start.max(f_start) - piece_start) as usize;
+                let seg_len = (block_end.min(f_end) - block_start.max(f_start)) as usize;
+                if rel >= cached.len() {
+                    continue;
+                }
+                let end = (rel + seg_len).min(cached.len());
+                out.extend_from_slice(&cached[rel..end]);
+            }
+            return Ok(out);
+        }
 
         let mut out = Vec::with_capacity(length as usize);
         for (fi, f_layout) in self.layout.files.iter().enumerate() {
@@ -511,8 +670,12 @@ impl PieceStore {
         self.map.to_bitfield()
     }
 
-    /// 刷盘全部已打开文件。
+    /// 刷盘全部已打开文件（先把写回缓存落盘，再 flush + sync 各句柄）。
+    ///
+    /// 顺序是上层不变式的前提：续传位图落盘前必须保证位图对应的片数据
+    /// 已在磁盘上，否则崩溃后按位图恢复会重现"已完成"的空洞。
     pub fn flush_all(&mut self) -> std::io::Result<()> {
+        self.flush_write_cache()?;
         for f in self.files.iter_mut().flatten() {
             f.file.flush()?;
             f.file.sync_all()?;
@@ -784,5 +947,165 @@ mod tests {
         let digest: [u8; 20] = h.finalize().into();
         assert!(verify_piece(data, &digest));
         assert!(!verify_piece(data, &[0u8; 20]));
+    }
+
+    // ------------------------------------------------------------------
+    // 磁盘缓存（写回缓冲）
+    // ------------------------------------------------------------------
+
+    /// 10 字节片长的单文件布局：3 片（10/10/5）。
+    fn cache_layout() -> PieceLayout {
+        PieceLayout::new(10, vec![(vec!["one.bin".into()], 25)])
+    }
+
+    /// 返回 (临时目录, 存储, 数据文件路径)。单文件种子布局下数据文件
+    /// 直接落在 `root/dl`（不是目录），因此路径统一由 store 自己给出。
+    fn cache_store(tag: &str) -> (PathBuf, PieceStore, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("xfer-piece-cache-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = PieceStore::open(&dir, "dl", cache_layout(), None).unwrap();
+        let data = store.file_paths()[0].clone();
+        (dir, store, data)
+    }
+
+    #[test]
+    fn write_cache_serves_reads_before_flush() {
+        let (dir, mut store, data) = cache_store("read");
+        // 上限足够容纳全部片：写入后仍在缓存、磁盘为空文件
+        store.set_write_cache_limit(4096).unwrap();
+        let p0: Vec<u8> = (0..10).collect();
+        store.write_piece(0, &p0).unwrap();
+        assert!(store.write_cache_contains(0));
+        assert_eq!(store.write_cache_bytes(), 10);
+        assert_eq!(std::fs::metadata(&data).unwrap().len(), 0);
+
+        // 读路径命中缓存（read_piece / read_block 均不碰磁盘）
+        assert_eq!(store.read_piece(0).unwrap(), p0);
+        assert_eq!(store.read_block(0, 2, 4).unwrap(), &p0[2..6]);
+        assert_eq!(store.read_block(0, 8, 4).unwrap(), &p0[8..10]);
+
+        // flush 后落盘、缓存清空
+        store.flush_write_cache().unwrap();
+        assert_eq!(store.write_cache_bytes(), 0);
+        assert!(!store.write_cache_contains(0));
+        let f = std::fs::read(&data).unwrap();
+        assert_eq!(&f[..10], &p0[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_cache_evicts_oldest_when_full() {
+        let (dir, mut store, data) = cache_store("evict");
+        // 上限 15 字节：第 3 片入队后必须逐出最旧的片 0
+        store.set_write_cache_limit(15).unwrap();
+        let p0: Vec<u8> = vec![1; 10];
+        let p1: Vec<u8> = vec![2; 10];
+        store.write_piece(0, &p0).unwrap();
+        store.write_piece(1, &p1).unwrap();
+        // 上限 15：写入 p1 后总量 20 超限 → 逐出最旧的 p0，缓存回落到 10
+        assert_eq!(store.write_cache_bytes(), 10);
+        assert!(!store.write_cache_contains(0));
+        assert!(store.write_cache_contains(1));
+        // 被逐出的片数据已在磁盘上
+        let f = std::fs::read(&data).unwrap();
+        assert_eq!(&f[..10], &p0[..]);
+        assert_eq!(store.read_piece(0).unwrap(), p0);
+        assert_eq!(store.read_piece(1).unwrap(), p1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_cache_dedupes_same_piece() {
+        let (dir, mut store, data) = cache_store("dedupe");
+        store.set_write_cache_limit(4096).unwrap();
+        let a: Vec<u8> = vec![7; 10];
+        let b: Vec<u8> = vec![9; 10];
+        store.write_piece(1, &a).unwrap();
+        store.write_piece(1, &b).unwrap();
+        // 同片替换而非叠加
+        assert_eq!(store.write_cache_bytes(), 10);
+        assert_eq!(store.read_piece(1).unwrap(), b);
+        store.flush_all().unwrap();
+        // flush_all 后磁盘上是最后一次写入的内容（片 1 = 文件 10..20）
+        let f = std::fs::read(&data).unwrap();
+        assert_eq!(&f[10..20], &b[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_cache_disabled_writes_through() {
+        let (dir, mut store, data) = cache_store("off");
+        // 默认关闭缓存 → 直写（与旧行为一致）
+        assert_eq!(store.write_cache_limit(), 0);
+        let p0: Vec<u8> = vec![3; 10];
+        store.write_piece(0, &p0).unwrap();
+        assert_eq!(store.write_cache_bytes(), 0);
+        assert_eq!(std::fs::metadata(&data).unwrap().len(), 10);
+        // 关闭缓存后读取同样正确
+        assert_eq!(store.read_piece(0).unwrap(), p0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_piece_bypasses_cache() {
+        let (dir, mut store, data) = cache_store("oversize");
+        // 上限小于片长（10）：该片不进缓存，直接落盘
+        store.set_write_cache_limit(4).unwrap();
+        let p0: Vec<u8> = vec![5; 10];
+        store.write_piece(0, &p0).unwrap();
+        assert_eq!(store.write_cache_bytes(), 0);
+        assert!(!store.write_cache_contains(0));
+        assert_eq!(std::fs::metadata(&data).unwrap().len(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shrink_cache_limit_flushes_overflow() {
+        let (dir, mut store, data) = cache_store("shrink");
+        store.set_write_cache_limit(4096).unwrap();
+        store.write_piece(0, &[1u8; 10]).unwrap();
+        store.write_piece(1, &[2u8; 10]).unwrap();
+        // 缩小上限 → 超出部分逐出落盘
+        store.set_write_cache_limit(10).unwrap();
+        assert_eq!(store.write_cache_bytes(), 10);
+        assert!(!store.write_cache_contains(0));
+        let f = std::fs::read(&data).unwrap();
+        assert_eq!(&f[..10], &[1u8; 10][..]);
+        // 设为 0 → 全部落盘并关闭缓存
+        store.set_write_cache_limit(0).unwrap();
+        assert_eq!(store.write_cache_bytes(), 0);
+        let f = std::fs::read(&data).unwrap();
+        assert_eq!(&f[10..20], &[2u8; 10][..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_read_skips_unselected_files() {
+        let dir = std::env::temp_dir().join(format!("xfer-piece-cachesel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 只选 b.bin：跨片 1（a 尾 + b 头）写入时缓存整片，读回只含 b 侧
+        let mut store = PieceStore::open(&dir, "dl", layout3(), Some(&[1])).unwrap();
+        store.set_write_cache_limit(4096).unwrap();
+        let piece1: Vec<u8> = (0..10).map(|i| i as u8).collect();
+        store.write_piece(1, &piece1).unwrap();
+        assert_eq!(store.read_piece(1).unwrap(), piece1[5..].to_vec());
+        assert_eq!(store.read_block(1, 0, 10).unwrap(), piece1[5..].to_vec());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_size_bytes_handles_units() {
+        use crate::parse_size_bytes;
+        assert_eq!(parse_size_bytes("1k"), Some(1024));
+        assert_eq!(parse_size_bytes("8M"), Some(8 * 1024 * 1024));
+        assert_eq!(parse_size_bytes("128m"), Some(128 * 1024 * 1024));
+        assert_eq!(parse_size_bytes("1G"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_size_bytes("1048576"), Some(1048576));
+        assert_eq!(parse_size_bytes(" 16 M "), Some(16 * 1024 * 1024));
+        // 非法输入
+        assert_eq!(parse_size_bytes(""), None);
+        assert_eq!(parse_size_bytes("abc"), None);
+        assert_eq!(parse_size_bytes("12x"), None);
+        assert_eq!(parse_size_bytes("M"), None);
     }
 }

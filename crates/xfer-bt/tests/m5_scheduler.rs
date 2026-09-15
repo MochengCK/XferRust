@@ -205,6 +205,11 @@ async fn pipeline_adaptive_grows_under_fast_peer() {
     ));
 
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.to_path_buf(),
         peer_id: PeerId::azureus_prefix(&[3u8; 12]),
         listen_port: 0,
@@ -272,6 +277,11 @@ async fn slow_peer_does_not_block_download() {
     ));
 
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.to_path_buf(),
         peer_id: PeerId::azureus_prefix(&[3u8; 12]),
         listen_port: 0,
@@ -340,6 +350,11 @@ async fn rate_limit_caps_download_speed() {
     // 限速 50KB/s → 256KB 应至少需要 ~5s
     let limit = 50 * 1024; // 50KB/s
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.to_path_buf(),
         peer_id: PeerId::azureus_prefix(&[3u8; 12]),
         listen_port: 0,
@@ -415,6 +430,11 @@ async fn seed_mode_accepts_incoming_connections() {
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.to_path_buf(),
         peer_id: PeerId::azureus_prefix(&[3u8; 12]),
         listen_port: 0,
@@ -493,6 +513,11 @@ async fn cold_start_burst_connects_multiple_seeds() {
 
     let start = Instant::now();
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.to_path_buf(),
         peer_id: PeerId::azureus_prefix(&[3u8; 12]),
         listen_port: 0,

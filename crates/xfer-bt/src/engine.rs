@@ -588,6 +588,12 @@ pub struct TorrentConfig {
     pub pipeline: usize,
     /// 是否启用 DHT（磁力链接冷启动需要）。
     pub enable_dht: bool,
+    /// DHT 是否启用 IPv6（BEP 32，引擎全局选项 `enable-dht6`）：
+    /// 双栈 UDP socket + v6 bootstrap + nodes6/peers6。
+    pub enable_dht_ipv6: bool,
+    /// 是否启用 PEX（BEP 11 对等节点交换，引擎全局选项
+    /// `enable-peer-exchange`）。关闭时不声明 ut_pex、不发不收 PEX 消息。
+    pub enable_pex: bool,
     /// DHT 监听端口（0 = 系统分配）。
     pub dht_port: u16,
     /// 是否启用 LSD 本地发现（BEP 14，多播 239.192.0.0:6771，默认开）。
@@ -612,6 +618,15 @@ pub struct TorrentConfig {
     /// 文件选择（None = 全部文件；Some = 仅下载这些文件索引）。
     /// 磁力链接解析出文件列表后由用户勾选，未选文件的片不请求。
     pub selected_files: Option<Vec<usize>>,
+    /// 磁盘缓存（写回缓冲）上限字节数（全局选项 `disk-cache`，0 = 关闭直写）。
+    /// 片数据先聚合在内存中按 FIFO 落盘，减少随机小写；读路径缓存命中不碰磁盘。
+    pub disk_cache_bytes: u64,
+    /// 磁力元数据到手后是否把种子保存为 `<下载目录>/<infohash>.torrent`
+    /// （全局选项 `bt-save-metadata`）。
+    pub save_metadata: bool,
+    /// 磁力任务启动时是否尝试加载下载目录中已保存的 `<infohash>.torrent`
+    /// （全局选项 `bt-load-saved-metadata`），免去从对端重新拉元数据。
+    pub load_saved_metadata: bool,
 }
 
 impl Default for TorrentConfig {
@@ -627,6 +642,8 @@ impl Default for TorrentConfig {
             udp_announce_urls: Vec::new(),
             pipeline: 0, // 0 = 自适应
             enable_dht: false,
+            enable_dht_ipv6: false,
+            enable_pex: true,
             dht_port: 0,
             enable_lpd: true,
             enable_port_mapping: true,
@@ -638,6 +655,9 @@ impl Default for TorrentConfig {
             seed_duration: 0,
             seed_ratio: 0.0,
             selected_files: None,
+            disk_cache_bytes: 0,
+            save_metadata: false,
+            load_saved_metadata: false,
         }
     }
 }
@@ -1128,6 +1148,10 @@ impl TorrentEngine {
             config.selected_files.as_deref(),
         )
         .map_err(|e| format!("打开 piece 存储失败: {e}"))?;
+        // 磁盘缓存（disk-cache 全局选项）：片写回缓冲上限，0 = 关闭直写
+        store
+            .set_write_cache_limit(config.disk_cache_bytes)
+            .map_err(|e| format!("设置磁盘缓存失败: {e}"))?;
 
         // 续传：优先从续传控制文件恢复已校验片位图（暂停/重启续传）；
         // 无控制文件但文件已全部完整（手动拷贝/旧任务）→ 按长度全部标记完成。
@@ -1289,6 +1313,8 @@ impl TorrentEngine {
             seed_duration_secs: AtomicU64::new(seed_duration_init),
             wanted: Mutex::new(None),
         });
+        // 磁力启动：尝试加载已保存的种子（bt-load-saved-metadata）
+        engine.try_load_saved_torrent();
         Ok(engine)
     }
 
@@ -1318,6 +1344,10 @@ impl TorrentEngine {
         let mut store =
             PieceStore::open(&self.config.dir, &meta.info.name, layout, wanted_files.as_deref())
                 .map_err(|e| format!("打开 piece 存储失败: {e}"))?;
+        // 磁盘缓存（disk-cache 全局选项）：片写回缓冲上限，0 = 关闭直写
+        store
+            .set_write_cache_limit(self.config.disk_cache_bytes)
+            .map_err(|e| format!("设置磁盘缓存失败: {e}"))?;
 
         // 续传：优先从续传控制文件恢复已校验片位图；
         // 无控制文件但文件已全部完整 → 按长度全部标记完成。
@@ -1350,6 +1380,10 @@ impl TorrentEngine {
         }
         *self.store.lock().unwrap() = Some(store);
         self.total_bytes.store(total_bytes, Ordering::Relaxed);
+        // 磁力保存为种子（bt-save-metadata）：元数据到手即写
+        // `<下载目录>/<infohash>.torrent`（aria2 语义），方便后续
+        // 直接以种子文件添加或由 bt-load-saved-metadata 复用。
+        self.save_torrent_file(&meta);
         {
             let mut m = self.meta.write().unwrap();
             *m = Some(meta);
@@ -1362,6 +1396,90 @@ impl TorrentEngine {
         self.apply_selection();
         tracing::info!(total_bytes, "磁力元数据就绪，进入正常下载");
         Ok(())
+    }
+
+    /// 磁力保存为种子（bt-save-metadata）：把元数据写为 `.torrent` 文件。
+    ///
+    /// 文件名 = `<16 进制 infohash>.torrent`，放在任务下载目录；已存在则
+    /// 覆盖（元数据可能与首次不同）。写失败只告警不中断下载（种子保存是
+    /// 附加能力，不应成为任务失败的原因）。非磁力任务（从 .torrent 文件
+    /// 创建）不重复保存——原始文件已在。
+    ///
+    /// 注意：不能用 `xfer_bencode::encode` 把 info 编码为字节串——那样
+    /// info 字段会带长度前缀成为「字符串」而非嵌套字典，.torrent 将无法
+    /// 被标准解析器解析且 info_hash 错位。这里手工拼接顶层字典：info 直接
+    /// 使用元数据的原始字典字节（d…e），字符串字段（announce/comment 等）
+    /// 按 `len:value` 编码，保证保存的种子与标准 .torrent 完全一致。
+    fn save_torrent_file(&self, meta: &TorrentMeta) {
+        if !self.config.save_metadata {
+            return;
+        }
+        let Some(info_bytes) = meta.raw_info.clone() else {
+            return;
+        };
+        // 顶层字典手工编码（字段名按 bencode 规范，字典键无需长度前缀）
+        let mut out = Vec::with_capacity(info_bytes.len() + 64);
+        out.extend_from_slice(b"d4:info");
+        out.extend_from_slice(&info_bytes); // info 字典原始字节（d…e）
+        if let Some(a) = &meta.announce {
+            let v = a.as_bytes();
+            out.extend_from_slice(b"8:announce");
+            out.extend_from_slice(format!("{}:", v.len()).as_bytes());
+            out.extend_from_slice(v);
+        }
+        if let Some(c) = &meta.comment {
+            let v = c.as_bytes();
+            out.extend_from_slice(b"7:comment");
+            out.extend_from_slice(format!("{}:", v.len()).as_bytes());
+            out.extend_from_slice(v);
+        }
+        if let Some(c) = &meta.created_by {
+            let v = c.as_bytes();
+            out.extend_from_slice(b"10:created by");
+            out.extend_from_slice(format!("{}:", v.len()).as_bytes());
+            out.extend_from_slice(v);
+        }
+        out.push(b'e'); // 顶层字典结束
+        let path = self.config.dir.join(format!("{}.torrent", hex::encode(self.info_hash)));
+        // 原子写：临时文件 + rename，避免半截文件被 bt-load-saved-metadata 读到
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("torrent.tmp");
+        if std::fs::write(&tmp, &out).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            tracing::info!(path = %path.display(), "磁力元数据已保存为种子文件");
+        } else {
+            tracing::warn!(path = %path.display(), "磁力种子文件保存失败");
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// 磁力启动时尝试加载已保存的种子（bt-load-saved-metadata）：
+    /// 命中 `<下载目录>/<infohash>.torrent` 且 info_hash 匹配时直接
+    /// 安装元数据（免去从对端重新拉取，磁力任务秒变种子任务）。
+    fn try_load_saved_torrent(&self) -> bool {
+        if !self.config.load_saved_metadata {
+            return false;
+        }
+        let path = self.config.dir.join(format!("{}.torrent", hex::encode(self.info_hash)));
+        let Ok(bytes) = std::fs::read(&path) else {
+            return false;
+        };
+        match xfer_bencode::parse_torrent(&bytes) {
+            Ok(meta) if meta.info_hash == self.info_hash => {
+                match self.install_metadata(meta) {
+                    Ok(()) => {
+                        tracing::info!(path = %path.display(), "已从保存的种子恢复磁力元数据");
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "保存的种子无法安装，改走网络获取");
+                        false
+                    }
+                }
+            }
+            _ => false,
+        }
     }
 
     /// 按当前 `selected_files` 重算所需片位图、总量与已完成字节数。
@@ -1668,6 +1786,36 @@ impl TorrentEngine {
         }
     }
 
+    /// 按当前配置启动一个 DHT 节点（含 IPv6 回退）。
+    ///
+    /// `enable_dht_ipv6` 时优先尝试双栈/纯 v6 绑定（[`DhtConfig::new`] 在
+    /// bind_addr 为 None 且 enable_ipv6 时默认绑 "[::]"）；绑定失败（多为
+    /// 机器没有可用的 IPv6 地址）则退回纯 IPv4，保证 DHT 可用性。
+    async fn start_dht(&self, port: u16) -> Result<Arc<Dht>, String> {
+        let ipv6 = self.config.enable_dht_ipv6;
+        match Dht::new(DhtConfig {
+            listen_port: port,
+            bind_addr: if ipv6 { None } else { Some("0.0.0.0".into()) },
+            enable_ipv6: ipv6,
+            ..Default::default()
+        })
+        .await
+        {
+            Ok(d) => Ok(d),
+            Err(e) if ipv6 => {
+                tracing::warn!(error = %e, "DHT IPv6 初始化失败，回退纯 IPv4");
+                Dht::new(DhtConfig {
+                    listen_port: port,
+                    bind_addr: Some("0.0.0.0".into()),
+                    enable_ipv6: false,
+                    ..Default::default()
+                })
+                .await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// 运行直到下载完成或取消。
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<(), String> {
         self.spawn_listener().await?;
@@ -1683,24 +1831,16 @@ impl TorrentEngine {
 
         // DHT 初始化（如果启用）。配置端口被占时回退系统分配端口重试，
         // 避免多任务共享同一 dht-listen-port 时后续任务整个失去 DHT。
+        // enable-dht6（BEP 32）：绑定双栈 socket + v6 bootstrap；机器无
+        // IPv6 栈导致绑定失败时自动回退纯 IPv4，不影响 DHT 主功能。
         let dht = if self.config.enable_dht {
-            let mut attempted = Dht::new(DhtConfig {
-                listen_port: self.config.dht_port,
-                bind_addr: Some("0.0.0.0".into()),
-                ..Default::default()
-            })
-            .await;
+            let mut attempted = self.start_dht(self.config.dht_port).await;
             if attempted.is_err() && self.config.dht_port != 0 {
                 tracing::warn!(
                     port = self.config.dht_port,
                     "DHT 监听端口被占用，回退系统分配端口"
                 );
-                attempted = Dht::new(DhtConfig {
-                    listen_port: 0,
-                    bind_addr: Some("0.0.0.0".into()),
-                    ..Default::default()
-                })
-                .await;
+                attempted = self.start_dht(0).await;
             }
             match attempted {
                 Ok(dht) => {
@@ -4321,8 +4461,10 @@ impl TorrentEngine {
         use xfer_bencode::{encode, Value};
 
         let mut m = BTreeMap::new();
-        // 分配 ut_pex ext_id = 1
-        m.insert(b"ut_pex".to_vec(), Value::Int(1));
+        // 分配 ut_pex ext_id = 1（PEX 关闭时不声明，对端也就不会发 PEX）
+        if self.config.enable_pex {
+            m.insert(b"ut_pex".to_vec(), Value::Int(1));
+        }
         // 磁力链接支持：声明 ut_metadata（BEP 9）
         m.insert(
             b"ut_metadata".to_vec(),
@@ -4367,10 +4509,13 @@ impl TorrentEngine {
                     }
                     // 解析 "m" 字典获取对端 ut_pex / ut_metadata ext_id
                     if let Some(Value::Dict(m)) = d.get(b"m".as_slice()) {
+                        // PEX 关闭时不接受对端协商的 ut_pex（后续 PEX 消息一律忽略）
                         if let Some(Value::Int(id)) = m.get(b"ut_pex".as_slice()) {
-                            let mut st = cell.state.lock().unwrap();
-                            st.ut_pex_id = *id as u8;
-                            st.our_ut_pex_id = 1; // 我们分配的 ut_pex id
+                            if self.config.enable_pex {
+                                let mut st = cell.state.lock().unwrap();
+                                st.ut_pex_id = *id as u8;
+                                st.our_ut_pex_id = 1; // 我们分配的 ut_pex id
+                            }
                         }
                         if let Some(Value::Int(id)) = m.get(b"ut_metadata".as_slice()) {
                             let mut st = cell.state.lock().unwrap();
@@ -5148,13 +5293,16 @@ impl TorrentEngine {
         Ok(())
     }
 
-    /// 发送 PEX 消息（BEP 11）。
+    /// 发送 PEX 消息（BEP 11）。PEX 关闭时不做任何事。
     async fn send_pex_message(
         &self,
         stream: &mut PeerStream,
         cell: &Arc<PeerCell>,
         pex_exchange: &mut xfer_discovery::pex::PexExchange,
     ) -> Result<(), String> {
+        if !self.config.enable_pex {
+            return Ok(());
+        }
         let ut_pex_id = cell.state.lock().unwrap().ut_pex_id;
         if ut_pex_id == 0 {
             return Ok(()); // 对端不支持 PEX

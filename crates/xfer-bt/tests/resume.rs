@@ -181,6 +181,11 @@ fn make_torrent_bytes(data: &[u8], tracker_url: &str) -> Vec<u8> {
 
 fn make_config(dir: &std::path::Path, tracker_url: &str) -> TorrentConfig {
     TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.to_path_buf(),
         peer_id: PeerId::azureus_prefix(&[3u8; 12]),
         listen_port: 0,

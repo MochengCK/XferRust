@@ -21,6 +21,25 @@ pub fn existing_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+/// 解析带单位的大小字符串："4M"/"512k"/"1G"/"1048576"（aria2 语义）。
+///
+/// 1024 进制、单位大小写不敏感、无后缀 = 字节；空串 / 非数字 / 非法后缀
+/// 返回 None（调用方据此忽略该选项或退回默认值）。
+pub fn parse_size_bytes(v: &str) -> Option<u64> {
+    let v = v.trim();
+    let (num, mult) = match v.as_bytes().last()? {
+        b'k' | b'K' => (&v[..v.len() - 1], 1024u64),
+        b'm' | b'M' => (&v[..v.len() - 1], 1024 * 1024),
+        b'g' | b'G' => (&v[..v.len() - 1], 1024 * 1024 * 1024),
+        b'0'..=b'9' => (v, 1),
+        _ => return None,
+    };
+    num.trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| n.saturating_mul(mult))
+}
+
 /// 控制文件存放目录：环境变量 `XFER_CTRL_DIR` 优先，
 /// 默认用户主目录下 `.xfer/ctrl`（跨平台：Windows 读
 /// `USERPROFILE`；主目录不可得退当前目录）。

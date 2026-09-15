@@ -147,6 +147,11 @@ async fn download_from_real_libtorrent_seeder() {
     let meta = parse_torrent(&tb).expect("解析真实 .torrent 失败");
 
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dl_dir.clone(),
         peer_id: PeerId::azureus_prefix(&[5u8; 12]),
         listen_port: 0,
@@ -217,6 +222,11 @@ async fn download_from_real_libtorrent_seeder_over_utp() {
     let meta = parse_torrent(&tb).expect("解析真实 .torrent 失败");
 
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dl_dir.clone(),
         peer_id: PeerId::azureus_prefix(&[6u8; 12]),
         listen_port: 0,

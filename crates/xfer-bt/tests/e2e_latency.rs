@@ -253,6 +253,11 @@ async fn latency_link_throughput_requires_multipiece_window() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.clone(),
         peer_id: PeerId::azureus_prefix(&[0xBB; 12]),
         listen_port: 0,

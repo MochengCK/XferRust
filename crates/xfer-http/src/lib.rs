@@ -21,19 +21,33 @@ use xfer_types::{text as charset_text, ENGINE_NAME, ENGINE_VERSION};
 
 /// 构建 HTTP 客户端（全局共享）。
 ///
-/// - UA 按引擎名/版本派生；
+/// - UA 按引擎名/版本派生（可通过 `user-agent` 全局选项覆盖）；
+/// - 可选 HTTP 代理（`all-proxy` 全局选项，空 = 直连）；
 /// - 不启用自动解压（保证 Content-Length 与线上字节一致）；
 /// - 连接 10s、读 30s 超时；无整体超时（大文件流式下载）；
 /// - TCP_NODELAY：流式分块传输关闭 Nagle，避免小块合并延迟。
 pub fn build_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(format!("{ENGINE_NAME}/{ENGINE_VERSION}"))
+    build_client_with(None, None)
+}
+
+/// 按用户配置构建 HTTP 客户端：`user_agent`（None = 引擎默认 UA）、
+/// `proxy`（None/空 = 直连，否则为 `http://host:port` 形式代理地址）。
+pub fn build_client_with(user_agent: Option<&str>, proxy: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(user_agent
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("{ENGINE_NAME}/{ENGINE_VERSION}")))
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::default())
-        .tcp_nodelay(true)
-        .build()
-        .expect("构建 HTTP 客户端失败")
+        .tcp_nodelay(true);
+    if let Some(p) = proxy.filter(|s| !s.trim().is_empty()) {
+        if let Ok(proxy) = reqwest::Proxy::all(p) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    builder.build().expect("构建 HTTP 客户端失败")
 }
 
 /// 下载相关错误。`Cancelled` 表示主动暂停/移除，不是任务失败。

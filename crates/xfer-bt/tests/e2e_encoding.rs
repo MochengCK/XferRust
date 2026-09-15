@@ -211,6 +211,11 @@ async fn tracker_announce_info_hash_encoding_correct() {
     ));
 
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.to_path_buf(),
         peer_id: PeerId::azureus_prefix(&[3u8; 12]),
         listen_port: 0,
@@ -276,6 +281,11 @@ async fn tracker_url_with_existing_query_params() {
     ));
 
     let cfg = TorrentConfig {
+        enable_dht_ipv6: false,
+        enable_pex: false,
+        disk_cache_bytes: 0,
+        save_metadata: false,
+        load_saved_metadata: false,
         dir: dir.to_path_buf(),
         peer_id: PeerId::azureus_prefix(&[3u8; 12]),
         listen_port: 0,

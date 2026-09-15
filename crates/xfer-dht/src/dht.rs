@@ -25,8 +25,9 @@ use tokio_util::sync::CancellationToken;
 use xfer_types::InfoHash;
 
 use crate::krpc::{
-    encode_announce_peer, encode_get_peers, encode_ping, encode_response, gen_tid,
-    parse_get_peers_response, parse_query, parse_response, IncomingQuery, KrpcError, PeerAddr,
+    encode_announce_peer, encode_get_peers, encode_ping, encode_response, encode_response_v6,
+    gen_tid, parse_get_peers_response, parse_query, parse_response, IncomingQuery, KrpcError,
+    PeerAddr,
 };
 #[allow(unused_imports)]
 use crate::node_id::node_id_from_seed;
@@ -41,13 +42,14 @@ use crate::K;
 pub struct DhtConfig {
     /// 本端节点 ID（None 时随机生成）。
     pub node_id: Option<NodeId>,
-    /// 绑定地址（None 时使用 "0.0.0.0"）。
+    /// 绑定地址（None 时：`enable_ipv6` 为 true 用 "[::]" 双栈，否则 "0.0.0.0"）。
     pub bind_addr: Option<String>,
     /// 监听端口（0 = 系统分配）。
     pub listen_port: u16,
     /// 路由表持久化文件路径（None = 不持久化）。
     pub routing_table_file: Option<PathBuf>,
-    /// 是否启用 IPv6 bootstrap。
+    /// 是否启用 IPv6（BEP 32）：绑定双栈 socket、bootstrap v6 节点、
+    /// 解析/返回 nodes6 与 peers6。关闭时行为与纯 IPv4 完全一致。
     pub enable_ipv6: bool,
 }
 
@@ -100,18 +102,25 @@ pub struct Dht {
     recv_permits: Arc<Semaphore>,
     /// 路由表持久化文件。
     routing_table_file: Option<PathBuf>,
+    /// 是否启用 IPv6（BEP 32）：决定 bootstrap 是否含 v6 节点、响应是否
+    /// 附 nodes6。socket 已由绑定地址决定双栈能力。
+    enable_ipv6: bool,
     /// 取消令牌。
     cancel: CancellationToken,
 }
 
 impl Dht {
     /// 创建并绑定 UDP socket。
+    ///
+    /// `enable_ipv6` 且未显式指定 bind_addr 时绑定 "[::]"（双栈：同一
+    /// socket 兼顾 IPv4-mapped 与 IPv6 报文），否则沿用 IPv4 "0.0.0.0"。
     pub async fn new(config: DhtConfig) -> Result<Arc<Self>, String> {
         let node_id = config.node_id.unwrap_or_else(NodeId::random);
-        let bind_host = config.bind_addr.as_deref().unwrap_or("0.0.0.0");
+        let default_host = if config.enable_ipv6 { "[::]" } else { "0.0.0.0" };
+        let bind_host = config.bind_addr.as_deref().unwrap_or(default_host);
         let socket = UdpSocket::bind((bind_host, config.listen_port))
             .await
-            .map_err(|e| format!("DHT UDP 绑定失败: {e}"))?;
+            .map_err(|e| format!("DHT UDP 绑定失败（{bind_host}）: {e}"))?;
         // 确保使用回环地址用于本地测试（避免 macOS No route to host）
         let local_addr = socket
             .local_addr()
@@ -137,8 +146,14 @@ impl Dht {
             known_order: Arc::new(Mutex::new(VecDeque::new())),
             recv_permits: Arc::new(Semaphore::new(RECV_CONCURRENCY)),
             routing_table_file: config.routing_table_file,
+            enable_ipv6: config.enable_ipv6,
             cancel: CancellationToken::new(),
         }))
+    }
+
+    /// 是否启用 IPv6（BEP 32）。
+    pub fn enable_ipv6(&self) -> bool {
+        self.enable_ipv6
     }
 
     pub fn our_id(&self) -> NodeId {
@@ -235,7 +250,7 @@ impl Dht {
                 let table = self.table.read().await;
                 let closest = table.closest(&target, K);
                 let token = self.make_token(&id);
-                let resp = encode_response(&tid, &self.our_id, &closest, Some(&token));
+                let resp = self.encode_nodes_response(&tid, &closest, from, Some(&token));
                 drop(table);
                 let _ = self.socket.send_to(&resp, from).await;
             }
@@ -264,7 +279,7 @@ impl Dht {
                     let table = self.table.read().await;
                     let target_node = NodeId::from_info_hash(info_hash);
                     let closest = table.closest(&target_node, K);
-                    let resp = encode_response(&tid, &self.our_id, &closest, Some(&token));
+                    let resp = self.encode_nodes_response(&tid, &closest, from, Some(&token));
                     drop(table);
                     let _ = self.socket.send_to(&resp, from).await;
                 }
@@ -299,6 +314,37 @@ impl Dht {
             }
         }
         Ok(())
+    }
+
+    /// 编码节点响应：请求方是 IPv6 时按 BEP 32 附回 `nodes6`（IPv6 节点），
+    /// IPv4 节点始终走 `nodes` 字段。
+    fn encode_nodes_response(
+        &self,
+        tid: &[u8],
+        closest: &[NodeEntry],
+        from: SocketAddr,
+        token: Option<&[u8]>,
+    ) -> Vec<u8> {
+        if !self.enable_ipv6 || !from.is_ipv6() {
+            let v4: Vec<NodeEntry> = closest
+                .iter()
+                .filter(|n| n.addr.is_ipv4())
+                .cloned()
+                .collect();
+            // 纯 v4 响应：v6 节点无处安放（对端未声明 v6 能力）
+            return encode_response_v6(tid, &self.our_id, &v4, &[], token);
+        }
+        let v4: Vec<NodeEntry> = closest
+            .iter()
+            .filter(|n| n.addr.is_ipv4())
+            .cloned()
+            .collect();
+        let v6: Vec<NodeEntry> = closest
+            .iter()
+            .filter(|n| n.addr.is_ipv6())
+            .cloned()
+            .collect();
+        encode_response_v6(tid, &self.our_id, &v4, &v6, token)
     }
 
     /// 添加已知 peer（用于 announce_peer 与本端下载宣告）。
@@ -358,12 +404,20 @@ impl Dht {
     // ------------------------------------------------------------------
 
     /// 启动 bootstrap：解析种子节点 → ping → find_node 自身 ID 填充路由表。
+    ///
+    /// `enable_ipv6` 为 true 时同时解析 BOOTSTRAP_V6（BEP 32），v6 查询
+    /// 由双栈 socket 直接发出。
     pub async fn bootstrap(self: &Arc<Self>) -> Result<(), String> {
-        let bootstrap_addrs = resolve_bootstrap().await;
+        let bootstrap_addrs = resolve_bootstrap(self.enable_ipv6).await;
         if bootstrap_addrs.is_empty() {
             tracing::warn!("无法解析任何 bootstrap 节点");
             return Ok(());
         }
+        tracing::debug!(
+            count = bootstrap_addrs.len(),
+            ipv6 = self.enable_ipv6,
+            "DHT bootstrap 节点已解析"
+        );
 
         // 向每个 bootstrap 节点发送 find_node（查自身 ID）
         let target = self.our_id;
@@ -691,7 +745,10 @@ impl Dht {
 // ----------------------------------------------------------------------
 
 /// 解析 bootstrap 节点地址（DNS → SocketAddr）。
-async fn resolve_bootstrap() -> Vec<SocketAddr> {
+///
+/// `enable_ipv6` 时一并解析 BOOTSTRAP_V6（IPv6 节点）；单族解析失败
+/// 只记 debug，不影响另一族。两族都解析不到时退回已知 IPv4 兜底 IP。
+async fn resolve_bootstrap(enable_ipv6: bool) -> Vec<SocketAddr> {
     let mut addrs = Vec::new();
     // IPv4 bootstrap
     for (host, port) in crate::BOOTSTRAP_V4 {
@@ -703,9 +760,25 @@ async fn resolve_bootstrap() -> Vec<SocketAddr> {
             }
         }
     }
-    // IPv6 bootstrap（如果启用）
-    if addrs.is_empty() {
-        // 回退：尝试用已知 IP（避免 DNS 失败导致完全无法 bootstrap）
+    // IPv6 bootstrap（DHT over IPv6）
+    if enable_ipv6 {
+        for (host, port) in crate::BOOTSTRAP_V6 {
+            match tokio::net::lookup_host(format!("{host}:{port}")).await {
+                Ok(iter) => {
+                    for a in iter {
+                        if a.is_ipv6() {
+                            addrs.push(a);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(host = %host, error = %e, "IPv6 bootstrap 节点解析失败");
+                }
+            }
+        }
+    }
+    // 全部失败：回退已知 IPv4 IP（避免 DNS 故障导致完全无法 bootstrap）
+    if addrs.iter().all(|a| !a.is_ipv4()) {
         addrs.push("67.215.218.13:6881".parse().unwrap()); // dht.libtorrent.org 常用 IP
     }
     addrs
@@ -958,6 +1031,195 @@ mod tests {
             Err(KrpcError::Remote { .. }) => {} // 预期错误
             _ => panic!("错误 token 应返回错误"),
         }
+
+        dht.shutdown();
+    }
+
+    // ------------------------------------------------------------------
+    // DHT over IPv6（BEP 32）
+    // ------------------------------------------------------------------
+
+    /// 模拟 IPv6 KRPC 节点：响应 ping / find_node（回 nodes6）/ get_peers
+    /// （回 peers6）。绑定失败（机器无 IPv6 栈）返回 None，测试跳过。
+    async fn spawn_mock_krpc_node_v6(id: NodeId) -> Option<Arc<UdpSocket>> {
+        let socket = Arc::new(UdpSocket::bind(("[::1]", 0)).await.ok()?);
+        let s = socket.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, from)) = s.recv_from(&mut buf).await {
+                let data = &buf[..n];
+                match parse_query(data) {
+                    Ok(IncomingQuery::Ping { tid, .. }) => {
+                        let resp = encode_response(&tid, &id, &[], None);
+                        let _ = s.send_to(&resp, from).await;
+                    }
+                    Ok(IncomingQuery::FindNode { tid, .. }) => {
+                        // 回 IPv6 节点（nodes6 字段）
+                        let nodes6 = vec![NodeEntry {
+                            id: NodeId::from_bytes(&[0xA1; 20]),
+                            addr: "[::1]:7001".parse().unwrap(),
+                        }];
+                        let resp = encode_response_v6(&tid, &id, &[], &nodes6, None);
+                        let _ = s.send_to(&resp, from).await;
+                    }
+                    Ok(IncomingQuery::GetPeers { tid, .. }) => {
+                        // 回 peers6（18 字节 compact）
+                        let mut c = Vec::new();
+                        c.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+                        c.extend_from_slice(&51414u16.to_be_bytes());
+                        let mut r = std::collections::BTreeMap::new();
+                        r.insert(b"id".to_vec(), xfer_bencode::Value::Bytes(id.as_bytes().to_vec()));
+                        r.insert(
+                            b"token".to_vec(),
+                            xfer_bencode::Value::Bytes(b"tok6".to_vec()),
+                        );
+                        r.insert(b"peers6".to_vec(), xfer_bencode::Value::Bytes(c));
+                        let mut top = std::collections::BTreeMap::new();
+                        top.insert(b"t".to_vec(), xfer_bencode::Value::Bytes(tid.to_vec()));
+                        top.insert(b"y".to_vec(), xfer_bencode::Value::Bytes(b"r".to_vec()));
+                        top.insert(b"r".to_vec(), xfer_bencode::Value::Dict(r));
+                        let resp = xfer_bencode::encode(&xfer_bencode::Value::Dict(top));
+                        let _ = s.send_to(&resp, from).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        Some(socket)
+    }
+
+    #[tokio::test]
+    async fn dht_ipv6_binds_and_queries_nodes6() {
+        let mock_id = node_id_from_seed(b"mock-v6-node");
+        let Some(mock) = spawn_mock_krpc_node_v6(mock_id).await else {
+            // 环境无 IPv6：跳过（不算失败）
+            return;
+        };
+        let mock_addr = mock.local_addr().unwrap();
+        assert!(mock_addr.is_ipv6());
+
+        // enable_ipv6 + 未显式指定 bind_addr → 默认绑双栈 "[::]"；
+        // 这里为了不依赖全局 v6 地址，显式绑回环
+        let dht = Dht::new(DhtConfig {
+            node_id: Some(node_id_from_seed(b"test-dht-v6")),
+            bind_addr: Some("[::1]".into()),
+            listen_port: 0,
+            routing_table_file: None,
+            enable_ipv6: true,
+        })
+        .await
+        .unwrap();
+        assert!(dht.local_addr().unwrap().is_ipv6());
+        assert!(dht.enable_ipv6());
+
+        // find_node：响应里的 nodes6 应被解析为 IPv6 节点
+        let nodes = dht.find_node_query(mock_addr, NodeId::random()).await.unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].addr.is_ipv6());
+        assert_eq!(nodes[0].addr.port(), 7001);
+
+        // get_peers：响应里的 peers6 应被解析为 IPv6 peer
+        let ih = InfoHash::from_bytes(&[0x77; 20]);
+        let resp = dht.get_peers_query(mock_addr, ih).await.unwrap();
+        let peers = resp.peers.expect("应返回 peers6 解析出的 peer");
+        assert_eq!(peers.len(), 1);
+        assert!(peers[0].addr.is_ipv6());
+        assert_eq!(peers[0].addr.port(), 51414);
+        assert_eq!(resp.token, b"tok6".to_vec());
+
+        dht.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dht_v6_requester_receives_nodes6() {
+        let mock_id = node_id_from_seed(b"mock-v6-requester");
+        let Some(mock) = spawn_mock_krpc_node_v6(mock_id).await else {
+            return;
+        };
+        let _mock_addr = mock.local_addr().unwrap();
+
+        let dht = Dht::new(DhtConfig {
+            node_id: Some(node_id_from_seed(b"test-dht-v6-resp")),
+            bind_addr: Some("[::1]".into()),
+            listen_port: 0,
+            routing_table_file: None,
+            enable_ipv6: true,
+        })
+        .await
+        .unwrap();
+        dht.spawn_background();
+
+        // 路由表里同时放 v4 与 v6 节点
+        {
+            let mut table = dht.table.write().await;
+            table.add(NodeEntry {
+                id: NodeId::from_bytes(&[1; 20]),
+                addr: "127.0.0.1:7001".parse().unwrap(),
+            });
+            table.add(NodeEntry {
+                id: NodeId::from_bytes(&[2; 20]),
+                addr: "[::1]:7002".parse().unwrap(),
+            });
+        }
+
+        // 模拟 IPv6 请求方发 find_node：应收到 nodes6（v6 节点）
+        let client = UdpSocket::bind(("[::1]", 0)).await.unwrap();
+        let client_id = node_id_from_seed(b"v6-client");
+        let tid = gen_tid();
+        let wire = crate::krpc::encode_find_node(&tid, &client_id, &NodeId::random());
+        client.send_to(&wire, dht.local_addr().unwrap()).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(from, dht.local_addr().unwrap(), "回复应来自 DHT 自身");
+        let resp = parse_response(&buf[..n], &tid).unwrap();
+        assert!(
+            resp.nodes.iter().any(|node| node.addr.is_ipv6()),
+            "v6 请求方应收到 nodes6 中的 IPv6 节点"
+        );
+
+        dht.shutdown();
+    }
+
+    #[tokio::test]
+    async fn dht_v4_only_requester_gets_no_v6_nodes() {
+        let dht = Dht::new(DhtConfig {
+            node_id: Some(node_id_from_seed(b"test-dht-v4-resp")),
+            bind_addr: Some("127.0.0.1".into()),
+            listen_port: 0,
+            routing_table_file: None,
+            enable_ipv6: true,
+        })
+        .await
+        .unwrap();
+        dht.spawn_background();
+        {
+            let mut table = dht.table.write().await;
+            table.add(NodeEntry {
+                id: NodeId::from_bytes(&[1; 20]),
+                addr: "127.0.0.1:7001".parse().unwrap(),
+            });
+            table.add(NodeEntry {
+                id: NodeId::from_bytes(&[2; 20]),
+                addr: "[::1]:7002".parse().unwrap(),
+            });
+        }
+        // IPv4 请求方：只回 nodes（v4），不塞 nodes6
+        let client = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let client_id = node_id_from_seed(b"v4-client");
+        let tid = gen_tid();
+        let wire = crate::krpc::encode_find_node(&tid, &client_id, &NodeId::random());
+        client.send_to(&wire, dht.local_addr().unwrap()).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(from, dht.local_addr().unwrap(), "回复应来自 DHT 自身");
+        let resp = parse_response(&buf[..n], &tid).unwrap();
+        assert!(resp.nodes.iter().all(|node| node.addr.is_ipv4()));
 
         dht.shutdown();
     }

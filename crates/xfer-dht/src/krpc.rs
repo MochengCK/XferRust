@@ -125,7 +125,6 @@ pub fn decode_nodes_compact(data: &[u8]) -> Vec<NodeEntry> {
 }
 
 /// 从 compact nodes6（38 字节/条 = 20 ID + 16 IP + 2 端口）解码。
-#[allow(dead_code)]
 pub fn decode_nodes6_compact(data: &[u8]) -> Vec<NodeEntry> {
     let mut out = Vec::new();
     for c in data.chunks_exact(38) {
@@ -141,6 +140,23 @@ pub fn decode_nodes6_compact(data: &[u8]) -> Vec<NodeEntry> {
             id: NodeId::from_bytes(&id),
             addr: SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::from(ip)), port),
         });
+    }
+    out
+}
+
+/// 编码 compact nodes6（38 字节/条）；非 IPv6 节点跳过（BEP 32）。
+pub fn encode_nodes6_compact(nodes: &[NodeEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(nodes.len() * 38);
+    for n in nodes {
+        match n.addr {
+            SocketAddr::V6(v6) => {
+                out.extend_from_slice(n.id.as_bytes());
+                out.extend_from_slice(&v6.ip().octets());
+                out.extend_from_slice(&n.addr.port().to_be_bytes());
+            }
+            // IPv4 节点由 nodes 字段承载，这里略过
+            SocketAddr::V4(_) => {}
+        }
     }
     out
 }
@@ -310,17 +326,26 @@ pub fn parse_response(data: &[u8], expected_tid: &[u8; 2]) -> Result<NodeRespons
         .and_then(Value::as_bytes)
         .map(|b| b.to_vec());
 
-    let nodes = if let Some(n) = r.get(b"nodes".as_slice()).and_then(Value::as_bytes) {
-        decode_nodes_compact(n)
-    } else {
-        Vec::new()
-    };
+    let nodes = decode_nodes_field(r);
 
     Ok(NodeResponse {
         responder_id,
         nodes,
         token,
     })
+}
+
+/// 解析响应里的节点字段：`nodes`（IPv4 compact）+ `nodes6`（IPv6 compact，
+/// BEP 32）。合并为一个列表，调用方无需区分地址族。
+fn decode_nodes_field(r: &BTreeMap<Vec<u8>, Value>) -> Vec<NodeEntry> {
+    let mut nodes = Vec::new();
+    if let Some(n) = r.get(b"nodes".as_slice()).and_then(Value::as_bytes) {
+        nodes.extend(decode_nodes_compact(n));
+    }
+    if let Some(n6) = r.get(b"nodes6".as_slice()).and_then(Value::as_bytes) {
+        nodes.extend(decode_nodes6_compact(n6));
+    }
+    nodes
 }
 
 /// 解析 get_peers 专用的响应（同时检查 peers/nodes 分支）。
@@ -382,7 +407,7 @@ pub fn parse_get_peers_response(
         .unwrap_or_default();
 
     // 检查 peers（value 或 bytes）
-    let peers = match r.get(b"values".as_slice()) {
+    let mut peers = match r.get(b"values".as_slice()) {
         Some(Value::List(items)) => {
             let mut peers = Vec::new();
             for it in items {
@@ -398,17 +423,28 @@ pub fn parse_get_peers_response(
             Some(peers)
         }
         // 兼容部分实现：peers 字段
-        Some(Value::Bytes(b)) if b.len() % 6 == 0 && !b.is_empty() => {
-            Some(PeerAddr::from_compact(b))
-        }
+        Some(Value::Bytes(b)) if !b.is_empty() && b.len() % 6 == 0 => Some(PeerAddr::from_compact(b)),
         _ => None,
     };
-
-    let nodes = if let Some(n) = r.get(b"nodes".as_slice()).and_then(Value::as_bytes) {
-        decode_nodes_compact(n)
-    } else {
-        Vec::new()
+    // BEP 32：peers6（18 字节/条 compact）单独字段，与 values 合并
+    let peers6: Vec<PeerAddr> = match r.get(b"peers6".as_slice()) {
+        Some(Value::Bytes(b)) if !b.is_empty() && b.len() % 18 == 0 => PeerAddr::from_compact6(b),
+        Some(Value::List(items)) => {
+            let mut out = Vec::new();
+            for b in items.iter().filter_map(Value::as_bytes) {
+                if b.len() == 18 {
+                    out.extend(PeerAddr::from_compact6(b));
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
     };
+    if !peers6.is_empty() {
+        peers.get_or_insert_with(Vec::new).extend(peers6);
+    }
+
+    let nodes = decode_nodes_field(r);
 
     Ok(GetPeersResponse {
         responder_id,
@@ -571,10 +607,30 @@ pub fn encode_response(
     nodes: &[NodeEntry],
     token: Option<&[u8]>,
 ) -> Vec<u8> {
+    encode_response_v6(tid, our_id, nodes, &[], token)
+}
+
+/// 编码响应（BEP 32：给 IPv6 请求方附带回 `nodes6`）。
+///
+/// `nodes6` 中的 IPv6 节点写入 r.nodes6（38 字节/条 compact）；`nodes`
+/// 仍按 IPv4 compact（26 字节/条）编码，非 IPv4 项跳过。
+pub fn encode_response_v6(
+    tid: &[u8],
+    our_id: &NodeId,
+    nodes: &[NodeEntry],
+    nodes6: &[NodeEntry],
+    token: Option<&[u8]>,
+) -> Vec<u8> {
     let mut r = BTreeMap::new();
     r.insert(b"id".to_vec(), Value::Bytes(our_id.as_bytes().to_vec()));
     if !nodes.is_empty() {
         r.insert(b"nodes".to_vec(), Value::Bytes(encode_nodes_compact(nodes)));
+    }
+    if !nodes6.is_empty() {
+        let compact = encode_nodes6_compact(nodes6);
+        if !compact.is_empty() {
+            r.insert(b"nodes6".to_vec(), Value::Bytes(compact));
+        }
     }
     if let Some(t) = token {
         r.insert(b"token".to_vec(), Value::Bytes(t.to_vec()));
@@ -806,5 +862,116 @@ mod tests {
             IncomingQuery::GetPeers { info_hash: h, .. } => assert_eq!(h, ih),
             _ => panic!("应为 GetPeers"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // BEP 32（DHT over IPv6）
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn nodes6_compact_roundtrip() {
+        let nodes = vec![
+            NodeEntry {
+                id: NodeId::from_bytes(&[7; 20]),
+                addr: "[2001:db8::1]:6881".parse().unwrap(),
+            },
+            NodeEntry {
+                id: NodeId::from_bytes(&[8; 20]),
+                addr: "[::1]:49001".parse().unwrap(),
+            },
+            // IPv4 节点不参与 nodes6 编码
+            NodeEntry {
+                id: NodeId::from_bytes(&[9; 20]),
+                addr: "127.0.0.1:6881".parse().unwrap(),
+            },
+        ];
+        let compact = encode_nodes6_compact(&nodes);
+        assert_eq!(compact.len(), 38 * 2, "只应编码两个 IPv6 节点");
+        let back = decode_nodes6_compact(&compact);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].id, nodes[0].id);
+        assert_eq!(back[0].addr, nodes[0].addr);
+        assert_eq!(back[1].addr, nodes[1].addr);
+    }
+
+    #[test]
+    fn response_with_nodes6_is_parsed() {
+        let tid = gen_tid();
+        let our = NodeId::random();
+        let v4 = vec![NodeEntry {
+            id: NodeId::from_bytes(&[1; 20]),
+            addr: "127.0.0.1:7001".parse().unwrap(),
+        }];
+        let v6 = vec![NodeEntry {
+            id: NodeId::from_bytes(&[2; 20]),
+            addr: "[2001:db8::2]:7002".parse().unwrap(),
+        }];
+        let wire = encode_response_v6(&tid, &our, &v4, &v6, Some(b"tok"));
+        let parsed = parse_response(&wire, &tid).unwrap();
+        // 两种地址族的节点都进入同一列表（调用方无需区分）
+        assert_eq!(parsed.nodes.len(), 2);
+        assert!(parsed.nodes.iter().any(|n| n.addr.is_ipv6()));
+        assert!(parsed.nodes.iter().any(|n| n.addr.is_ipv4()));
+        assert_eq!(parsed.token.as_deref(), Some(&b"tok"[..]));
+
+        // 无 v6 节点时不写 nodes6 字段（保持纯 v4 报文形状）
+        let wire = encode_response_v6(&tid, &our, &v4, &[], None);
+        let parsed = parse_response(&wire, &tid).unwrap();
+        assert_eq!(parsed.nodes.len(), 1);
+        assert!(parsed.nodes[0].addr.is_ipv4());
+    }
+
+    #[test]
+    fn get_peers_response_parses_peers6_field() {
+        let tid = gen_tid();
+        let our = NodeId::random();
+        // 手工构造 peers6 compact（18 字节）
+        let mut c = Vec::new();
+        c.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        c.extend_from_slice(&51413u16.to_be_bytes());
+        let mut r = BTreeMap::new();
+        r.insert(b"id".to_vec(), Value::Bytes(our.as_bytes().to_vec()));
+        r.insert(b"token".to_vec(), Value::Bytes(b"t6".to_vec()));
+        r.insert(b"peers6".to_vec(), Value::Bytes(c.clone()));
+        let mut top = BTreeMap::new();
+        top.insert(b"t".to_vec(), Value::Bytes(tid.to_vec()));
+        top.insert(b"y".to_vec(), Value::Bytes(b"r".to_vec()));
+        top.insert(b"r".to_vec(), Value::Dict(r));
+        let wire = encode(&Value::Dict(top));
+
+        let parsed = parse_get_peers_response(&wire, &tid).unwrap();
+        let peers = parsed.peers.expect("peers6 应被解析为 peer 列表");
+        assert_eq!(peers.len(), 1);
+        assert!(peers[0].addr.is_ipv6());
+        assert_eq!(peers[0].addr.port(), 51413);
+        assert_eq!(parsed.token, b"t6".to_vec());
+    }
+
+    #[test]
+    fn get_peers_response_merges_values_and_peers6() {
+        let tid = gen_tid();
+        let our = NodeId::random();
+        let mut v6 = vec![0u8; 18];
+        v6[15] = 1; // ::1
+        v6[16] = 0xC8;
+        v6[17] = 0xB5; // 51381
+        let mut r = BTreeMap::new();
+        r.insert(b"id".to_vec(), Value::Bytes(our.as_bytes().to_vec()));
+        r.insert(
+            b"values".to_vec(),
+            Value::List(vec![Value::Bytes(vec![127, 0, 0, 1, 0xD0, 0x01])]),
+        );
+        r.insert(b"peers6".to_vec(), Value::Bytes(v6));
+        let mut top = BTreeMap::new();
+        top.insert(b"t".to_vec(), Value::Bytes(tid.to_vec()));
+        top.insert(b"y".to_vec(), Value::Bytes(b"r".to_vec()));
+        top.insert(b"r".to_vec(), Value::Dict(r));
+        let wire = encode(&Value::Dict(top));
+
+        let parsed = parse_get_peers_response(&wire, &tid).unwrap();
+        let peers = parsed.peers.unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers.iter().filter(|p| p.addr.is_ipv6()).count(), 1);
+        assert_eq!(peers.iter().filter(|p| p.addr.is_ipv4()).count(), 1);
     }
 }
