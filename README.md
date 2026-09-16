@@ -523,5 +523,5 @@ mgr.unpause(&gid)?;               // start downloading immediately after confirm
 
 ## License
 
-GPL-3.0-only (GNU General Public License v3.0, this version only). See
+GPL-3.0 (GNU General Public License v3.0, this version only). See
 [LICENSE](LICENSE) for the full license text.
