@@ -481,4 +481,4 @@ mgr.unpause(&gid)?;               // 确认后立即开始下载
 
 ## License
 
-GPL-3.0-only（GNU General Public License v3.0，仅此版本）。完整许可证文本见 [LICENSE](LICENSE)。
+GPL-3.0（GNU General Public License v3.0，仅此版本）。完整许可证文本见 [LICENSE](LICENSE)。
