@@ -4,7 +4,7 @@
 //! 重发策略（§7.7）：5s 首次重发、10s 放弃。
 //! connect 响应 connection_id 有效期 60s（BEP 15 建议）。
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
@@ -69,18 +69,36 @@ const CONNECTION_ID_TTL: Duration = Duration::from_secs(60);
 /// UDP tracker 客户端。
 pub struct UdpTracker {
     socket: UdpSocket,
+    /// socket 是否为 IPv6（双栈绑定）：发往 IPv4 tracker 前必须转
+    /// v4-mapped，否则 sendto 因地址族不匹配失败（EINVAL）。
+    v6_socket: bool,
     /// connection_id 缓存：(tracker_addr, id, 过期时间)。
     connection_id: Option<(SocketAddr, u64, Instant)>,
 }
 
 impl UdpTracker {
     /// 绑定 UDP socket（系统分配端口）。
+    ///
+    /// 双栈优先（`[::]:0`）：同一 socket 兼顾 IPv4 tracker 与 IPv6 tracker，
+    /// 纯 IPv4 绑定在无 IPv4 的主机上会直接失败。无 IPv6 的机器回退
+    /// `0.0.0.0:0`（与旧行为一致）。
     pub async fn new() -> Result<Self, UdpTrackerError> {
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| UdpTrackerError::Network(e.to_string()))?;
+        let (socket, v6_socket) =
+            match UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await {
+                Ok(s) => (s, true),
+                Err(e) => {
+                    tracing::debug!(error = %e, "UDP tracker 双栈绑定失败，回退纯 IPv4");
+                    (
+                        UdpSocket::bind("0.0.0.0:0")
+                            .await
+                            .map_err(|e2| UdpTrackerError::Network(e2.to_string()))?,
+                        false,
+                    )
+                }
+            };
         Ok(Self {
             socket,
+            v6_socket,
             connection_id: None,
         })
     }
@@ -90,10 +108,22 @@ impl UdpTracker {
         let socket = UdpSocket::bind(addr)
             .await
             .map_err(|e| UdpTrackerError::Network(e.to_string()))?;
+        let v6_socket = socket.local_addr().map(|a| a.is_ipv6()).unwrap_or(false);
         Ok(Self {
             socket,
+            v6_socket,
             connection_id: None,
         })
+    }
+
+    /// 发送目标地址转换（双栈 socket 上 IPv4 目标需转 v4-mapped）。
+    fn wire_dst(&self, to: SocketAddr) -> SocketAddr {
+        match (self.v6_socket, to) {
+            (true, SocketAddr::V4(v4)) => {
+                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+            }
+            _ => to,
+        }
     }
 
     /// 执行 announce（含 connect 握手 + 重发策略）。
@@ -153,7 +183,7 @@ impl UdpTracker {
             }
 
             self.socket
-                .send_to(&packet, tracker_addr)
+                .send_to(&packet, self.wire_dst(tracker_addr))
                 .await
                 .map_err(|e| UdpTrackerError::Network(e.to_string()))?;
 
@@ -200,7 +230,7 @@ impl UdpTracker {
             }
 
             self.socket
-                .send_to(&packet, tracker_addr)
+                .send_to(&packet, self.wire_dst(tracker_addr))
                 .await
                 .map_err(|e| UdpTrackerError::Network(e.to_string()))?;
 
@@ -552,6 +582,55 @@ mod tests {
         assert_eq!(resp.peers[0], "127.0.0.1:6881".parse().unwrap());
         assert_eq!(resp.peers[1], "192.168.1.1:6882".parse().unwrap());
 
+        server_task.await.unwrap();
+    }
+
+    /// 默认构造（双栈 socket）访问 IPv4 tracker：发往 IPv4 目标需转
+    /// v4-mapped，否则 sendto 因地址族不匹配失败（EINVAL）。
+    ///
+    /// 回归场景——`UdpTracker::new()` 此前绑 `0.0.0.0`：IPv6-only 主机上
+    /// UDP tracker 全部不可用；改双栈后若不转 v4-mapped，IPv4 tracker
+    /// （BEP 15 的绝大多数）反而全部发送失败。
+    #[tokio::test]
+    async fn udp_tracker_dual_stack_socket_reaches_ipv4_tracker() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 128];
+            let (n, client_addr) = server.recv_from(&mut buf).await.unwrap();
+            let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+            let mut resp = Vec::with_capacity(16);
+            resp.extend_from_slice(&ACTION_CONNECT.to_be_bytes());
+            resp.extend_from_slice(&tid.to_be_bytes());
+            resp.extend_from_slice(&0xCAFE_BABEu64.to_be_bytes());
+            server.send_to(&resp, client_addr).await.unwrap();
+            assert_eq!(n, 16);
+
+            let (_, client_addr) = server.recv_from(&mut buf).await.unwrap();
+            let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+            let mut resp = Vec::new();
+            resp.extend_from_slice(&ACTION_ANNOUNCE.to_be_bytes());
+            resp.extend_from_slice(&tid.to_be_bytes());
+            resp.extend_from_slice(&1800u32.to_be_bytes());
+            resp.extend_from_slice(&1u32.to_be_bytes());
+            resp.extend_from_slice(&2u32.to_be_bytes());
+            server.send_to(&resp, client_addr).await.unwrap();
+        });
+
+        let mut tracker = UdpTracker::new().await.unwrap();
+        let req = UdpAnnounceRequest {
+            info_hash: InfoHash::from_bytes(&[0xAA; 20]),
+            peer_id: PeerId([0xBB; 20]),
+            port: 6881,
+            uploaded: 0,
+            downloaded: 0,
+            left: 1024,
+            event: UdpEvent::Started,
+            numwant: 50,
+        };
+        let resp = tracker.announce(server_addr, &req).await.unwrap();
+        assert_eq!(resp.interval, 1800);
+        assert_eq!(resp.seeders, 2);
         server_task.await.unwrap();
     }
 }

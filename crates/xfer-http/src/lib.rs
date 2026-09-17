@@ -27,12 +27,22 @@ use xfer_types::{text as charset_text, ENGINE_NAME, ENGINE_VERSION};
 /// - 连接 10s、读 30s 超时；无整体超时（大文件流式下载）；
 /// - TCP_NODELAY：流式分块传输关闭 Nagle，避免小块合并延迟。
 pub fn build_client() -> reqwest::Client {
-    build_client_with(None, None)
+    build_client_with(None, None, None)
 }
 
 /// 按用户配置构建 HTTP 客户端：`user_agent`（None = 引擎默认 UA）、
-/// `proxy`（None/空 = 直连，否则为 `http://host:port` 形式代理地址）。
-pub fn build_client_with(user_agent: Option<&str>, proxy: Option<&str>) -> reqwest::Client {
+/// `proxy`（None/空 = 直连，否则为 `http://host:port` 形式代理地址）、
+/// `no_proxy`（None/空 = 不过滤，逗号分隔的直连主机/网段，支持
+/// `.example.com` 后缀与 `192.168.0.0/16` 网段写法）。
+///
+/// `no-proxy` 作用于 `all-proxy` 配置的代理；走环境变量代理
+/// （`HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`，reqwest 默认读取）时由
+/// `NO_PROXY` 环境变量本身控制。
+pub fn build_client_with(
+    user_agent: Option<&str>,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .user_agent(user_agent
             .filter(|s| !s.trim().is_empty())
@@ -43,8 +53,16 @@ pub fn build_client_with(user_agent: Option<&str>, proxy: Option<&str>) -> reqwe
         .redirect(reqwest::redirect::Policy::default())
         .tcp_nodelay(true);
     if let Some(p) = proxy.filter(|s| !s.trim().is_empty()) {
-        if let Ok(proxy) = reqwest::Proxy::all(p) {
-            builder = builder.proxy(proxy);
+        if let Ok(mut pr) = reqwest::Proxy::all(p) {
+            // 直连例外（no-proxy）：此前该选项只被存储从未生效，代理环境里
+            // 局域网/回环地址也被塞进代理，本可直连的地址反而失败
+            if let Some(np) = no_proxy
+                .filter(|s| !s.trim().is_empty())
+                .and_then(reqwest::NoProxy::from_string)
+            {
+                pr = pr.no_proxy(Some(np));
+            }
+            builder = builder.proxy(pr);
         }
     }
     builder.build().expect("构建 HTTP 客户端失败")
@@ -603,5 +621,28 @@ mod tests {
             probe(&client, &format!("http://{a2}/missing"), &cancel).await,
             Err(HttpError::Http(404))
         ));
+    }
+
+    /// no-proxy 生效：代理地址不可达时，列表内的主机仍能直连成功。
+    ///
+    /// 回归场景——代理环境（企业网/校园网强制代理）里 `all-proxy` 配了代理，
+    /// `no-proxy` 列出局域网/回环地址；此前 no-proxy 只被存储从不生效，
+    /// 这些本该直连的地址被塞进代理后请求必然失败。
+    #[tokio::test]
+    async fn no_proxy_bypasses_unreachable_proxy() {
+        let app = axum::Router::new().route(
+            "/probe",
+            axum::routing::get(|| async { axum::http::StatusCode::OK }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let cancel = CancellationToken::new();
+
+        // 代理指向必然连不上的端口：只有 no-proxy 放行 127.0.0.1 才可能成功
+        let client = build_client_with(None, Some("http://127.0.0.1:1"), Some("127.0.0.1"));
+        let p = probe(&client, &format!("http://{addr}/probe"), &cancel).await;
+        assert!(p.is_ok(), "no-proxy 未生效，请求走了不可达代理: {p:?}");
     }
 }

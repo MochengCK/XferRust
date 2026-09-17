@@ -10,7 +10,7 @@
 //! §7.6：uTP 与 TCP 监听同端口（对端把 uTP SYN 发到通告的监听端口）。
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -224,6 +224,9 @@ impl ConnContext {
 /// 通过 `UtpManagerHandle` 与外部交互。
 pub struct UtpManager {
     socket: UdpSocket,
+    /// socket 是否为 IPv6（双栈绑定）。双栈 socket 上发往 IPv4 目标前必须
+    /// 转成 v4-mapped 地址，否则 sendto 因地址族不匹配失败（EINVAL）。
+    v6_socket: bool,
     /// 已建立的连接：recv_id → ConnContext。
     connections: HashMap<u16, ConnContext>,
     /// 入站连接通知通道。
@@ -237,12 +240,19 @@ impl UtpManager {
     ///
     /// 返回 (handle, incoming_receiver)。
     /// `incoming_receiver` 接收新入站连接。
+    ///
+    /// `addr` 为监听地址字面量（`"0.0.0.0"` / `"[::]"`）：先按 IP 字面量
+    /// 解析再绑定，不能交给 DNS 解析——`"[::]"` 作为域名解析在 macOS 上
+    /// 必然失败（nodename nor servname provided）。绑 `"[::]"` 得到双栈
+    /// socket，同时收发 IPv4（v4-mapped）与 IPv6。
     pub async fn bind(
         addr: &str,
         port: u16,
     ) -> io::Result<(UtpManagerHandle, mpsc::Receiver<UtpStream>)> {
-        let socket = UdpSocket::bind((addr, port)).await?;
+        let bind_addr = resolve_bind_addr(addr, port).await?;
+        let socket = UdpSocket::bind(bind_addr).await?;
         let local_addr = socket.local_addr()?;
+        let v6_socket = local_addr.is_ipv6();
 
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
@@ -251,6 +261,7 @@ impl UtpManager {
 
         let manager = UtpManager {
             socket,
+            v6_socket,
             connections: HashMap::new(),
             incoming_tx,
             tick_interval: Duration::from_millis(1),
@@ -267,6 +278,32 @@ impl UtpManager {
         });
 
         Ok((handle, incoming_rx))
+    }
+
+    /// 发送目标地址转换：双栈 socket 上发往 IPv4 目标必须先转成
+    /// v4-mapped 形式（`::ffff:a.b.c.d`），否则 sendto 因地址族不匹配
+    /// 失败（EINVAL，"Invalid argument (os error 22)"）——IPv6 对端的 uTP
+    /// 拨号此前即因此必然失败，只能等握手超时后回退 TCP。
+    fn wire_dst(&self, to: SocketAddr) -> SocketAddr {
+        match (self.v6_socket, to) {
+            (true, SocketAddr::V4(v4)) => {
+                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+            }
+            _ => to,
+        }
+    }
+
+    /// 接收侧地址规范化：双栈 socket 上 IPv4 报文的源地址是 v4-mapped
+    /// 形式，统一还原为 IPv4——连接路由按「远端地址相等」匹配，出站拨号
+    /// 用的是 IPv4 字面量，不还原则 IPv4 对端的双向包对不上已有连接。
+    fn canonical_addr(addr: SocketAddr) -> SocketAddr {
+        match addr {
+            SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+                Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
+                None => addr,
+            },
+            v4 => v4,
+        }
     }
 
     /// 创建一个出站 uTP 连接（管理器内部方法）。
@@ -330,7 +367,8 @@ impl UtpManager {
             tokio::select! {
                 // 处理入站 UDP 数据报
                 Ok((len, src)) = self.socket.recv_from(&mut buf) => {
-                    self.handle_datagram(&buf[..len], src);
+                    // 双栈 socket 上 IPv4 报文源地址是 v4-mapped，先还原
+                    self.handle_datagram(&buf[..len], Self::canonical_addr(src));
                 }
                 // tick 驱动
                 _ = tick.tick() => {
@@ -512,8 +550,9 @@ impl UtpManager {
             // 从 outbox 取出包并发送
             let remote = ctx.conn.remote_addr();
             let outbox = ctx.conn.drain_outbox();
+            let dst = self.wire_dst(remote);
             for pkt in &outbox {
-                if let Err(e) = self.socket.try_send_to(pkt, remote) {
+                if let Err(e) = self.socket.try_send_to(pkt, dst) {
                     debug!(error = %e, "uTP 发送失败");
                 }
             }
@@ -602,6 +641,23 @@ impl UtpManager {
             }
         }
     }
+}
+
+/// 绑定地址解析：优先按 IP 字面量解析（`"[::]"` 剥离方括号），
+/// 失败才交给系统解析器（兼容传入主机名/`"localhost"` 的调用方）。
+///
+/// 必须先试字面量：`UdpSocket::bind(("[::]", port))` 会把 `"[::]"`
+/// 当域名解析，macOS 上直接报 "nodename nor servname provided"，
+/// 导致双栈绑定必然失败、只能退化成纯 IPv4。
+async fn resolve_bind_addr(host: &str, port: u16) -> io::Result<SocketAddr> {
+    let trimmed = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    tokio::net::lookup_host((host, port))
+        .await?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "监听地址无法解析"))
 }
 
 /// 管理器命令。
@@ -708,12 +764,73 @@ impl UtpManagerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[tokio::test]
     async fn utp_socket_bind() {
         let (handle, _rx) = UtpManager::bind("127.0.0.1", 0).await.unwrap();
         assert!(handle.local_addr().port() > 0);
         handle.shutdown().await;
+    }
+
+    /// 双栈监听：同一个 `[::]` socket 同时服务 IPv6 与 IPv4 对端。
+    ///
+    /// 回归场景——uTP 此前绑 `0.0.0.0`：IPv6-only 主机上 uTP 直接起不来；
+    /// 且双栈 socket 向 IPv6 对端发送因地址族不匹配报 EINVAL
+    /// （日志里的 "Invalid argument (os error 22)"），IPv6 对端只能白等
+    /// 握手超时后回退 TCP。
+    #[tokio::test]
+    async fn utp_dual_stack_serves_v6_and_v4() {
+        let (server_handle, mut incoming_rx) = UtpManager::bind("[::]", 0).await.unwrap();
+        let port = server_handle.local_addr().port();
+        assert!(server_handle.local_addr().is_ipv6());
+
+        // IPv6 对端（::1）
+        let (v6_client, _rx6) = UtpManager::bind("[::]", 0).await.unwrap();
+        let mut c6 = v6_client
+            .connect(SocketAddr::from((Ipv6Addr::LOCALHOST, port)))
+            .await
+            .expect("IPv6 拨号失败");
+        let mut s6 = tokio::time::timeout(Duration::from_secs(5), incoming_rx.recv())
+            .await
+            .expect("IPv6 入站超时")
+            .expect("入站通道关闭");
+        assert!(s6.remote_addr().is_ipv6());
+        c6.write_all(b"v6 hello").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(s6.read_data().await.expect("IPv6 读取失败"), b"v6 hello");
+
+        // IPv4 对端（127.0.0.1）：出站发送需转 v4-mapped，入站源地址需还原
+        let (v4_client, _rx4) = UtpManager::bind("[::]", 0).await.unwrap();
+        let mut c4 = v4_client
+            .connect(SocketAddr::from(([127, 0, 0, 1], port)))
+            .await
+            .expect("IPv4 拨号失败");
+        let mut s4 = tokio::time::timeout(Duration::from_secs(5), incoming_rx.recv())
+            .await
+            .expect("IPv4 入站超时")
+            .expect("入站通道关闭");
+        assert_eq!(
+            s4.remote_addr().ip(),
+            IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            "IPv4 入站源地址未被还原为 IPv4"
+        );
+        c4.write_all(b"v4 hello").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(s4.read_data().await.expect("IPv4 读取失败"), b"v4 hello");
+
+        server_handle.shutdown().await;
+        v6_client.shutdown().await;
+        v4_client.shutdown().await;
+    }
+
+    /// 绑定地址按 IP 字面量解析（`"[::]"` 不能落到 DNS 解析）。
+    #[tokio::test]
+    async fn resolve_bind_addr_parses_literal() {
+        let a = resolve_bind_addr("[::]", 6881).await.unwrap();
+        assert_eq!(a, SocketAddr::from((Ipv6Addr::UNSPECIFIED, 6881)));
+        let b = resolve_bind_addr("0.0.0.0", 6881).await.unwrap();
+        assert_eq!(b, SocketAddr::from((Ipv4Addr::UNSPECIFIED, 6881)));
     }
 
     #[tokio::test]

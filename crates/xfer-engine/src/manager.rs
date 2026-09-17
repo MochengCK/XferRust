@@ -2002,18 +2002,20 @@ impl TaskManager {
         // 客户端，后续新连接（含 tracker 订阅）即用新配置；进行中的连接
         // 不受影响（reqwest 连接池按需复用）。
         if client_changed {
-            let (ua, proxy) = {
+            let (ua, proxy, no_proxy) = {
                 let g = self.inner.lock().unwrap().global_options.clone();
                 (
                     g.get("user-agent").cloned(),
                     g.get("all-proxy").cloned(),
+                    g.get("no-proxy").cloned(),
                 )
             };
             *self.client.write().unwrap() = xfer_http::build_client_with(
                 ua.as_deref(),
                 proxy.as_deref(),
+                no_proxy.as_deref(),
             );
-            tracing::info!("HTTP 客户端已按 user-agent / all-proxy 重建");
+            tracing::info!("HTTP 客户端已按 user-agent / all-proxy / no-proxy 重建");
         }
         self.kick();
         self.save_session_now();

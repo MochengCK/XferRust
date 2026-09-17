@@ -13,7 +13,7 @@
 //! 消息洪泛检测、非活跃连接断开、Allowed Fast Set 计算。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1571,25 +1571,52 @@ impl TorrentEngine {
 
     /// 启动监听（端口 0 = 系统自动分配）。
     ///
-    /// 配置端口被其他任务/进程占用时回退系统分配端口，保证任务可用
-    /// （多任务共享同一配置端口时，仅首个任务能绑到该端口）。
+    /// TCP 优先双栈 `[::]`（同一 socket 兼顾 IPv6 与 IPv4-mapped），并按需
+    /// 补一个纯 IPv4 监听；配置端口被其他任务/进程占用时回退系统分配端口，
+    /// 保证任务可用（多任务共享同一配置端口时，仅首个任务能绑到该端口）。
     async fn spawn_listener(self: &Arc<Self>) -> Result<(), String> {
-        let listener = match TcpListener::bind(("0.0.0.0", self.config.listen_port)).await {
-            Ok(l) => l,
-            Err(e) if self.config.listen_port != 0 => {
-                tracing::warn!(
-                    port = self.config.listen_port,
-                    error = %e,
-                    "配置的 BT 监听端口被占用，回退系统分配端口"
-                );
-                TcpListener::bind(("0.0.0.0", 0))
-                    .await
-                    .map_err(|e2| format!("BT 监听端口绑定失败: {e2}"))?
-            }
-            Err(e) => return Err(format!("BT 监听端口绑定失败: {e}")),
-        };
-        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        let listeners = bind_bt_listeners(self.config.listen_port).await?;
+        let port = listeners
+            .first()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or(0);
         self.actual_listen_port.store(port, Ordering::Relaxed);
+        for listener in listeners {
+            self.spawn_accept_loop(listener);
+        }
+        tracing::info!(port, "BT 监听已启动");
+
+        // uTP 同端口监听（§7.6）。始终绑定，模式只决定是否接受/拨号，
+        // 以便运行时热切换协议；UDP 绑定失败则本引擎禁用 uTP。
+        // 优先双栈：纯 IPv4 的 uTP socket 在 IPv6 主机上无法启动，
+        // 且向 IPv6 对端发送必然 EINVAL。
+        let utp_bound = match UtpManager::bind("[::]", port).await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                tracing::debug!(error = %e, "uTP 双栈绑定失败，回退纯 IPv4");
+                UtpManager::bind("0.0.0.0", port).await
+            }
+        };
+        match utp_bound {
+            Ok((handle, incoming_rx)) => {
+                *self.utp.lock().unwrap() = Some(handle);
+                let engine = self.clone();
+                let shutdown = self.shutdown.clone();
+                tokio::spawn(async move {
+                    engine.utp_incoming_loop(incoming_rx, shutdown).await;
+                });
+                tracing::info!(port, "uTP 监听已启动");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "uTP 端口绑定失败，本引擎禁用 uTP");
+            }
+        }
+        Ok(())
+    }
+
+    /// 为一个已绑定的 TCP 监听 socket 启动 accept 循环。
+    fn spawn_accept_loop(self: &Arc<Self>, listener: TcpListener) {
         let engine = self.clone();
         let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
@@ -1601,6 +1628,11 @@ impl TorrentEngine {
                 };
                 match accepted {
                     Ok((stream, addr)) => {
+                        // 双栈监听的 IPv4 入站连接源地址是 v4-mapped 形式，
+                        // 统一还原为 IPv4——封禁名单、peer 登记与
+                        // tracker/DHT 提供的 IPv4 字面量必须是同一形态，
+                        // 否则同一对端会出现 v4 / v4-mapped 两条记录
+                        let addr = canonical_peer_addr(addr);
                         if engine.is_banned(&addr.ip()) {
                             tracing::debug!(peer = %addr, "拒绝来自封禁 IP 的入站连接");
                             continue;
@@ -1620,25 +1652,6 @@ impl TorrentEngine {
                 }
             }
         });
-        tracing::info!(port, "BT 监听已启动");
-
-        // uTP 同端口监听（§7.6）。始终绑定，模式只决定是否接受/拨号，
-        // 以便运行时热切换协议；UDP 绑定失败则本引擎禁用 uTP。
-        match UtpManager::bind("0.0.0.0", port).await {
-            Ok((handle, incoming_rx)) => {
-                *self.utp.lock().unwrap() = Some(handle);
-                let engine = self.clone();
-                let shutdown = self.shutdown.clone();
-                tokio::spawn(async move {
-                    engine.utp_incoming_loop(incoming_rx, shutdown).await;
-                });
-                tracing::info!(port, "uTP 监听已启动");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "uTP 端口绑定失败，本引擎禁用 uTP");
-            }
-        }
-        Ok(())
     }
 
     /// UPnP/NAT-PMP 端口映射：TCP+UDP 双映射、周期续期、停机时尽力撤销。
@@ -2474,6 +2487,10 @@ impl TorrentEngine {
         {
             let mut pending = self.pending.lock().unwrap();
             for a in addrs {
+                // v4-mapped（`::ffff:a.b.c.d`）统一还原为 IPv4：部分 tracker /
+                // PEX 实现用映射形式传 IPv4 地址，不还原就会与 v4 字面量形成
+                // 两条对端记录，并且在无 IPv6 路由的环境里拨号必然失败。
+                let a = canonical_peer_addr(a);
                 // 过滤不可路由地址与 0 端口（部分 tracker 会返回，永远连不通）。
                 // 回环地址保留：本机可能有 seed（本地测试/同机部署），
                 // 自连回声由下面的监听端口检查兜底。
@@ -6088,6 +6105,77 @@ impl PeerCtx {
     }
 }
 
+/// 绑定 BT TCP 监听 socket（返回 1~2 个：双栈 + 按需的纯 IPv4）。
+///
+/// - 先绑 `[::]`：macOS / Linux 默认 `IPV6_V6ONLY=0`，一个双栈 socket
+///   同时收 IPv6 与 IPv4-mapped 连接；
+/// - 再试 `0.0.0.0` 同端口：`IPV6_V6ONLY=1` 的系统（如 Windows 默认）下
+///   `[::]` 不收 IPv4 报文，缺这个监听就丢掉全部 IPv4 入站；双栈已覆盖
+///   IPv4 时该绑定返回 EADDRINUSE，属预期（只记 debug）；
+/// - 无 IPv6 的机器上 `[::]` 绑定失败，只剩纯 IPv4 监听（与旧行为一致）；
+/// - 请求端口被占用时用系统分配端口重试一次，保证任务仍可启动。
+///
+/// 用 `SocketAddr` 而不是 `("[::]", port)` 元组绑定：元组的 host 会先按
+/// IPv4/IPv6 字面量解析，`"[::]"` 带方括号解析失败后落入 DNS 解析，
+/// macOS 上直接报 "nodename nor servname provided"。
+async fn bind_bt_listeners(port: u16) -> Result<Vec<TcpListener>, String> {
+    let mut last_err = String::new();
+    let mut candidates = vec![port];
+    if port != 0 {
+        candidates.push(0);
+    }
+    for candidate in candidates {
+        let mut bound: Vec<TcpListener> = Vec::new();
+        let v6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), candidate);
+        match TcpListener::bind(v6).await {
+            Ok(l) => bound.push(l),
+            Err(e) => {
+                tracing::debug!(addr = %v6, error = %e, "BT 监听 IPv6 绑定失败");
+                last_err = e.to_string();
+            }
+        }
+        // 纯 IPv4 监听与已绑定的双栈 socket 同端口（端口 0 时取实际分配值）
+        let v4_port = bound
+            .first()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port())
+            .unwrap_or(candidate);
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), v4_port);
+        match TcpListener::bind(v4).await {
+            Ok(l) => bound.push(l),
+            Err(e) => {
+                tracing::debug!(addr = %v4, error = %e, "BT 监听 IPv4 绑定跳过（多为双栈已覆盖）");
+                if bound.is_empty() {
+                    last_err = e.to_string();
+                }
+            }
+        }
+        if !bound.is_empty() {
+            if candidate != port {
+                tracing::warn!(
+                    port,
+                    error = %last_err,
+                    "配置的 BT 监听端口不可用，回退系统分配端口"
+                );
+            }
+            return Ok(bound);
+        }
+    }
+    Err(format!("BT 监听端口绑定失败: {last_err}"))
+}
+
+/// 入站连接源地址规范化：双栈监听/收发路径上的 IPv4 对端是 v4-mapped
+/// 形式（`::ffff:a.b.c.d`），统一还原为 IPv4。
+fn canonical_peer_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
+            None => addr,
+        },
+        v4 => v4,
+    }
+}
+
 /// 解析 UDP tracker URL（`udp://host:port[/path]` → SocketAddr）。
 ///
 /// 真实种子的 udp:// URL 几乎都带路径后缀（如
@@ -7121,5 +7209,65 @@ mod tests {
         drop(dyn_list);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 监听绑定：双栈可用时同时收 IPv6 与 IPv4（回环实测），
+    /// 各监听共用同一端口（tracker announce 上报的端口必须一致）。
+    #[tokio::test]
+    async fn bt_listeners_bind_dual_stack_same_port() {
+        let listeners = bind_bt_listeners(0).await.unwrap();
+        assert!(!listeners.is_empty());
+        let port = listeners[0].local_addr().unwrap().port();
+        assert!(port > 0);
+        for l in &listeners {
+            assert_eq!(l.local_addr().unwrap().port(), port, "多个监听端口不一致");
+        }
+        // IPv4 回环必通（双栈 socket 或纯 IPv4 监听至少有一个覆盖）
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok(),
+            "IPv4 回环连接失败：监听未覆盖 IPv4"
+        );
+        // IPv6 回环：机器有 IPv6 栈时必须通
+        if listeners.iter().any(|l| l.local_addr().unwrap().is_ipv6()) {
+            assert!(
+                tokio::net::TcpStream::connect(("::1", port)).await.is_ok(),
+                "IPv6 回环连接失败：监听未覆盖 IPv6"
+            );
+        }
+    }
+
+    /// 配置端口被占用（双栈均占）时回退系统分配端口，仍能启动。
+    #[tokio::test]
+    async fn bt_listeners_fallback_when_port_occupied() {
+        let l6 = tokio::net::TcpListener::bind((Ipv6Addr::UNSPECIFIED, 0))
+            .await
+            .unwrap();
+        let busy = l6.local_addr().unwrap().port();
+        // 补一个纯 IPv4 占用：双栈系统上会 EADDRINUSE（无需断言），
+        // v6only=1 的系统上补上后该端口两个族都被占
+        let _l4 = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, busy)).await;
+
+        let listeners = bind_bt_listeners(busy).await.unwrap();
+        assert!(!listeners.is_empty());
+        assert_ne!(
+            listeners[0].local_addr().unwrap().port(),
+            busy,
+            "端口被占用时应回退系统分配端口"
+        );
+    }
+
+    /// v4-mapped 源地址统一还原为 IPv4（双栈监听/收发路径的公共形态）。
+    #[test]
+    fn canonical_peer_addr_unwraps_v4_mapped() {
+        let mapped: SocketAddr = "[::ffff:203.0.113.7]:6881".parse().unwrap();
+        assert_eq!(
+            canonical_peer_addr(mapped),
+            "203.0.113.7:6881".parse::<SocketAddr>().unwrap()
+        );
+        // 纯 IPv6 与 IPv4 原样返回
+        let v6: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
+        assert_eq!(canonical_peer_addr(v6), v6);
+        let v4: SocketAddr = "203.0.113.7:6881".parse().unwrap();
+        assert_eq!(canonical_peer_addr(v4), v4);
     }
 }
