@@ -12,16 +12,17 @@
 //! - 未找到 peer 时按 5s/30s/2min 三档重试。
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sha1::{Digest, Sha1};
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{oneshot, Mutex, RwLock, Semaphore};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
+use xfer_bencode::Value;
 use xfer_types::InfoHash;
 
 use crate::krpc::{
@@ -82,6 +83,9 @@ const MAX_KNOWN_INFOHASHES: usize = 4096;
 const MAX_PEERS_PER_INFOHASH: usize = 100;
 /// 接收处理任务并发上限。
 const RECV_CONCURRENCY: usize = 256;
+/// KRPC 查询超时。响应通常几十毫秒到达，3s 无响应即视为对端不可达
+/// （原值 10s 会让不可达节点大幅拖慢 bootstrap / get_peers 迭代）。
+const KRPC_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// DHT 节点。
 pub struct Dht {
@@ -100,11 +104,21 @@ pub struct Dht {
     /// 洪水攻击可瞬时堆出十万级任务；满载时直接丢包——UDP 无序可靠
     /// 语义，KRPC 查询自带 tid 重试）。
     recv_permits: Arc<Semaphore>,
+    /// 待响应查询表：事务 id → 响应送达通道。
+    ///
+    /// 单一 socket 只有一个常驻接收者（`recv_loop`），查询方不能自行
+    /// `recv_from`（两边竞争会把响应包抢走）。因此查询发出前在此登记，
+    /// `recv_loop` 收到响应后按 tid 投递；没有这张表时响应包会经
+    /// `parse_query` 解析失败被静默丢弃，所有查询必然超时。
+    pending: Mutex<HashMap<[u8; 2], oneshot::Sender<Vec<u8>>>>,
     /// 路由表持久化文件。
     routing_table_file: Option<PathBuf>,
     /// 是否启用 IPv6（BEP 32）：决定 bootstrap 是否含 v6 节点、响应是否
     /// 附 nodes6。socket 已由绑定地址决定双栈能力。
     enable_ipv6: bool,
+    /// socket 是否为 IPv6（双栈绑定）。发往 IPv4 目标前必须转成
+    /// v4-mapped 地址，否则 libc::sendto 因地址族不匹配直接失败。
+    v6_socket: bool,
     /// 取消令牌。
     cancel: CancellationToken,
 }
@@ -118,7 +132,8 @@ impl Dht {
         let node_id = config.node_id.unwrap_or_else(NodeId::random);
         let default_host = if config.enable_ipv6 { "[::]" } else { "0.0.0.0" };
         let bind_host = config.bind_addr.as_deref().unwrap_or(default_host);
-        let socket = UdpSocket::bind((bind_host, config.listen_port))
+        let bind_addr = resolve_bind_addr(bind_host, config.listen_port).await?;
+        let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| format!("DHT UDP 绑定失败（{bind_host}）: {e}"))?;
         // 确保使用回环地址用于本地测试（避免 macOS No route to host）
@@ -145,10 +160,41 @@ impl Dht {
             known_peers: Arc::new(Mutex::new(HashMap::new())),
             known_order: Arc::new(Mutex::new(VecDeque::new())),
             recv_permits: Arc::new(Semaphore::new(RECV_CONCURRENCY)),
+            pending: Mutex::new(HashMap::new()),
             routing_table_file: config.routing_table_file,
             enable_ipv6: config.enable_ipv6,
+            v6_socket: local_addr.is_ipv6(),
             cancel: CancellationToken::new(),
         }))
+    }
+
+    /// 发送目标地址转换：双栈（IPv6）socket 上发往 IPv4 目标必须先转成
+    /// v4-mapped 形式（`::ffff:a.b.c.d`），否则 sendto 因地址族不匹配失败。
+    fn wire_dst(&self, to: SocketAddr) -> SocketAddr {
+        match (self.v6_socket, to) {
+            (true, SocketAddr::V4(v4)) => {
+                SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+            }
+            _ => to,
+        }
+    }
+
+    /// 接收侧地址规范化：双栈 socket 上 IPv4 报文的源地址是 v4-mapped
+    /// 形式，统一还原成 IPv4——路由表、known_peers、以及最终交给 BT
+    /// 引擎去连接的 peer 地址都应是 v4。
+    fn canonical_addr(addr: SocketAddr) -> SocketAddr {
+        match addr {
+            SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+                Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
+                None => addr,
+            },
+            v4 => v4,
+        }
+    }
+
+    /// 发送 KRPC 报文（内部完成地址族转换）。
+    async fn send_wire(&self, data: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        self.socket.send_to(data, self.wire_dst(to)).await
     }
 
     /// 是否启用 IPv6（BEP 32）。
@@ -207,7 +253,19 @@ impl Dht {
                             continue;
                         }
                     };
+                    // 双栈 socket 上 IPv4 报文源地址是 v4-mapped，统一还原
+                    let addr = Self::canonical_addr(addr);
                     let data = buf[..n].to_vec();
+                    // 响应包（y=r/e）按 tid 投递给等待中的查询。
+                    // recv_loop 是 socket 的唯一接收者，查询方不能自行
+                    // recv_from；若在这里落到 handle_incoming，会因
+                    // parse_query 只认查询而静默丢弃 → 查询方必然超时。
+                    if let Some(tid) = response_tid(&data) {
+                        if let Some(tx) = self.pending.lock().await.remove(&tid) {
+                            let _ = tx.send(data);
+                            continue;
+                        }
+                    }
                     let dht = self.clone();
                     // 并发上限——洪水攻击下不无限制 spawn；满载直接丢包
                     //（UDP 无可靠语义，KRPC 查询自带 tid 重试机制）
@@ -240,8 +298,7 @@ impl Dht {
                 self.add_node(NodeEntry { id, addr: from }).await;
                 // 回复我们的 ID
                 let resp = encode_response(&tid, &self.our_id, &[], None);
-                self.socket
-                    .send_to(&resp, from)
+                self.send_wire(&resp, from)
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -252,7 +309,7 @@ impl Dht {
                 let token = self.make_token(&id);
                 let resp = self.encode_nodes_response(&tid, &closest, from, Some(&token));
                 drop(table);
-                let _ = self.socket.send_to(&resp, from).await;
+                let _ = self.send_wire(&resp, from).await;
             }
             IncomingQuery::GetPeers { tid, id, info_hash } => {
                 self.add_node(NodeEntry { id, addr: from }).await;
@@ -273,7 +330,7 @@ impl Dht {
                         &peer_addrs,
                         &token,
                     );
-                    let _ = self.socket.send_to(&resp, from).await;
+                    let _ = self.send_wire(&resp, from).await;
                 } else {
                     // 没有已知 peer → 返回最近的 K 个节点
                     let table = self.table.read().await;
@@ -281,7 +338,7 @@ impl Dht {
                     let closest = table.closest(&target_node, K);
                     let resp = self.encode_nodes_response(&tid, &closest, from, Some(&token));
                     drop(table);
-                    let _ = self.socket.send_to(&resp, from).await;
+                    let _ = self.send_wire(&resp, from).await;
                 }
             }
             IncomingQuery::AnnouncePeer {
@@ -296,7 +353,7 @@ impl Dht {
                 let expected = self.make_token(&id);
                 if token != expected {
                     let err = crate::krpc::encode_error(&tid, 203, "Invalid token");
-                    let _ = self.socket.send_to(&err, from).await;
+                    let _ = self.send_wire(&err, from).await;
                     return Ok(());
                 }
                 // 确定宣告的端口
@@ -310,7 +367,7 @@ impl Dht {
                 self.add_known_peer(info_hash, announce_addr).await;
                 // 回复确认
                 let resp = encode_response(&tid, &self.our_id, &[], None);
-                let _ = self.socket.send_to(&resp, from).await;
+                let _ = self.send_wire(&resp, from).await;
             }
         }
         Ok(())
@@ -419,17 +476,23 @@ impl Dht {
             "DHT bootstrap 节点已解析"
         );
 
-        // 向每个 bootstrap 节点发送 find_node（查自身 ID）
+        // 向每个 bootstrap 节点并发发送 find_node（查自身 ID）——
+        // 串行时不可达节点各耗一个超时，冷启动会被拖到几十秒
         let target = self.our_id;
         let mut discovered: Vec<NodeEntry> = Vec::new();
+        let mut set = tokio::task::JoinSet::new();
         for addr in &bootstrap_addrs {
-            match self.find_node_query(*addr, target).await {
-                Ok(nodes) => {
-                    discovered.extend(nodes);
+            let dht = self.clone();
+            let addr = *addr;
+            set.spawn(async move { (addr, dht.find_node_query(addr, target).await) });
+        }
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((_, Ok(nodes))) => discovered.extend(nodes),
+                Ok((addr, Err(e))) => {
+                    tracing::debug!(addr = %addr, error = %e, "bootstrap find_node 失败")
                 }
-                Err(e) => {
-                    tracing::debug!(addr = %addr, error = %e, "bootstrap find_node 失败");
-                }
+                Err(e) => tracing::debug!(error = %e, "bootstrap find_node 任务失败"),
             }
         }
 
@@ -441,18 +504,26 @@ impl Dht {
             }
         }
 
-        // 向新发现的节点继续 find_node（一轮迭代）
+        // 向新发现的节点继续 find_node（一轮迭代，并发）
         let to_query: Vec<NodeEntry> = discovered.into_iter().take(K).collect();
-        let mut further: Vec<NodeEntry> = Vec::new();
+        let mut set = tokio::task::JoinSet::new();
         for n in &to_query {
-            if let Ok(nodes) = self.find_node_query(n.addr, target).await {
-                {
+            let dht = self.clone();
+            let addr = n.addr;
+            set.spawn(async move { (addr, dht.find_node_query(addr, target).await) });
+        }
+        while let Some(res) = set.join_next().await {
+            match res {
+                Ok((_, Ok(nodes))) => {
                     let mut table = self.table.write().await;
-                    for n2 in &nodes {
-                        table.add(n2.clone());
+                    for n in &nodes {
+                        table.add(n.clone());
                     }
                 }
-                further.extend(nodes);
+                Ok((addr, Err(e))) => {
+                    tracing::debug!(addr = %addr, error = %e, "bootstrap 迭代 find_node 失败")
+                }
+                Err(e) => tracing::debug!(error = %e, "bootstrap 迭代任务失败"),
             }
         }
 
@@ -670,47 +741,29 @@ impl Dht {
     }
 
     /// 底层发送-接收原语：发送 wire 到 addr，等待匹配 tid 的响应。
-    /// 超时 10s（§7.7 UDP tracker 的 10s 超时对 KRPC 也适用）。
+    ///
+    /// 响应由 `recv_loop` 接收后经 `pending` 表按 tid 分发，本函数只
+    /// 等待自己的 oneshot 通道（超时 3s）。发送失败/超时都会摘除登记项，
+    /// 避免 pending 表泄漏。
     async fn send_raw(
         &self,
         tid: &[u8; 2],
         wire: &[u8],
         addr: SocketAddr,
     ) -> Result<Vec<u8>, KrpcError> {
-        self.socket
-            .send_to(wire, addr)
-            .await
-            .map_err(|e| KrpcError::Network(e.to_string()))?;
-
-        let mut buf = vec![0u8; 4096];
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(KrpcError::Timeout);
-            }
-            match timeout(remaining, self.socket.recv_from(&mut buf)).await {
-                Ok(Ok((n, _))) => {
-                    // 尝试匹配事务 id（简化：只看是否匹配 tid）
-                    if n >= 4 {
-                        if let Ok(v) = xfer_bencode::decode(&buf[..n]) {
-                            if let Some(d) = v.as_dict() {
-                                if let Some(t) = d
-                                    .get(b"t".as_slice())
-                                    .and_then(xfer_bencode::Value::as_bytes)
-                                {
-                                    if t == tid {
-                                        return Ok(buf[..n].to_vec());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // 不匹配 → 继续等待（可能是其他节点的响应）
-                    continue;
-                }
-                Ok(Err(e)) => return Err(KrpcError::Network(e.to_string())),
-                Err(_) => return Err(KrpcError::Timeout),
+        let (tx, rx) = oneshot::channel();
+        // 先登记再发送——响应可能极快到达，晚登记会丢包
+        self.pending.lock().await.insert(*tid, tx);
+        if let Err(e) = self.send_wire(wire, addr).await {
+            self.pending.lock().await.remove(tid);
+            return Err(KrpcError::Network(e.to_string()));
+        }
+        match timeout(KRPC_QUERY_TIMEOUT, rx).await {
+            Ok(Ok(data)) => Ok(data),
+            Ok(Err(_)) => Err(KrpcError::Timeout),
+            Err(_) => {
+                self.pending.lock().await.remove(tid);
+                Err(KrpcError::Timeout)
             }
         }
     }
@@ -743,6 +796,24 @@ impl Dht {
 // ----------------------------------------------------------------------
 // 辅助函数
 // ----------------------------------------------------------------------
+
+/// 若数据包是 KRPC 响应（`y` 为 `r`/`e`）且含 2 字节事务 id，返回其 tid。
+///
+/// 响应不能交给 `handle_incoming`（只识别 `y=q` 查询，其余静默丢弃），
+/// 必须由 `recv_loop` 借此函数识别后投递给对应的等待者。
+fn response_tid(data: &[u8]) -> Option<[u8; 2]> {
+    let v = xfer_bencode::decode(data).ok()?;
+    let d = v.as_dict()?;
+    match d.get(b"y".as_slice()).and_then(Value::as_str) {
+        Some("r") | Some("e") => {}
+        _ => return None,
+    }
+    let t = d.get(b"t".as_slice()).and_then(Value::as_bytes)?;
+    if t.len() != 2 {
+        return None;
+    }
+    Some([t[0], t[1]])
+}
 
 /// 解析 bootstrap 节点地址（DNS → SocketAddr）。
 ///
@@ -782,6 +853,24 @@ async fn resolve_bootstrap(enable_ipv6: bool) -> Vec<SocketAddr> {
         addrs.push("67.215.218.13:6881".parse().unwrap()); // dht.libtorrent.org 常用 IP
     }
     addrs
+}
+
+/// 解析绑定地址：优先按 IP 字面量（允许 "[::]" 这种带方括号写法），
+/// 失败再走 DNS。
+///
+/// `UdpSocket::bind(("[::]", port))` 会把 "[::]" 原样交给 DNS 解析器，
+/// macOS 报 `nodename nor servname provided` → IPv6 双栈绑定必然失败，
+/// BEP 32（DHT over IPv6）整条链路不可用，只能回退纯 IPv4。
+async fn resolve_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("DHT 绑定地址解析失败（{host}）: {e}"))?
+        .next()
+        .ok_or_else(|| format!("DHT 绑定地址无解析结果（{host}）"))
 }
 
 /// 从文件加载路由表。
@@ -862,6 +951,8 @@ mod tests {
         })
         .await
         .unwrap();
+        // 查询依赖 recv_loop 分发响应，测试须显式启动
+        dht.spawn_background();
 
         // find_node 查询
         let target = NodeId::random();
@@ -891,6 +982,7 @@ mod tests {
         })
         .await
         .unwrap();
+        dht.spawn_background();
 
         let ih = InfoHash::from_bytes(&[0x42; 20]);
         let resp = dht.get_peers_query(mock_addr, ih).await.unwrap();
@@ -920,6 +1012,7 @@ mod tests {
         })
         .await
         .unwrap();
+        dht.spawn_background();
 
         // 预填路由表
         {
@@ -1109,6 +1202,7 @@ mod tests {
         })
         .await
         .unwrap();
+        dht.spawn_background();
         assert!(dht.local_addr().unwrap().is_ipv6());
         assert!(dht.enable_ipv6());
 

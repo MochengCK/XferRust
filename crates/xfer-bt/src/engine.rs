@@ -39,7 +39,7 @@ use crate::message::{
 };
 use crate::mse::EncryptedStream;
 use crate::scheduler::{PeerSample, PeerScheduler, PeerSchedulerConfig, ScheduleAction};
-use crate::tracker::{announce, AnnounceRequest, AnnounceResponse};
+use crate::tracker::{announce, announce_via_ipv6, AnnounceRequest, AnnounceResponse};
 
 /// 统一 peer 流：明文 TCP 或 MSE 加密流。
 /// EncryptedStream 已实现 AsyncRead + AsyncWrite，可直接传递给 PeerReader。
@@ -2138,10 +2138,30 @@ impl TorrentEngine {
                     event: event_owned.as_deref(),
                     numwant,
                 };
-                match announce(&client, &url, &req).await {
-                    Ok(r) => Ok((url, r)),
-                    Err(e) => Err((url, e)),
+                // 同一 tracker 同时经 IPv4（默认解析顺序）与 IPv6 各 announce
+                // 一次并合并 peer：tracker 只把 IPv6 peer 回给 IPv6 来源
+                // （BEP 7），缺 IPv6 这路会丢掉全部公网 IPv6 seeder——它们
+                // 正是热门种子的主要高速来源。
+                let (r4, r6) = tokio::join!(
+                    announce(&client, &url, &req),
+                    announce_via_ipv6(&url, &req),
+                );
+                let (mut resp, extra6) = match (r4, r6) {
+                    (Ok(r), r6) => (r, r6.ok()),
+                    (Err(e), Ok(r6)) => {
+                        tracing::debug!(url = %url, error = %e, "IPv4 announce 失败，使用 IPv6 结果");
+                        (r6, None)
+                    }
+                    (Err(e), Err(_)) => return Err((url, e)),
+                };
+                if let Some(r6) = extra6 {
+                    for p in r6.peers {
+                        if !resp.peers.contains(&p) {
+                            resp.peers.push(p);
+                        }
+                    }
                 }
+                Ok((url, resp))
             });
         }
 

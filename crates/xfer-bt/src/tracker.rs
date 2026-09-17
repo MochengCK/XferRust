@@ -1,6 +1,7 @@
 //! HTTP tracker announce（BEP 3）：请求构造与响应解析（compact/非 compact）。
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use xfer_bencode::{decode, Value};
 use xfer_types::{InfoHash, PeerId};
@@ -126,20 +127,30 @@ fn parse_response(body: &[u8]) -> Result<AnnounceResponse, String> {
                 let Some(pd) = it.as_dict() else {
                     continue;
                 };
-                let ip = pd
-                    .get(b"ip".as_slice())
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "非 compact peers 条目缺少 ip".to_string())?;
-                let port = pd
-                    .get(b"port".as_slice())
-                    .and_then(Value::as_int)
-                    .ok_or_else(|| "非 compact peers 条目缺少 port".to_string())?;
-                if let Ok(addr) = format!("{ip}:{port}").parse::<SocketAddr>() {
-                    out.peers.push(addr);
+                let Some(ip) = pd.get(b"ip".as_slice()).and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(port) = pd.get(b"port".as_slice()).and_then(Value::as_int) else {
+                    continue;
+                };
+                if !(0..=65535).contains(&port) {
+                    continue;
+                }
+                // 非 compact 的 ip 是裸字面量（IPv6 不带方括号）。拼成
+                // "ip:port" 再 parse 对 IPv6 必然失败——"2a02:2479:44:8f00::1:6965"
+                // 会被当成合法的 8 组 IPv6 地址（端口被吞进地址），于是整条
+                // IPv6 peer 被静默丢弃。Ubuntu tracker 对 IPv6 源返回的正是
+                // 非 compact 字典列表，丢弃它等于丢掉全部公网 IPv6 seeder。
+                if let Ok(ip) = ip.parse::<IpAddr>() {
+                    out.peers.push(SocketAddr::new(ip, port as u16));
                 }
             }
         }
         _ => {} // 无 peers 字段
+    }
+    // BEP 32：部分 tracker 用独立字段 peers6（18 字节/条 compact）返回 IPv6 peer
+    if let Some(Value::Bytes(b)) = d.get(b"peers6".as_slice()) {
+        out.peers.extend(parse_compact6(b));
     }
     Ok(out)
 }
@@ -163,6 +174,67 @@ fn parse_compact(b: &[u8]) -> Result<Vec<SocketAddr>, String> {
         out.push(SocketAddr::from((ip, port)));
     }
     Ok(out)
+}
+
+/// peers6（BEP 32 compact）：每 18 字节 = 16 字节 IPv6 + 2 字节端口（BE）。
+fn parse_compact6(b: &[u8]) -> Vec<SocketAddr> {
+    if b.len() % 18 != 0 {
+        tracing::warn!(
+            len = b.len(),
+            usable = b.len() / 18 * 18,
+            "compact peers6 长度非 18 的倍数，截断尾部"
+        );
+    }
+    let mut out = Vec::with_capacity(b.len() / 18);
+    for c in b.chunks_exact(18) {
+        let mut ip = [0u8; 16];
+        ip.copy_from_slice(&c[..16]);
+        let port = u16::from_be_bytes([c[16], c[17]]);
+        if port != 0 {
+            out.push(SocketAddr::from((Ipv6Addr::from(ip), port)));
+        }
+    }
+    out
+}
+
+/// 强制经 IPv6 追加一次 announce（BEP 7/32）。
+///
+/// tracker 域名通常同时有 A/AAAA 记录，而系统解析顺序是 IPv4 优先，
+/// 默认 HTTP 客户端必然经 IPv4 访问；tracker 只把 IPv6 peer 返回给
+/// IPv6 来源（BEP 7），于是 IPv6 seeder 一个都拿不到。这里用 `resolve`
+/// 把域名钉到该主机的 IPv6 地址上再 announce 一次，与 IPv4 结果合并。
+pub async fn announce_via_ipv6(
+    url: &str,
+    req: &AnnounceRequest<'_>,
+) -> Result<AnnounceResponse, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("tracker URL 非法: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "tracker URL 缺少主机名".to_string())?
+        .to_string();
+    if host.parse::<IpAddr>().is_ok() {
+        // IP 直连：announce 已在该地址族上，无需附加
+        return Err("tracker 使用 IP 直连，跳过 IPv6 附加 announce".into());
+    }
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "tracker URL 缺少端口".to_string())?;
+    let addrs = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| format!("tracker 域名解析失败: {e}"))?;
+    let v6 = addrs
+        .filter(|a| a.is_ipv6())
+        .next()
+        .ok_or_else(|| "tracker 无 IPv6 地址".to_string())?;
+    let ua = format!("XferRust/{}", xfer_types::ENGINE_VERSION);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent(ua)
+        .resolve(&host, v6)
+        .build()
+        .map_err(|e| format!("IPv6 HTTP 客户端构建失败: {e}"))?;
+    announce(&client, url, req).await
 }
 
 /// 百分号编码（tracker 查询参数要求）。
@@ -230,6 +302,60 @@ mod tests {
         assert_eq!(r.interval, 60);
         assert_eq!(r.complete, Some(3));
         assert_eq!(r.peers, vec!["127.0.0.1:6881".parse().unwrap()]);
+    }
+
+    #[test]
+    fn non_compact_ipv6_peers_parsed() {
+        // Ubuntu tracker 对 IPv6 源返回的形态：非 compact 字典列表，ip 为裸
+        // IPv6 字面量（无方括号），必须能解析出 IPv6 peer（含端口）
+        use std::collections::BTreeMap;
+        use xfer_bencode::{bytes, dict, encode, int, list};
+        let entry = |ip: &str, port: i64| {
+            dict(BTreeMap::from([
+                (b"ip".to_vec(), bytes(ip.to_string())),
+                (b"port".to_vec(), int(port)),
+                (b"peer id".to_vec(), bytes("-lt0D80-012345678901")),
+            ]))
+        };
+        let v = dict(BTreeMap::from([
+            (b"interval".to_vec(), int(1800)),
+            (
+                b"peers".to_vec(),
+                list(vec![
+                    entry("185.125.190.59", 6893),
+                    entry("2001:41d0:700:2413::1", 6769),
+                    entry("not-an-ip", 1234),
+                ]),
+            ),
+        ]));
+        let r = parse_response(&encode(&v)).unwrap();
+        assert_eq!(
+            r.peers,
+            vec![
+                "185.125.190.59:6893".parse().unwrap(),
+                "[2001:41d0:700:2413::1]:6769".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn peers6_compact_parsed() {
+        use std::collections::BTreeMap;
+        use xfer_bencode::{bytes, dict, encode, int};
+        let mut compact = Vec::new();
+        compact.extend_from_slice(&"2001:41d0:700:2413::1".parse::<Ipv6Addr>().unwrap().octets());
+        compact.extend_from_slice(&6769u16.to_be_bytes());
+        let v = dict(BTreeMap::from([
+            (b"interval".to_vec(), int(1800)),
+            (b"peers6".to_vec(), bytes(compact.clone())),
+        ]));
+        let r = parse_response(&encode(&v)).unwrap();
+        assert_eq!(r.peers, vec!["[2001:41d0:700:2413::1]:6769".parse().unwrap()]);
+        // 端口 0 与长度非 18 倍数的尾部都应被丢弃
+        assert!(parse_compact6(&[0u8; 18]).is_empty());
+        let mut ragged = compact.clone();
+        ragged.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(parse_compact6(&ragged).len(), 1);
     }
 
     #[test]
