@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -104,13 +104,20 @@ pub struct Dht {
     /// 洪水攻击可瞬时堆出十万级任务；满载时直接丢包——UDP 无序可靠
     /// 语义，KRPC 查询自带 tid 重试）。
     recv_permits: Arc<Semaphore>,
-    /// 待响应查询表：事务 id → 响应送达通道。
+    /// 待响应查询表：(来源地址, 事务 id) → 响应送达通道。
     ///
     /// 单一 socket 只有一个常驻接收者（`recv_loop`），查询方不能自行
     /// `recv_from`（两边竞争会把响应包抢走）。因此查询发出前在此登记，
     /// `recv_loop` 收到响应后按 tid 投递；没有这张表时响应包会经
     /// `parse_query` 解析失败被静默丢弃，所有查询必然超时。
-    pending: Mutex<HashMap<[u8; 2], oneshot::Sender<Vec<u8>>>>,
+    ///
+    /// 键必须含来源地址而不能只有 tid：tid 仅 16 位，一轮并发查询
+    /// （bootstrap + 迭代 find_node 可达数百个）用生日界近似就有可观
+    /// 概率撞号，仅按 tid 投递会让响应被交给另一个节点的等待者；
+    /// 更糟的是任意主机只要猜中 tid 就能把伪造的响应注入本地查询
+    /// （DHT 里 peers 直接进 BT 连接队列）。加上来源地址后，响应只有
+    /// 来自被查询的那个地址才会被采纳。
+    pending: Mutex<HashMap<(SocketAddr, [u8; 2]), oneshot::Sender<Vec<u8>>>>,
     /// 路由表持久化文件。
     routing_table_file: Option<PathBuf>,
     /// 是否启用 IPv6（BEP 32）：决定 bootstrap 是否含 v6 节点、响应是否
@@ -227,7 +234,7 @@ impl Dht {
                 let mut iv = tokio::time::interval(Duration::from_secs(300));
                 loop {
                     iv.tick().await;
-                    dht.save_routing_table();
+                    dht.save_routing_table_async().await;
                 }
             });
         }
@@ -256,15 +263,19 @@ impl Dht {
                     // 双栈 socket 上 IPv4 报文源地址是 v4-mapped，统一还原
                     let addr = Self::canonical_addr(addr);
                     let data = buf[..n].to_vec();
-                    // 响应包（y=r/e）按 tid 投递给等待中的查询。
+                    // 响应包（y=r/e）按 (来源地址, tid) 投递给等待中的查询。
                     // recv_loop 是 socket 的唯一接收者，查询方不能自行
                     // recv_from；若在这里落到 handle_incoming，会因
                     // parse_query 只认查询而静默丢弃 → 查询方必然超时。
                     if let Some(tid) = response_tid(&data) {
-                        if let Some(tx) = self.pending.lock().await.remove(&tid) {
+                        if let Some(tx) = self.pending.lock().await.remove(&(addr, tid)) {
                             let _ = tx.send(data);
                             continue;
                         }
+                        // 是响应但没有等待者：要么来自非被查询地址（伪造/
+                        // 过期），要么等待者已超时摘除。响应不可能是查询，
+                        // 不必再走 handle_incoming（只会解析失败空转）。
+                        continue;
                     }
                     let dht = self.clone();
                     // 并发上限——洪水攻击下不无限制 spawn；满载直接丢包
@@ -654,7 +665,12 @@ impl Dht {
                 Err(_) => continue,
             };
             let tid = gen_tid();
-            let wire = encode_announce_peer(&tid, &self.our_id, &info_hash, port, &token, true);
+            // implied_port 必须为 false：BEP 5 规定该位为 1 时对端**忽略
+            // port 参数**、改用 UDP 包的源端口。本端 announce 走的是 DHT
+            // socket（端口与 BT 监听端口通常不同），置 1 会让对端把 DHT
+            // 端口当作我们的 BT 端口记下——别人从 DHT 拿到的地址上根本
+            // 没人监听，等于宣告了一个死地址。
+            let wire = encode_announce_peer(&tid, &self.our_id, &info_hash, port, &token, false);
             // 用 send_raw 确保 tid 匹配（与 recv_loop 共享 socket，
             // 响应可能被 recv_loop 消费；发送成功即视为宣告送达）
             match self.send_raw(&tid, &wire, n.addr).await {
@@ -667,8 +683,12 @@ impl Dht {
             }
         }
         tracing::info!(info_hash = %info_hash, port, announced = success, "DHT announce_peer 完成");
-        // 同时记入本端已知 peer
-        self.add_known_peer(info_hash, self.local_addr()?).await;
+        // 同时记入本端已知 peer——端口必须用上面宣告的 BT 监听端口，
+        // 不能用 DHT socket 的端口：其他节点向我们查 get_peers 时会拿到
+        // 这条记录，端口写错等于把死地址散播出去。
+        let local = self.local_addr()?;
+        self.add_known_peer(info_hash, SocketAddr::new(local.ip(), port))
+            .await;
         Ok(())
     }
 
@@ -740,9 +760,9 @@ impl Dht {
         Ok(resp)
     }
 
-    /// 底层发送-接收原语：发送 wire 到 addr，等待匹配 tid 的响应。
+    /// 底层发送-接收原语：发送 wire 到 addr，等待匹配 (addr, tid) 的响应。
     ///
-    /// 响应由 `recv_loop` 接收后经 `pending` 表按 tid 分发，本函数只
+    /// 响应由 `recv_loop` 接收后经 `pending` 表分发，本函数只
     /// 等待自己的 oneshot 通道（超时 3s）。发送失败/超时都会摘除登记项，
     /// 避免 pending 表泄漏。
     async fn send_raw(
@@ -752,44 +772,76 @@ impl Dht {
         addr: SocketAddr,
     ) -> Result<Vec<u8>, KrpcError> {
         let (tx, rx) = oneshot::channel();
+        // 登记键与 recv_loop 的查表键必须同口径：接收侧对源地址做了
+        // canonical_addr 规范化（v4-mapped → v4），发送侧的目标地址同样
+        // 规范化后再作键，否则双栈 socket 上按 v4 发送、按 v4-mapped 查表
+        // 永远不命中（所有查询超时）。
+        let key = (Self::canonical_addr(addr), *tid);
         // 先登记再发送——响应可能极快到达，晚登记会丢包
-        self.pending.lock().await.insert(*tid, tx);
+        self.pending.lock().await.insert(key, tx);
         if let Err(e) = self.send_wire(wire, addr).await {
-            self.pending.lock().await.remove(tid);
+            self.pending.lock().await.remove(&key);
             return Err(KrpcError::Network(e.to_string()));
         }
         match timeout(KRPC_QUERY_TIMEOUT, rx).await {
             Ok(Ok(data)) => Ok(data),
             Ok(Err(_)) => Err(KrpcError::Timeout),
             Err(_) => {
-                self.pending.lock().await.remove(tid);
+                self.pending.lock().await.remove(&key);
                 Err(KrpcError::Timeout)
             }
         }
     }
 
-    /// 保存路由表到文件。
+    /// 保存路由表到文件（异步路径：定期任务调用）。
+    ///
+    /// 必须用 `read().await`——`RwLock::blocking_read` 在异步执行上下文里
+    /// 会直接 panic（"Cannot block the current thread from within a
+    /// runtime"），而定期保存任务正是跑在运行时工作线程上：一旦启用
+    /// 路由表持久化，5 分钟后必然 panic。
+    async fn save_routing_table_async(&self) {
+        let Some(path) = &self.routing_table_file else {
+            return;
+        };
+        let j = {
+            let table = self.table.read().await;
+            table.to_json()
+        };
+        write_routing_table_file(path, &j);
+    }
+
+    /// 保存路由表到文件（同步路径：`shutdown` 调用）。
+    ///
+    /// 拿不到读锁就跳过本轮，绝不阻塞当前线程（可能在异步上下文里被调用）。
     fn save_routing_table(&self) {
         let Some(path) = &self.routing_table_file else {
             return;
         };
-        // 同步读取 + 序列化
-        let table = self.table.blocking_read();
+        let Ok(table) = self.table.try_read() else {
+            tracing::warn!("路由表正被占用，跳过本次保存");
+            return;
+        };
         let j = table.to_json();
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let tmp = path.with_extension("json.tmp");
-        if serde_json::to_string_pretty(&j)
-            .map_err(|e| e.to_string())
-            .and_then(|text| {
-                std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-                std::fs::rename(&tmp, path).map_err(|e| e.to_string())
-            })
-            .is_err()
-        {
-            tracing::warn!("DHT 路由表保存失败");
-        }
+        drop(table);
+        write_routing_table_file(path, &j);
+    }
+}
+
+/// 路由表 JSON 落盘（临时文件 + rename 原子替换）。
+fn write_routing_table_file(path: &Path, j: &serde_json::Value) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if serde_json::to_string_pretty(j)
+        .map_err(|e| e.to_string())
+        .and_then(|text| {
+            std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+        })
+        .is_err()
+    {
+        tracing::warn!("DHT 路由表保存失败");
     }
 }
 
@@ -1316,5 +1368,177 @@ mod tests {
         assert!(resp.nodes.iter().all(|node| node.addr.is_ipv4()));
 
         dht.shutdown();
+    }
+
+    /// 查询响应必须来自「被查询的那个地址」才会被采纳。
+    ///
+    /// 待响应表若只按 tid 索引，任意主机只要猜中 16 位事务 id 就能把
+    /// 伪造响应注入本地查询（peers 会直接进 BT 连接队列）；一轮并发
+    /// 查询数百个 tid 时，撞号也会把响应错投给另一个节点的等待者。
+    #[tokio::test]
+    async fn dht_response_requires_matching_source_addr() {
+        let dht = Dht::new(DhtConfig {
+            node_id: Some(node_id_from_seed(b"pending-key")),
+            listen_port: 0,
+            bind_addr: Some("127.0.0.1".into()),
+            routing_table_file: None,
+            enable_ipv6: false,
+        })
+        .await
+        .unwrap();
+        dht.spawn_background();
+        let dht_addr = dht.local_addr().unwrap();
+
+        // 被查询方（合法响应来源）与第三方（错配来源）
+        let queried = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let queried_addr = queried.local_addr().unwrap();
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let tid: [u8; 2] = [0xAB, 0xCD];
+        let (tx, mut rx) = oneshot::channel();
+        dht.pending.lock().await.insert((queried_addr, tid), tx);
+
+        let resp = encode_response(&tid, &NodeId::random(), &[], None);
+
+        // 第三方持有完全正确的 tid，但来源地址不是被查询方 → 不得采纳
+        stranger.send_to(&resp, dht_addr).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(300), &mut rx).await.is_err(),
+            "来自非被查询地址的响应被错误采纳（猜中 tid 即可注入）"
+        );
+
+        // 被查询方回同一个响应 → 正常投递
+        queried.send_to(&resp, dht_addr).await.unwrap();
+        let got = timeout(Duration::from_secs(2), rx)
+            .await
+            .expect("被查询方的响应应被投递")
+            .unwrap();
+        assert_eq!(got, resp);
+
+        dht.shutdown();
+    }
+
+    /// announce_peer 必须显式声明 `implied_port=0`（BEP 5）。
+    ///
+    /// 回归点：此前恒传 `true`，而对端在 implied_port=1 时会**忽略
+    /// port 参数**、改用 UDP 包的源端口。本端 announce 走的是 DHT
+    /// socket（端口与 BT 监听端口通常不同），于是对端把 DHT 端口记成
+    /// 我们的 BT 端口——别的节点拿到这个地址去连，那里没人监听。
+    #[tokio::test]
+    async fn announce_peer_declares_explicit_port() {
+        let mock_id = node_id_from_seed(b"mock-announce");
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mock_addr = socket.local_addr().unwrap();
+        // (implied_port, port) 实际收到的宣告参数
+        let captured: Arc<Mutex<Vec<(bool, Option<u16>)>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let s = socket.clone();
+            let cap = captured.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                while let Ok((n, from)) = s.recv_from(&mut buf).await {
+                    match parse_query(&buf[..n]) {
+                        Ok(IncomingQuery::GetPeers { tid, .. }) => {
+                            // 提供 token（announce 前置条件）
+                            let resp = crate::krpc::encode_get_peers_response_with_peers(
+                                &tid,
+                                &mock_id,
+                                &[],
+                                b"mock_tok",
+                            );
+                            let _ = s.send_to(&resp, from).await;
+                        }
+                        Ok(IncomingQuery::AnnouncePeer {
+                            tid,
+                            implied_port,
+                            port,
+                            ..
+                        }) => {
+                            cap.lock().await.push((implied_port, port));
+                            let resp = encode_response(&tid, &mock_id, &[], None);
+                            let _ = s.send_to(&resp, from).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        let dht = Dht::new(DhtConfig {
+            node_id: Some(node_id_from_seed(b"announcer")),
+            listen_port: 0,
+            bind_addr: Some("127.0.0.1".into()),
+            routing_table_file: None,
+            enable_ipv6: false,
+        })
+        .await
+        .unwrap();
+        dht.spawn_background();
+
+        let ih = InfoHash::from_bytes(&[0x77; 20]);
+        dht.announce_peer(
+            ih,
+            51413,
+            &[NodeEntry {
+                id: mock_id,
+                addr: mock_addr,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let got = captured.lock().await;
+        assert_eq!(got.len(), 1, "应向 mock 节点发出一次 announce_peer");
+        assert!(
+            !got[0].0,
+            "implied_port 必须为 0，否则对端按 DHT 源端口记录我们的 BT 端口"
+        );
+        assert_eq!(got[0].1, Some(51413), "port 必须是 BT 监听端口");
+
+        dht.shutdown();
+    }
+
+    /// 路由表保存必须在异步上下文里可用。
+    ///
+    /// 回归点：此前两条路径都走 `blocking_read`，而定期保存任务跑在运行时
+    /// 工作线程上、`shutdown` 也可能被异步调用方触发——`blocking_read`
+    /// 在异步上下文直接 panic（"Cannot block the current thread from
+    /// within a runtime"），即启用路由表持久化后引擎会崩。
+    #[tokio::test]
+    async fn routing_table_persist_survives_async_context() {
+        let dir = std::env::temp_dir().join(format!("xfer-dht-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("rt.json");
+        let dht = Dht::new(DhtConfig {
+            node_id: Some(node_id_from_seed(b"rt-persist")),
+            listen_port: 0,
+            bind_addr: Some("127.0.0.1".into()),
+            routing_table_file: Some(path.clone()),
+            enable_ipv6: false,
+        })
+        .await
+        .unwrap();
+        {
+            let mut t = dht.table.write().await;
+            t.add(NodeEntry {
+                id: NodeId::from_bytes(&[7; 20]),
+                addr: "127.0.0.1:7001".parse().unwrap(),
+            });
+        }
+
+        // 异步路径（定期保存）
+        dht.save_routing_table_async().await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("127.0.0.1:7001"), "路由表应已落盘: {text}");
+        // 同步路径（shutdown）在异步上下文里同样不得 panic
+        dht.save_routing_table();
+        // 锁被占用时同步路径只跳过，不阻塞
+        {
+            let _held = dht.table.write().await;
+            dht.save_routing_table();
+        }
+
+        dht.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

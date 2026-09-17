@@ -106,13 +106,7 @@ impl PeerId {
     /// 尾部以随机字节填满 20 字节。
     pub fn azureus_prefix(random: &[u8; 12]) -> Self {
         let (maj, min, mic) = version_tuple();
-        let prefix = format!("-XR{maj}{min}{mic}0-");
-        let mut out = [0u8; 20];
-        let p = prefix.as_bytes();
-        debug_assert_eq!(p.len(), 8, "version 前缀长度必须为 8");
-        out[..p.len()].copy_from_slice(p);
-        out[p.len()..].copy_from_slice(random);
-        Self(out)
+        Self(azureus_prefix_from(maj, min, mic, random))
     }
 
     /// 解析 Azureus 风格前缀出 (major, minor, micro)，非该风格返回 None。
@@ -121,8 +115,62 @@ impl PeerId {
         if p[0] != b'-' || p[1] != b'X' || p[2] != b'R' || p[7] != b'-' {
             return None;
         }
-        let d = |b: u8| (b as char).is_ascii_digit().then(|| b - b'0');
-        Some((d(p[3])?, d(p[4])?, d(p[5])?))
+        Some((
+            version_digit_value(p[3])?,
+            version_digit_value(p[4])?,
+            version_digit_value(p[5])?,
+        ))
+    }
+}
+
+/// 构造 Azureus 风格 peer-id：`-XR####-`（**定长 8 字节**）+ 12 字节随机段。
+///
+/// 定长构造是刻意的：此前用 `format!("-XR{maj}{min}{mic}0-")` 拼字符串，
+/// 版本号一旦出现两位数（如 0.10.0）就拼出 9 字节前缀，`out[p.len()..]`
+/// 只剩 11 字节而随机段是 12 字节 → `copy_from_slice` 长度不匹配 panic；
+/// 而 `debug_assert` 仅在 debug 生效，release 里没有护栏，升到 0.10.x
+/// 就是每个任务第一次生成 peer-id 时直接崩。
+fn azureus_prefix_from(maj: u8, min: u8, mic: u8, random: &[u8; 12]) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    // BEP 20 的 4 个版本字符位：major / minor / micro / 固定 0
+    out[..8].copy_from_slice(&[
+        b'-',
+        b'X',
+        b'R',
+        version_digit(maj),
+        version_digit(min),
+        version_digit(mic),
+        b'0',
+        b'-',
+    ]);
+    out[8..].copy_from_slice(random);
+    out
+}
+
+/// 版本号单个字符位的编码：0-9 → `'0'`-`'9'`，10-35 → `'A'`-`'Z'`。
+///
+/// 前缀只有 4 个字符位，两位数版本塞不进单个十进制字符，改用字母承载
+///（客户端对 Azureus 前缀本来就是按字符解析的）。超出 35 的分量饱和到
+/// `'Z'`——宁可少报版本号，也不能 panic。
+///
+/// 注意：BEP 20 的原文仍写「4 位各一个十进制数字」，因此 `xfer-bt` 里
+/// 用于**展示他人** peer 客户端版本的 `azureus_version()` 只认数字
+/// （保持对第三方 id 的既有解读不变）。含义是：版本号真的出现两位数时，
+/// 我们的 peer 在对方界面里会显示成无版本（纯装饰性差异，不影响连接）。
+fn version_digit(v: u8) -> u8 {
+    match v {
+        0..=9 => b'0' + v,
+        10..=35 => b'A' + (v - 10),
+        _ => b'Z',
+    }
+}
+
+/// [`version_digit`] 的逆运算（解析回版本号用）。
+fn version_digit_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'Z' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -133,7 +181,7 @@ impl std::fmt::Debug for PeerId {
 }
 
 /// 解析 [`ENGINE_VERSION`] 为 (major, minor, micro)。
-/// 版本号各位必须是一位数（`-XR%d%d%d0-` 编码要求）。
+/// 各分量按 [`version_digit`] 编进 `-XR####-`（0-35 可完整往返）。
 fn version_tuple() -> (u8, u8, u8) {
     let mut it = ENGINE_VERSION
         .split('.')
@@ -141,10 +189,6 @@ fn version_tuple() -> (u8, u8, u8) {
     let maj = it.next().expect("major");
     let min = it.next().expect("minor");
     let mic = it.next().expect("micro");
-    debug_assert!(
-        maj < 10 && min < 10 && mic < 10,
-        "Azureus 前缀编码仅支持个位版本"
-    );
     (maj, min, mic)
 }
 
@@ -212,5 +256,63 @@ mod tests {
         let mut other = [0u8; 20];
         other[..8].copy_from_slice(b"-UT3600-");
         assert_eq!(PeerId(other).parse_azureus(), None);
+    }
+
+    /// `ENGINE_VERSION` 是手写常量，必须与 Cargo 工作区版本严格一致。
+    ///
+    /// 两者曾各自漂移：`engine.getVersion`、TUI 标题、peer-id 前缀
+    /// （`-XR####-`）全部读 `ENGINE_VERSION`，而 tracker 的 HTTP UA
+    /// （`xfer-bt` 里的 `env!("CARGO_PKG_VERSION")` 拼成 `XferRust/<ver>`）
+    /// 读 Cargo 版本。一旦不一致，引擎会对外宣称两个不同版本号
+    /// （peer-id 说 0.3.0、UA 说 0.3.1），且发布说明与实际产物对不上。
+    #[test]
+    fn engine_version_matches_cargo_version() {
+        assert_eq!(
+            ENGINE_VERSION,
+            env!("CARGO_PKG_VERSION"),
+            "xfer-types::ENGINE_VERSION 与工作区 Cargo.toml 的 version 不一致"
+        );
+        // 版本段必须落在单个字符位能无损承载的范围内（见 version_digit）
+        let (maj, min, mic) = version_tuple();
+        assert!(
+            maj <= 35 && min <= 35 && mic <= 35,
+            "版本分量超过 35 后 peer-id 前缀只能饱和编码（版本号丢失）"
+        );
+        // 且 ENGINE_VERSION 里不得夹带预发布后缀（-XR 前缀与 UA 都要裸版本）
+        assert!(
+            !ENGINE_VERSION.contains('-') && !ENGINE_VERSION.contains('+'),
+            "ENGINE_VERSION 只允许 major.minor.patch"
+        );
+    }
+
+    /// 两位数版本必须能编码（前缀恰好 8 字节、随机段完整保留），不 panic。
+    ///
+    /// 回归点：此前用 `format!("-XR{maj}{min}{mic}0-")` 拼字符串，0.10.0 会
+    /// 拼出 9 字节前缀 → `out[p.len()..]` 只剩 11 字节而随机段 12 字节 →
+    /// `copy_from_slice` panic（release 里 `debug_assert` 不生效）。
+    #[test]
+    fn azureus_prefix_encodes_two_digit_versions() {
+        let random = [0x5Au8; 12];
+
+        // 0.10.0 → 前缀第 5 位用字母 'A'（10），仍是 `-XR####-` 8 字节
+        let pid = azureus_prefix_from(0, 10, 0, &random);
+        assert_eq!(&pid[..8], b"-XR0A00-");
+        assert_eq!(&pid[8..], &random, "随机段必须完整保留（12 字节）");
+        assert_eq!(PeerId(pid).parse_azureus(), Some((0, 10, 0)));
+
+        // 两位数的多个分量：12.34.5 → 'C' 'Y' '5'
+        let pid = azureus_prefix_from(12, 34, 5, &random);
+        assert_eq!(&pid[..8], b"-XRCY50-");
+        assert_eq!(PeerId(pid).parse_azureus(), Some((12, 34, 5)));
+
+        // 超出单字符位承载范围：饱和到 'Z'，绝不 panic
+        let pid = azureus_prefix_from(99, 99, 99, &random);
+        assert_eq!(&pid[..8], b"-XRZZZ0-");
+        assert_eq!(&pid[8..], &random);
+
+        // 个位版本与旧编码逐字节一致（不改变现有对外标识）
+        let pid = azureus_prefix_from(0, 3, 1, &random);
+        assert_eq!(&pid[..8], b"-XR0310-");
+        assert_eq!(PeerId(pid).parse_azureus(), Some((0, 3, 1)));
     }
 }

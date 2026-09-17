@@ -26,9 +26,13 @@ pub enum PortMappingProtocol {
 }
 
 impl PortMappingProtocol {
+    /// NAT-PMP opcode（RFC 6886 §3.3）：0 = 查询外部地址，
+    /// 1 = 映射 UDP，2 = 映射 TCP。此前 TCP 写成 6（既非 1 也非 2），
+    /// 网关一律回 unsupported/ignore——NAT-PMP 的 TCP 映射从未成功过，
+    /// 全靠 UPnP 回退兜底（只有 UPnP 不可用时才暴露为「TCP 端口映射失败」）。
     fn nat_pmp_code(&self) -> u16 {
         match self {
-            PortMappingProtocol::Tcp => 6, // NAT-PMP op 6 = map TCP
+            PortMappingProtocol::Tcp => 2, // NAT-PMP op 2 = map TCP
             PortMappingProtocol::Udp => 1, // NAT-PMP op 1 = map UDP
         }
     }
@@ -647,8 +651,11 @@ mod tests {
 
     #[test]
     fn protocol_values() {
-        assert_eq!(PortMappingProtocol::Tcp.nat_pmp_code(), 6);
+        // NAT-PMP opcode 按 RFC 6886 §3.3：1 = 映射 UDP、2 = 映射 TCP。
+        // 此前 TCP 断言为 6（既非 1 也非 2）——网关只回 unsupported，
+        // NAT-PMP 的 TCP 映射从未生效，全靠 UPnP 回退兜底。
         assert_eq!(PortMappingProtocol::Udp.nat_pmp_code(), 1);
+        assert_eq!(PortMappingProtocol::Tcp.nat_pmp_code(), 2);
         assert_eq!(PortMappingProtocol::Tcp.upnp_protocol_str(), "TCP");
         assert_eq!(PortMappingProtocol::Udp.upnp_protocol_str(), "UDP");
     }

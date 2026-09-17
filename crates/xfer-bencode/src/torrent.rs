@@ -39,6 +39,13 @@ pub struct Info {
     pub pieces: Vec<[u8; 20]>,
     /// 文件列表（单文件种子为 1 项）。
     pub files: Vec<FileEntry>,
+    /// BEP 3 多文件模式（info 里有 `files` 列表）。
+    ///
+    /// 必须保留这一结构位：`files` 列表长度无法区分「单文件种子」与
+    /// 「只有 1 个文件的多文件种子」——前者的落盘路径是 `<name>`，
+    /// 后者是 `<name>/<path>`。用 `files.len() == 1` 当判据会把后者的
+    /// 文件直接写成 `<name>`（占了目录名，且路径段被丢掉）。
+    pub multi_file: bool,
     /// private 标记（禁止 DHT/PEX）。
     pub private: bool,
 }
@@ -218,67 +225,72 @@ fn parse_info(v: &Value) -> Result<Info, String> {
         .unwrap_or(false);
 
     // 单文件模式：length + name
-    let files = if let Some(len) = dict.get(b"length".as_slice()).and_then(Value::as_int) {
-        if len < 0 {
-            return Err("文件长度不能为负".into());
-        }
-        vec![FileEntry {
-            path: vec![name.clone()],
-            length: len as u64,
-        }]
-    } else {
-        let list = dict
-            .get(b"files".as_slice())
-            .and_then(Value::as_list)
-            .ok_or_else(|| "info 既无 length 也无 files".to_string())?;
-        let mut out = Vec::with_capacity(list.len());
-        for f in list {
-            let fd = f
-                .as_dict()
-                .ok_or_else(|| "files 条目必须是字典".to_string())?;
-            let length =
-                fd.get(b"length".as_slice())
-                    .and_then(Value::as_int)
-                    .filter(|&n| n >= 0)
-                    .ok_or_else(|| "文件条目缺少合法 length".to_string())? as u64;
-            let path_raw: Vec<u8> = fd
-                .get(b"path.utf-8".as_slice())
-                .or_else(|| fd.get(b"path".as_slice()))
-                .and_then(Value::as_list)
-                .map(|parts| {
-                    parts
-                        .iter()
-                        .filter_map(Value::as_bytes)
-                        .flat_map(|b| {
-                            let mut v = b.to_vec();
-                            v.push(0); // 分隔占位，下面按 0 分组
-                            v
-                        })
-                        .collect()
-                })
-                .ok_or_else(|| "文件条目缺少 path".to_string())?;
-            let parts: Vec<String> = path_raw
-                .split(|&b| b == 0)
-                .filter(|s| !s.is_empty())
-                // 与 name 同理：路径段可能是 GBK 字节，探测解码而不是 lossy
-                .map(|s| sanitize_segment(&xfer_types::text::decode_text(s)))
-                .collect();
-            if parts.is_empty() {
-                return Err("文件条目 path 为空".into());
+    let (files, multi_file) =
+        if let Some(len) = dict.get(b"length".as_slice()).and_then(Value::as_int) {
+            if len < 0 {
+                return Err("文件长度不能为负".into());
             }
-            out.push(FileEntry {
-                path: parts,
-                length,
-            });
-        }
-        out
-    };
+            (
+                vec![FileEntry {
+                    path: vec![name.clone()],
+                    length: len as u64,
+                }],
+                false,
+            )
+        } else {
+            let list = dict
+                .get(b"files".as_slice())
+                .and_then(Value::as_list)
+                .ok_or_else(|| "info 既无 length 也无 files".to_string())?;
+            let mut out = Vec::with_capacity(list.len());
+            for f in list {
+                let fd = f
+                    .as_dict()
+                    .ok_or_else(|| "files 条目必须是字典".to_string())?;
+                let length =
+                    fd.get(b"length".as_slice())
+                        .and_then(Value::as_int)
+                        .filter(|&n| n >= 0)
+                        .ok_or_else(|| "文件条目缺少合法 length".to_string())? as u64;
+                let path_raw: Vec<u8> = fd
+                    .get(b"path.utf-8".as_slice())
+                    .or_else(|| fd.get(b"path".as_slice()))
+                    .and_then(Value::as_list)
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter_map(Value::as_bytes)
+                            .flat_map(|b| {
+                                let mut v = b.to_vec();
+                                v.push(0); // 分隔占位，下面按 0 分组
+                                v
+                            })
+                            .collect()
+                    })
+                    .ok_or_else(|| "文件条目缺少 path".to_string())?;
+                let parts: Vec<String> = path_raw
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    // 与 name 同理：路径段可能是 GBK 字节，探测解码而不是 lossy
+                    .map(|s| sanitize_segment(&xfer_types::text::decode_text(s)))
+                    .collect();
+                if parts.is_empty() {
+                    return Err("文件条目 path 为空".into());
+                }
+                out.push(FileEntry {
+                    path: parts,
+                    length,
+                });
+            }
+            (out, true)
+        };
 
     Ok(Info {
         name,
         piece_length,
         pieces,
         files,
+        multi_file,
         private,
     })
 }
@@ -287,6 +299,23 @@ impl Info {
     /// 文件总长度。
     pub fn total_length(&self) -> u64 {
         self.files.iter().map(|f| f.length).sum()
+    }
+
+    /// 某文件相对任务下载目录的路径（`/` 分隔），与磁盘布局一致。
+    ///
+    /// - 多文件种子：`<name>/<path 段拼接>`；
+    /// - 单文件种子：`<name>`（此时 `FileEntry::path` 就是 `[name]`，
+    ///   不能再前置一次 `name`，否则得到 `<name>/<name>` 这种不存在的路径）。
+    ///
+    /// 详情页文件列表、`task.verifyFiles` 的校验路径都取自这里，必须与
+    /// `PieceStore::open` 的落盘位置同口径。
+    pub fn file_rel_path(&self, f: &FileEntry) -> String {
+        let joined = f.path.join("/");
+        if self.multi_file {
+            format!("{}/{}", self.name, joined)
+        } else {
+            joined
+        }
     }
 
     /// 片数（按总长与片长推导；对 pieces 数组不一致的种子取较小者防御）。
@@ -389,6 +418,8 @@ mod tests {
         assert_eq!(meta.info.total_length(), 40);
         assert_eq!(meta.info.files.len(), 1);
         assert_eq!(meta.info.files[0].path, vec!["file.txt".to_string()]);
+        // 带 length 的是单文件种子：落盘路径就是 `<name>`（不是 `<name>/<name>`）
+        assert!(!meta.info.multi_file);
         // 最后一片只有 8 字节
         assert_eq!(meta.info.piece_len(2), 8);
         // info_hash 与重新编码的 info 一致
@@ -404,12 +435,43 @@ mod tests {
         assert_eq!(meta.info_hash, expect);
     }
 
+    /// 只有 1 个文件的**多文件**种子必须与单文件种子区分开。
+    ///
+    /// 回归点：两者都是 1 项 `files`，`files.len() == 1` 分不出来，落盘时
+    /// 会把多文件种子的 `<name>/<file>` 写成 `<name>`（占了目录名、路径段
+    /// 被丢掉）。判据只能来自 info 里写的是 `length` 还是 `files` 列表。
+    #[test]
+    fn parse_single_entry_multi_file_keeps_flag() {
+        let info = dict(BTreeMap::from([
+            (b"name".to_vec(), bytes("Best Movie")),
+            (b"piece length".to_vec(), int(16)),
+            (
+                b"files".to_vec(),
+                list(vec![dict(BTreeMap::from([
+                    (b"length".to_vec(), int(40)),
+                    (b"path".to_vec(), list(vec![bytes("movie.mkv")])),
+                ]))]),
+            ),
+            (b"pieces".to_vec(), bytes(vec![0xAA; 60])),
+        ]));
+        let top = dict(BTreeMap::from([(b"info".to_vec(), info)]));
+        let meta = parse_torrent(&encode(&top)).unwrap();
+        assert!(
+            meta.info.multi_file,
+            "有 files 列表就是多文件种子，哪怕只有 1 项"
+        );
+        assert_eq!(meta.info.name, "Best Movie");
+        assert_eq!(meta.info.files.len(), 1);
+        assert_eq!(meta.info.files[0].path, vec!["movie.mkv".to_string()]);
+    }
+
     #[test]
     fn piece_segments_cross_file() {
         let info = Info {
             name: "d".into(),
             piece_length: 10,
             pieces: vec![[0u8; 20]; 4],
+            multi_file: true,
             files: vec![
                 FileEntry {
                     path: vec!["a".into()],

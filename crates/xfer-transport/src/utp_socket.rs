@@ -18,7 +18,7 @@ use std::time::Instant;
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
+use tokio::time::Duration;
 use tracing::debug;
 
 use crate::utp_connection::UtpConnection;
@@ -358,12 +358,23 @@ impl UtpManager {
     }
 
     async fn run(mut self, mut cmd_rx: mpsc::Receiver<ManagerCmd>) {
-        let mut tick = interval(self.tick_interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // tick 间隔随连接数自适应：uTP 管理器在 BT 任务存活期间常驻，无连接时
+        // 仍按 1ms 空转（1000 次/秒无谓唤醒）；空闲放宽到 100ms，建连后立刻
+        // 回到 1ms——建连/入站 SYN 路径本就即时 tick（见 do_connect /
+        // handle_datagram），握手时延不受影响。
+        // 用 interval 而非每轮新建 sleep：deadline 独立于其他 select 分支，
+        // 高包量下定时器不会被饿死（重传 / SACK 定时必须保时）。
+        let mut idle = true;
+        let mut tick = new_tick(IDLE_TICK);
 
         let mut buf = [0u8; 2048];
 
         loop {
+            let now_idle = self.connections.is_empty();
+            if now_idle != idle {
+                idle = now_idle;
+                tick = new_tick(if idle { IDLE_TICK } else { self.tick_interval });
+            }
             tokio::select! {
                 // 处理入站 UDP 数据报
                 Ok((len, src)) = self.socket.recv_from(&mut buf) => {
@@ -658,6 +669,16 @@ async fn resolve_bind_addr(host: &str, port: u16) -> io::Result<SocketAddr> {
         .await?
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "监听地址无法解析"))
+}
+
+/// 无 uTP 连接时的 tick 间隔（空闲期唤醒频率，见 `UtpManager::run`）。
+const IDLE_TICK: Duration = Duration::from_millis(100);
+
+/// 新建 tick 定时器（首个 tick 在一个周期后触发，跳过堆积的错失 tick）。
+fn new_tick(period: Duration) -> tokio::time::Interval {
+    let mut t = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    t
 }
 
 /// 管理器命令。

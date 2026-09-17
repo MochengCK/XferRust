@@ -721,84 +721,90 @@ impl Writer {
         let loaded = load_ctrl(ctrl)
             .filter(|c| c.total == total)
             .filter(|c| c.segs.iter().all(|s| s.w == 0 || s.s + s.w <= file_len));
+        // 段表严格平铺 [base, total) 校验：无重叠、无间隙。
+        // 校验不过的控制文件必须**等价于没有控制文件**（走下面的 None
+        // 分支：把已有文件当连续前缀、按需重新切段）——绝不能保留它的
+        // 空段表继续走下去：空段表让下面 todo 算出 0，于是一个字节都
+        // 没下载也判 `finished`（假成功，且目标文件不会被截齐到 total）。
+        let loaded = loaded.and_then(|c| {
+            let mut sorted = c.segs.clone();
+            sorted.sort_by_key(|s| s.s);
+            let mut cursor = c.base.min(total);
+            let tiled = !sorted.is_empty() && {
+                let mut ok = true;
+                for s in &sorted {
+                    // 严格平铺 [base, total)：不允许重叠也不允许间隙。
+                    // 间隙意味着一段字节脱离段表——todo 永不归零，
+                    // 恢复时若把文件长度误当连续前缀，间隙中的空洞
+                    // 会被静默跳过（假完成、文件损坏）。
+                    if s.s != cursor || s.e <= s.s {
+                        ok = false;
+                        break;
+                    }
+                    cursor = s.e;
+                }
+                ok && cursor == total
+            };
+            if !tiled {
+                tracing::warn!(path = %ctrl.display(), "控制文件段表不连续，忽略");
+                return None;
+            }
+            Some((c.base.min(total), sorted))
+        });
         let mut segs: Vec<Seg> = Vec::new();
-        let mut base = 0u64;
+        // 两条分支都必然赋值（控制文件可用 / 不可用）
+        let base: u64;
 
-        match loaded {
-            Some(c) => {
-                // 校验段表严格平铺 [base, total)：无重叠、无间隙
-                let mut sorted = c.segs.clone();
-                sorted.sort_by_key(|s| s.s);
-                let mut cursor = c.base.min(total);
-                let tiled = !sorted.is_empty() && {
-                    let mut ok = true;
-                    for s in &sorted {
-                        // 严格平铺 [base, total)：不允许重叠也不允许间隙。
-                        // 间隙意味着一段字节脱离段表——todo 永不归零，
-                        // 恢复时若把文件长度误当连续前缀，间隙中的空洞
-                        // 会被静默跳过（假完成、文件损坏）。
-                        if s.s != cursor || s.e <= s.s {
-                            ok = false;
-                            break;
-                        }
-                        cursor = s.e;
-                    }
-                    ok && cursor == total
-                };
-                if tiled {
-                    base = c.base.min(total);
-                    for s in &sorted {
-                        // 已完成段必须保留在段表（done=true，不入队）：
-                        // 1) 序列化时随之保存——若在此丢弃，后续任何一次
-                        //    save_ctrl 都会写出有间隙的段表，下次恢复校验
-                        //    失败 → 文件长度被当作连续前缀 → 中间段空洞被
-                        //    静默跳过（假完成、文件损坏）；
-                        // 2) 恢复时据此跳过重下。
-                        let len = s.e - s.s;
-                        // 防御性 clamp：损坏的 w 超界会导致 todo 下溢
-                        let written = s.w.min(len);
-                        let done = written >= len;
-                        segs.push(Seg {
-                            start: s.s,
-                            end: s.e,
-                            written,
-                            done,
-                            queued: !done,
-                            end_shared: Arc::new(AtomicU64::new(s.e)),
-                        });
-                    }
-                } else {
-                    tracing::warn!(path = %ctrl.display(), "控制文件段表不连续，忽略");
+        if let Some((ctrl_base, sorted)) = loaded {
+            base = ctrl_base;
+            for s in &sorted {
+                // 已完成段必须保留在段表（done=true，不入队）：
+                // 1) 序列化时随之保存——若在此丢弃，后续任何一次
+                //    save_ctrl 都会写出有间隙的段表，下次恢复校验
+                //    失败 → 文件长度被当作连续前缀 → 中间段空洞被
+                //    静默跳过（假完成、文件损坏）；
+                // 2) 恢复时据此跳过重下。
+                let len = s.e - s.s;
+                // 防御性 clamp：损坏的 w 超界会导致 todo 下溢
+                let written = s.w.min(len);
+                let done = written >= len;
+                segs.push(Seg {
+                    start: s.s,
+                    end: s.e,
+                    written,
+                    done,
+                    queued: !done,
+                    end_shared: Arc::new(AtomicU64::new(s.e)),
+                });
+            }
+        } else {
+            // 无控制文件（或控制文件不可用）：把已有文件视为连续前缀
+            //（兼容旧引擎进度）。
+            base = file_len.min(total);
+            let remain = total - base;
+            if remain > 0 {
+                let workers = opts.connections.max(1);
+                let by_min = remain.div_ceil(opts.min_split_size).max(1) as usize;
+                // 初始段数 ∈ [1, 2×workers]：上限防小文件碎片化，
+                // 下限保住并行度（配合对冲切分动态均衡）。
+                let nseg = by_min.clamp(1, workers * 2);
+                let mut prev = base;
+                for i in 1..=nseg {
+                    let end = base + remain * (i as u64) / (nseg as u64);
+                    segs.push(Seg {
+                        start: prev,
+                        end,
+                        written: 0,
+                        done: false,
+                        queued: true,
+                        end_shared: Arc::new(AtomicU64::new(end)),
+                    });
+                    prev = end;
                 }
             }
-            None => {
-                // 无控制文件：把已有文件视为连续前缀（兼容旧引擎进度）。
-                base = file_len.min(total);
-                let remain = total - base;
-                if remain > 0 {
-                    let workers = opts.connections.max(1);
-                    let by_min = remain.div_ceil(opts.min_split_size).max(1) as usize;
-                    // 初始段数 ∈ [1, 2×workers]：上限防小文件碎片化，
-                    // 下限保住并行度（配合对冲切分动态均衡）。
-                    let nseg = by_min.clamp(1, workers * 2);
-                    let mut prev = base;
-                    for i in 1..=nseg {
-                        let end = base + remain * (i as u64) / (nseg as u64);
-                        segs.push(Seg {
-                            start: prev,
-                            end,
-                            written: 0,
-                            done: false,
-                            queued: true,
-                            end_shared: Arc::new(AtomicU64::new(end)),
-                        });
-                        prev = end;
-                    }
-                }
-                if file_len > total {
-                    // 目标文件比资源长（外部残留）：截齐，避免完成后长度错误
-                    file.set_len(total)?;
-                }
+            if file_len > total {
+                // 目标文件比资源长（外部残留）：截齐，避免完成后长度错误
+                file.set_len(total)?;
             }
         }
 
@@ -2943,6 +2949,98 @@ mod tests {
         assert_eq!(w2.segs.len(), 3, "控制文件往返后必须保留已完成段");
         assert_eq!(w2.todo, mb / 2, "只有未完成段的剩余量待下");
         assert!(w2.segs.iter().any(|s| s.queued));
+    }
+
+    /// 段表不连续（间隙/重叠/空表）的控制文件必须等价于「无控制文件」：
+    /// 重新按剩余量切段，绝不沿用空段表。
+    ///
+    /// 回归点：此前非平铺分支既不回落也不建段，段表为空 → todo 算出 0
+    /// → `finished = true`——**一个字节都没下载就报完成**（且目标文件
+    /// 连截齐到 total 都跳过），用户拿到的是残缺文件却显示成功。
+    #[test]
+    fn broken_ctrl_falls_back_to_fresh_split() {
+        let dir = tmpdir("ctrl-broken");
+        let notify = Arc::new(Notify::new());
+        let fatal: Arc<Mutex<Option<HttpError>>> = Arc::new(Mutex::new(None));
+        let desired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stats = Arc::new(SplitStats::new(0));
+        let opts = SplitOptions {
+            connections: 2,
+            min_split_size: 1024 * 1024,
+            adaptive: None,
+            limiter: None,
+        };
+        let path = dir.join("broken.bin");
+        let ctrl = ctrl_path(&path);
+        let mb = 1024u64 * 1024;
+        let total = 3 * mb;
+        // 段表有间隙（段 0 之后直接跳到 2MB）：总长匹配、水位也不越界，
+        // 但脱离段表的 1MB 永远无人下载。
+        std::fs::write(
+            &ctrl,
+            serde_json::to_vec(&CtrlFile {
+                v: 1,
+                total,
+                base: 0,
+                url: "http://x/broken.bin".into(),
+                segs: vec![
+                    CtrlSeg {
+                        s: 0,
+                        w: mb,
+                        e: mb,
+                    },
+                    CtrlSeg {
+                        s: 2 * mb,
+                        w: 0,
+                        e: 3 * mb,
+                    },
+                ],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // 数据文件已有 1MB（连续前缀）
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_len(mb).unwrap();
+        }
+
+        let mut w = Writer::bootstrap(
+            &path,
+            &ctrl,
+            "http://x/broken.bin",
+            total,
+            &opts,
+            &stats,
+            &notify,
+            &fatal,
+            &desired,
+        )
+        .unwrap();
+        assert!(!w.finished(), "段表不可用不得判完成");
+        assert!(!w.segs.is_empty(), "必须重新切段，不能留空段表");
+        // 已有 1MB 视作连续前缀，剩余 2MB 全部待下（含被跳过的那 1MB）
+        assert_eq!(w.todo, 2 * mb);
+        assert_eq!(w.base, mb);
+        let covered: u64 = w.segs.iter().map(|s| s.end - s.start).sum();
+        assert_eq!(covered, 2 * mb, "重切段必须无缝覆盖 [base, total)");
+
+        // 重写控制文件后往返一次：仍是可用段表，进度不回退
+        w.save_ctrl(true).unwrap();
+        let w2 = Writer::bootstrap(
+            &path,
+            &ctrl,
+            "http://x/broken.bin",
+            total,
+            &opts,
+            &stats,
+            &notify,
+            &fatal,
+            &desired,
+        )
+        .unwrap();
+        assert!(!w2.finished(), "重写后的控制文件必须可用");
+        assert_eq!(w2.todo, 2 * mb);
     }
 
     /// 定向收缩：优先收缩调度器指认的慢段（尾部重建入队）；

@@ -807,7 +807,7 @@ pub fn status_json(task: &Task) -> Value {
             .map(|(i, f)| {
                 json!({
                     "index": (i + 1).to_string(),
-                    "path": format!("{}/{}", meta.info.name, f.path.join("/")),
+                    "path": meta.info.file_rel_path(f),
                     "length": f.length.to_string(),
                     "completedLength": per_file.get(i).copied().unwrap_or(0).to_string(),
                     "selected": is_selected(i).to_string(),
@@ -946,7 +946,7 @@ pub fn status_json_native(task: &Task) -> Value {
             .map(|(i, f)| {
                 json!({
                     "index": i + 1,
-                    "path": format!("{}/{}", meta.info.name, f.path.join("/")),
+                    "path": meta.info.file_rel_path(f),
                     "length": f.length,
                     "completedLength": per_file.get(i).copied().unwrap_or(0),
                     "selected": is_selected(i),
@@ -1072,6 +1072,9 @@ mod tests {
             piece_length: 10,
             pieces: vec![[0u8; 20]; count],
             files,
+            // 助手构造的是 `files` 列表形态（BEP 3 多文件模式），
+            // 结构位如实置 true：哪怕只有 1 项也不能靠 files.len() 推断
+            multi_file: true,
             private: false,
         }
     }

@@ -81,5 +81,7 @@ required-features = ["tui"]
 [profile.release]
 lto = "fat"
 codegen-units = 1
-opt-level = "s"
+# 性能优先：opt-level="s" 会关闭向量化与部分循环优化，BT 收发、SHA-1 校验、
+# 分片读写等热点明显变慢；二进制体积由 lto + strip 控制，仍保持单文件发布。
+opt-level = 3
 strip = true

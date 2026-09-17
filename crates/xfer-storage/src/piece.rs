@@ -42,6 +42,14 @@ impl PieceMap {
         self.bits[(i / 8) as usize] & (0x80 >> (i % 8)) != 0
     }
 
+    /// 清除单片标记（写回缓存中的片落盘前，位图不得声称它已完成）。
+    pub fn unset(&mut self, i: u32) {
+        if i < self.count {
+            let byte = &mut self.bits[(i / 8) as usize];
+            *byte &= !(0x80 >> (i % 8));
+        }
+    }
+
     pub fn done_count(&self) -> u32 {
         self.bits
             .iter()
@@ -109,6 +117,13 @@ impl PieceMap {
 pub struct PieceLayout {
     pub piece_length: u64,
     pub files: Vec<FileLayout>,
+    /// BEP 3 多文件模式：落盘路径为 `<name>/<path 段拼接>`；
+    /// false（单文件种子）落盘路径就是 `<name>`。
+    ///
+    /// 不能用 `files.len() == 1` 代替：只有 1 个文件的多文件种子同样是
+    /// 1 项 `files`，但它的文件必须放在 `<name>/` 目录里面。判据只能来自
+    /// 种子结构本身（[`xfer_bencode`] 的 `Info::multi_file`）。
+    pub multi_file: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +139,7 @@ impl PieceLayout {
     /// 构建布局：`files` 为 (路径段, 长度) 列表。
     pub fn new(piece_length: u64, files: Vec<(Vec<String>, u64)>) -> Self {
         let mut offset = 0u64;
-        let files = files
+        let files: Vec<FileLayout> = files
             .into_iter()
             .map(|(path, length)| {
                 let f = FileLayout {
@@ -136,10 +151,37 @@ impl PieceLayout {
                 f
             })
             .collect();
+        // 与历史启发式逐字节一致（`single = files.len()==1 &&
+        // files[0].path.len()==1`）：只有 1 项**且**路径仅 1 段才当单文件，
+        // 否则按多文件。1 项但路径嵌套的种子本来就走 `<name>/<path>`，
+        // 不能被改成单文件。真正有歧义的只有「1 项且 1 段」这一种情形
+        //（单文件种子 vs 只有 1 个文件的多文件种子），调用方需用
+        // [`Self::with_multi_file`] 传种子结构位来消歧。
+        let multi_file = !(files.len() == 1 && files[0].path.len() == 1);
         Self {
             piece_length,
             files,
+            multi_file,
         }
+    }
+
+    /// 声明是否 BEP 3 多文件模式（返回自身，便于链式构造）。
+    ///
+    /// 调用方应传种子里解析出的结构位（`Info::multi_file`），
+    /// 不要再用 `files.len()` 推断。
+    pub fn with_multi_file(mut self, multi_file: bool) -> Self {
+        self.multi_file = multi_file;
+        self
+    }
+
+    /// 是否单文件种子布局（落盘路径就是 `<name>`）。
+    ///
+    /// 判据同时要求「结构位是非多文件」**且**「只有 1 个文件」：结构位与
+    /// 文件数互相矛盾时（外部用 [`Self::with_multi_file`] 传错，或字段被
+    /// 直接改写）按多文件处理——否则 N 个句柄会全部指向 `root/<name>`
+    /// 互相覆盖，写出的文件内容静默错乱。
+    pub fn is_single_file(&self) -> bool {
+        !self.multi_file && self.files.len() == 1
     }
 
     pub fn total_length(&self) -> u64 {
@@ -307,6 +349,59 @@ struct OpenFile {
     path: PathBuf,
 }
 
+/// 旧版单文件布局迁移：把 `<root>/<name>` 这个**普通文件**搬进
+/// `<root>/<name>/<file>`。
+///
+/// 背景：旧版用 `files.len() == 1 && path.len() == 1` 判断单文件，于是
+/// 「只有 1 个文件的多文件种子」的数据被落成 `<root>/<name>` 这个普通文件。
+/// 升级后这类种子要落在 `<root>/<name>/<file>`，若不处理，`create_dir_all`
+/// 会因同名文件存在而失败——任务启动即报「打开 piece 存储失败」，已下载的
+/// 数据也悬在旧路径上没人管。
+///
+/// 只在「目标位置已被普通文件占用」时动手：文件数 >1 时该位置不可能是本
+/// 任务的数据（旧版多文件种子本来就走目录），保持报错交还给用户处理。
+fn migrate_legacy_single_entry_layout(dir: &Path, layout: &PieceLayout) -> std::io::Result<()> {
+    let Ok(md) = std::fs::symlink_metadata(dir) else {
+        return Ok(()); // 不存在：正常新建目录
+    };
+    if md.is_dir() {
+        return Ok(()); // 已是新布局
+    }
+    if md.file_type().is_symlink() || layout.files.len() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{} 已存在且不是目录（不是旧版单文件布局，无法自动迁移）",
+                dir.display()
+            ),
+        ));
+    }
+    let dst = dir.join(layout.files[0].path.iter().collect::<PathBuf>());
+    let tmp = dir.with_extension("xfer-legacy");
+    // 先挪到同层临时名腾出位置，建好目录后再放进 <dir>/<file>
+    std::fs::rename(dir, &tmp)?;
+    match std::fs::create_dir_all(dir).and_then(|_| {
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&tmp, &dst)
+    }) {
+        Ok(()) => {
+            tracing::warn!(
+                from = %dir.display(),
+                to = %dst.display(),
+                "检测到旧版落盘布局，已迁移为 <目录>/<文件>（保留已下载数据）"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // 回滚：尽量把数据放回原位，别让用户找不到数据
+            let _ = std::fs::rename(&tmp, dir);
+            Err(e)
+        }
+    }
+}
+
 impl PieceStore {
     /// 打开（必要时创建）存储。
     ///
@@ -329,12 +424,18 @@ impl PieceStore {
             || wanted_set
                 .as_ref()
                 .is_some_and(|s| !s.is_empty());
-        let single = layout.files.len() == 1 && layout.files[0].path.len() == 1;
+        // 单文件 / 多文件由布局的结构位决定（不能用 `files.len()==1` 猜：
+        // 只有 1 个文件的多文件种子同样是 1 项，但必须落在 `<name>/` 里）。
+        let single = layout.is_single_file();
         let base = if single {
             root.join(name)
         } else {
             let d = root.join(name);
             if any_wanted {
+                // 旧版把这种种子写成 `<root>/<name>` 这个**普通文件**：直接
+                // 建目录会因同名文件存在而失败（任务启动即报错）。先把旧文件
+                // 搬进新目录，保住已下载的数据。
+                migrate_legacy_single_entry_layout(&d, &layout)?;
                 std::fs::create_dir_all(&d)?;
             }
             d
@@ -670,6 +771,24 @@ impl PieceStore {
         self.map.to_bitfield()
     }
 
+    /// **已落盘**片位图：写回缓存中尚未 flush 的片按「未完成」呈现。
+    ///
+    /// 续传控制文件必须用它而不是 [`Self::bitfield`]——`bitfield` 反映的是
+    /// `mark_done` 的即时结果，而开启 `disk-cache` 后片的字节只在内存
+    /// （FIFO 回写缓冲），此时若把位图写进续传文件，进程崩溃/断电后按位图
+    /// 恢复就会重现「已完成的空洞」（[`Self::flush_all`] 的文档不变式）。
+    /// 代价只是崩溃后重下缓存里那几个片，远小于静默产出损坏文件的代价。
+    pub fn durable_bitfield(&self) -> Vec<u8> {
+        if self.cache_limit == 0 || self.write_cache.is_empty() {
+            return self.bitfield();
+        }
+        let mut map = self.map.clone();
+        for c in &self.write_cache {
+            map.unset(c.index);
+        }
+        map.to_bitfield()
+    }
+
     /// 刷盘全部已打开文件（先把写回缓存落盘，再 flush + sync 各句柄）。
     ///
     /// 顺序是上层不变式的前提：续传位图落盘前必须保证位图对应的片数据
@@ -939,6 +1058,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
+    /// 只有 1 个文件的**多文件**种子必须落在 `<name>/` 目录里。
+    ///
+    /// 回归点：`open` 此前用 `files.len()==1 && path.len()==1` 猜单文件，
+    /// 于是「1 项 files 列表」的多文件种子被当成单文件——文件写成
+    /// `root/<name>`（占了目录名，文件自己的路径段被整个丢掉）。判据必须是
+    /// 种子结构位（`PieceLayout::multi_file`），不能靠项数推断。
+    #[test]
+    fn single_entry_multi_file_writes_into_named_dir() {
+        let dir = std::env::temp_dir().join(format!("xfer-piece-multi1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layout =
+            PieceLayout::new(10, vec![(vec!["movie.mkv".into()], 20)]).with_multi_file(true);
+        let store = PieceStore::open(&dir, "Best Movie", layout, None).unwrap();
+        let expected = dir.join("Best Movie").join("movie.mkv");
+        assert_eq!(store.file_paths(), vec![expected.clone()]);
+        assert!(expected.exists(), "文件必须落在 <name>/<path> 里");
+        assert!(
+            dir.join("Best Movie").is_dir(),
+            "<name> 必须仍是目录，不能被同名文件占掉"
+        );
+
+        // 对照：同样 1 项、1 段路径，但结构位是单文件种子 → 直接写 <name>
+        let dir2 =
+            std::env::temp_dir().join(format!("xfer-piece-single1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir2);
+        let layout = PieceLayout::new(10, vec![(vec!["movie.mkv".into()], 20)]);
+        assert!(!layout.multi_file, "1 项 + 1 段路径的默认判定仍是单文件");
+        let store = PieceStore::open(&dir2, "movie.mkv", layout, None).unwrap();
+        assert_eq!(store.file_paths(), vec![dir2.join("movie.mkv")]);
+        assert!(dir2.join("movie.mkv").is_file());
+
+        // 嵌套路径的 1 项种子历史行为也是多文件（不能被这次改动改掉）
+        let layout = PieceLayout::new(10, vec![(vec!["sub".into(), "a.bin".into()], 20)]);
+        assert!(layout.multi_file, "路径嵌套的 1 项种子一直按多文件处理");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// 旧版把 1 项多文件种子落成 `<root>/<name>` **普通文件**：升级后 open
+    /// 必须把它搬进 `<root>/<name>/<file>`，而不是因同名文件无法建目录而
+    /// 报错（否则任务启动即失败、已下载数据悬在旧路径上没人管）。
+    #[test]
+    fn legacy_single_file_layout_is_migrated_into_dir() {
+        let dir = std::env::temp_dir().join(format!("xfer-piece-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 旧版布局：数据在 <root>/Best Movie（普通文件）
+        let legacy = dir.join("Best Movie");
+        std::fs::write(&legacy, b"OLD-DATA").unwrap();
+
+        let layout =
+            PieceLayout::new(10, vec![(vec!["movie.bin".into()], 20)]).with_multi_file(true);
+        let store = PieceStore::open(&dir, "Best Movie", layout, None).unwrap();
+        let new_path = dir.join("Best Movie").join("movie.bin");
+        assert!(
+            legacy.is_dir(),
+            "旧位置应变成目录（文件已被搬进 <name>/<file>）"
+        );
+        assert!(
+            std::fs::read(&new_path).unwrap() == b"OLD-DATA",
+            "已下载数据必须随迁移保留"
+        );
+        assert_eq!(store.file_paths(), vec![new_path]);
+
+        // 对照：文件数 >1 时 `<name>` 不可能是本任务的数据 → 明确报错，绝不误搬
+        let dir2 = std::env::temp_dir().join(format!("xfer-piece-mig2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        let foreign = dir2.join("Best Movie");
+        std::fs::write(&foreign, b"NOT-OURS").unwrap();
+        let layout = PieceLayout::new(
+            10,
+            vec![(vec!["a.bin".into()], 10), (vec!["b.bin".into()], 10)],
+        )
+        .with_multi_file(true);
+        let err = match PieceStore::open(&dir2, "Best Movie", layout, None) {
+            Err(e) => e,
+            Ok(_) => panic!("外来文件占位时必须报错，不得静默搬走"),
+        };
+        assert!(foreign.is_file(), "外来文件必须原样保留");
+        assert!(err.to_string().contains("无法自动迁移"), "错误信息: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// 结构位与文件数矛盾（multi_file=false 却给 2 个文件）必须按多文件兜底：
+    /// 否则 N 个句柄全部指向 `<name>`，写入内容互相覆盖且无任何报错。
+    #[test]
+    fn inconsistent_layout_falls_back_to_multi() {
+        let layout = PieceLayout::new(
+            10,
+            vec![(vec!["a.bin".into()], 10), (vec!["b.bin".into()], 10)],
+        )
+        .with_multi_file(false);
+        assert!(!layout.is_single_file(), "矛盾结构必须按多文件兜底");
+    }
+
     #[test]
     fn verify_piece_matches() {
         let data = b"hello bt";
@@ -990,6 +1208,37 @@ mod tests {
         assert!(!store.write_cache_contains(0));
         let f = std::fs::read(&data).unwrap();
         assert_eq!(&f[..10], &p0[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 持久化位图不得领先于磁盘：仍在写回缓存里的片必须按「未完成」呈现。
+    ///
+    /// 回归点：续传控制文件此前用 `bitfield()`（= mark_done 的即时结果），
+    /// 开启 disk-cache 后片数据只在内存——崩溃后按这份位图恢复，会重现
+    /// 「已完成的空洞」并静默产出损坏文件。
+    #[test]
+    fn durable_bitfield_excludes_unflushed_pieces() {
+        let (dir, mut store, data) = cache_store("durable");
+        // 无缓存时两者一致（直写路径：mark_done 即已落盘）
+        store.write_piece(0, &vec![7u8; 10]).unwrap();
+        store.mark_done(0);
+        assert_eq!(store.durable_bitfield(), store.bitfield());
+        store.flush_write_cache().unwrap();
+
+        // 开启缓存：片 1 只进内存 → 只出现在 bitfield，不出现在 durable
+        store.set_write_cache_limit(4096).unwrap();
+        store.write_piece(1, &vec![9u8; 10]).unwrap();
+        store.mark_done(1);
+        let live = store.bitfield();
+        let durable = store.durable_bitfield();
+        assert_eq!(live.len(), durable.len());
+        assert_eq!(live[0] & 0b1100_0000, 0b1100_0000, "bitfield 应含片 0/1");
+        assert_eq!(durable[0] & 0b1000_0000, 0b1000_0000, "片 0 已落盘应保留");
+        assert_eq!(durable[0] & 0b0100_0000, 0, "片 1 未落盘不得声称完成");
+        // 落盘后重新对齐
+        assert_eq!(std::fs::metadata(&data).unwrap().len(), 10, "片 1 尚未落盘");
+        store.flush_write_cache().unwrap();
+        assert_eq!(store.durable_bitfield(), store.bitfield());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -226,9 +226,119 @@ async fn add_torrent_downloads_and_completes() {
     let out = std::fs::read(dir.join("bt-data.bin")).unwrap();
     assert_eq!(out, data, "下载文件与源数据不一致");
 
+    // 单文件种子：展示路径就是 `<name>`（不能前置成 `<name>/<name>`），
+    // 且 verifyFiles 必须按同一路径找到文件（否则明明下载成功却报 missing）
+    let st = mgr.tell_status_native(&gid, None).unwrap();
+    assert_eq!(st["files"][0]["path"], "bt-data.bin");
+    let r = mgr.verify_task_files(&gid, "size").unwrap();
+    assert_eq!(r["status"], "ok", "单文件种子校验结果: {r}");
+    assert!(r["missing"].as_array().unwrap().is_empty());
+
     // getPeers 应有记录
     let peers = mgr.get_peers(&gid).unwrap();
     assert!(!peers.as_array().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 构造**只有 1 个文件的多文件**种子（info 用 `files` 列表而非 `length`）。
+fn make_single_entry_multi_torrent_b64(data: &[u8], tracker_url: &str, dir_name: &str) -> String {
+    let pieces: Vec<u8> = data.chunks(PIECE_LEN).flat_map(sha1_of).collect();
+    let info = dict(BTreeMap::from([
+        (b"name".to_vec(), bytes(dir_name)),
+        (b"piece length".to_vec(), int(PIECE_LEN as i64)),
+        (
+            b"files".to_vec(),
+            xfer_bencode::list(vec![dict(BTreeMap::from([
+                (b"length".to_vec(), int(data.len() as i64)),
+                (
+                    b"path".to_vec(),
+                    xfer_bencode::list(vec![bytes("movie.bin")]),
+                ),
+            ]))]),
+        ),
+        (b"pieces".to_vec(), bytes(pieces)),
+    ]));
+    let top = dict(BTreeMap::from([
+        (b"announce".to_vec(), bytes(tracker_url)),
+        (b"info".to_vec(), info),
+    ]));
+    base64::engine::general_purpose::STANDARD.encode(encode(&top))
+}
+
+/// 只有 1 个文件的多文件种子：落盘进 `<name>/`，且 `files[].path` 与
+/// `task.verifyFiles` 的校验路径都按 `<name>/<file>` 展开。
+///
+/// 回归点：单文件/多文件的判据此前是 `files.len() == 1`，于是这种种子的
+/// 文件被写成 `<dir>/<name>`（一个文件占了目录名、路径段被丢掉）；同时
+/// `verifyFiles` 用 `{name}/{path}` 拼展示路径，真正的单文件种子会得到
+/// `<name>/<name>` → 文件明明在盘上却被判成 missing。
+#[tokio::test]
+async fn single_entry_multi_file_torrent_uses_named_dir() {
+    let dir = std::env::temp_dir().join(format!("xfer-engine-bt-m1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let data: Vec<u8> = (0..(2 * PIECE_LEN + 31))
+        .map(|i| (i.wrapping_mul(97) % 251) as u8)
+        .collect();
+    init_tracing();
+
+    let (taddr, seed_ref) = start_tracker().await;
+    let tracker_url = format!("http://{taddr}/announce");
+    let dir_name = "Best Movie";
+    let tb64 = make_single_entry_multi_torrent_b64(&data, &tracker_url, dir_name);
+    let meta = parse_torrent(
+        &base64::engine::general_purpose::STANDARD
+            .decode(&tb64)
+            .unwrap(),
+    )
+    .unwrap();
+    // 结构位必须来自种子：1 项 files 列表 = 多文件
+    assert!(meta.info.multi_file, "有 files 列表就是多文件种子");
+    let ih = InfoHash::from_bytes(&meta.info_hash);
+
+    let (sl, saddr) = bind_random().await;
+    *seed_ref.write().unwrap() = Some(saddr);
+    let pid = PeerId::azureus_prefix(&[0x42; 12]);
+    tokio::spawn(serve_seed(sl, Arc::new(data.clone()), ih, pid));
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = mgr
+        .add_torrent(&tb64, &serde_json::json!({}), None)
+        .expect("addTorrent 应成功");
+
+    let mut done = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let st = mgr.tell_status_native(&gid, None).unwrap();
+        if st["status"] == "complete" {
+            done = true;
+            break;
+        }
+        if st["status"] == "error" {
+            panic!("任务进入 error: {st:?}");
+        }
+    }
+    assert!(done, "1 项多文件种子 30s 内未完成");
+
+    // 落盘位置：<dir>/<name>/<file>
+    let expected = dir.join(dir_name).join("movie.bin");
+    assert!(
+        dir.join(dir_name).is_dir(),
+        "<name> 必须是目录（不能被同名文件占掉）"
+    );
+    assert_eq!(std::fs::read(&expected).unwrap(), data, "落盘内容不一致");
+
+    // RPC 展示路径与实际落盘口径一致
+    let st = mgr.tell_status_native(&gid, None).unwrap();
+    assert_eq!(st["files"][0]["path"], "Best Movie/movie.bin");
+
+    // verifyFiles 必须按同一路径找文件（此前会拼成 <name>/<name> 报 missing）
+    let r = mgr.verify_task_files(&gid, "size").unwrap();
+    assert_eq!(r["status"], "ok", "校验结果: {r}");
+    assert_eq!(r["count"], 1);
+    assert!(r["missing"].as_array().unwrap().is_empty());
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

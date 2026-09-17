@@ -643,6 +643,12 @@ pub fn encode_response_v6(
 }
 
 /// 编码 get_peers 响应（带 peers）。
+///
+/// BEP 5/BEP 32：`values` 字段是 6 字节 IPv4 compact，`peers6` 是
+/// 18 字节 IPv6 compact。IPv6 peer 一律走 `peers6`——此前统一经
+/// [`PeerAddr::encode_compact`] 编进 `values`，IPv6 地址的 4 个 IP 字节
+/// 被填成 0，于是对外发出 `0.0.0.0:port`（端口非 0 能过接收侧过滤），
+/// 拿到它的客户端会对 0.0.0.0 发起连接（本机自身）。
 pub fn encode_get_peers_response_with_peers(
     tid: &[u8],
     our_id: &NodeId,
@@ -653,15 +659,34 @@ pub fn encode_get_peers_response_with_peers(
     r.insert(b"id".to_vec(), Value::Bytes(our_id.as_bytes().to_vec()));
     let values: Vec<Value> = peers
         .iter()
+        .filter(|p| p.addr.is_ipv4())
         .map(|p| Value::Bytes(p.encode_compact().to_vec()))
         .collect();
     r.insert(b"values".to_vec(), Value::List(values));
+    let peers6 = encode_peers6_compact(peers);
+    if !peers6.is_empty() {
+        r.insert(b"peers6".to_vec(), Value::Bytes(peers6));
+    }
     r.insert(b"token".to_vec(), Value::Bytes(token.to_vec()));
     let mut top = BTreeMap::new();
     top.insert(b"t".to_vec(), Value::Bytes(tid.to_vec()));
     top.insert(b"y".to_vec(), Value::Bytes(b"r".to_vec()));
     top.insert(b"r".to_vec(), Value::Dict(r));
     encode(&Value::Dict(top))
+}
+
+/// peers6 compact：每 18 字节 = 16 字节 IPv6 + 2 字节端口（BE）。
+/// 非 IPv6 项跳过；全无 IPv6 时返回空（调用方据此不写该字段）。
+fn encode_peers6_compact(peers: &[PeerAddr]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in peers {
+        let std::net::IpAddr::V6(v6) = p.addr.ip() else {
+            continue;
+        };
+        out.extend_from_slice(&v6.octets());
+        out.extend_from_slice(&p.addr.port().to_be_bytes());
+    }
+    out
 }
 
 /// 编码错误响应。
@@ -919,6 +944,52 @@ mod tests {
         let parsed = parse_response(&wire, &tid).unwrap();
         assert_eq!(parsed.nodes.len(), 1);
         assert!(parsed.nodes[0].addr.is_ipv4());
+    }
+
+    /// IPv6 peer 不得被编成 `0.0.0.0` 混进 `values`（BEP 5 的 values 只有
+    /// 6 字节 IPv4 compact），必须走 `peers6`。
+    ///
+    /// 回归点：此前所有 peer 统一经 `encode_compact`，IPv6 的 4 个 IP 字节
+    /// 被填 0 → 对外发出 `0.0.0.0:port`。端口非 0 能过接收侧过滤，拿到它的
+    /// 客户端会把 0.0.0.0 当 peer 去连（连自己）。
+    #[test]
+    fn get_peers_response_keeps_ipv6_out_of_values() {
+        let tid = gen_tid();
+        let our = NodeId::random();
+        let peers = vec![
+            PeerAddr {
+                addr: "1.2.3.4:6881".parse().unwrap(),
+            },
+            PeerAddr {
+                addr: "[2001:db8::5]:6882".parse().unwrap(),
+            },
+        ];
+        let wire = encode_get_peers_response_with_peers(&tid, &our, &peers, b"tok");
+        let v = decode(&wire).unwrap();
+        let r = v.as_dict().unwrap().get(b"r".as_slice()).unwrap();
+        let rd = r.as_dict().unwrap();
+
+        let values = rd.get(b"values".as_slice()).unwrap().as_list().unwrap();
+        assert_eq!(values.len(), 1, "values 只应含 IPv4 peer");
+        let c = values[0].as_bytes().unwrap();
+        assert_eq!(&c[0..4], &[1, 2, 3, 4]);
+        assert_ne!(&c[0..4], &[0, 0, 0, 0], "不得把 IPv6 编成 0.0.0.0");
+
+        let peers6 = rd
+            .get(b"peers6".as_slice())
+            .expect("IPv6 peer 必须走 peers6 字段")
+            .as_bytes()
+            .unwrap();
+        assert_eq!(peers6.len(), 18);
+        assert_eq!(&peers6[..16], &"2001:db8::5".parse::<std::net::Ipv6Addr>().unwrap().octets());
+        assert_eq!(u16::from_be_bytes([peers6[16], peers6[17]]), 6882);
+
+        // 往返：解析回来应同时看到 v4 与 v6 peer
+        let parsed = parse_get_peers_response(&wire, &tid).unwrap();
+        let got = parsed.peers.expect("应有 peer");
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().any(|p| p.addr.is_ipv4()));
+        assert!(got.iter().any(|p| p.addr.is_ipv6()));
     }
 
     #[test]

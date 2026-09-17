@@ -254,6 +254,9 @@ pub struct TaskManager {
     events: broadcast::Sender<EngineEvent>,
     /// HTTP 客户端（按 `user-agent` / `all-proxy` 全局选项构建，变更时重建）。
     client: std::sync::RwLock<reqwest::Client>,
+    /// 上次落盘会话内容的哈希：内容未变化时跳过写盘（30s 定期保存此前
+    /// 无条件重写整份会话——分片位图可达数百 KB，空闲时纯属重复 IO）。
+    session_hash: std::sync::atomic::AtomicU64,
     /// RPC shutdown 触发的整体退出令牌。
     shutdown_token: CancellationToken,
 }
@@ -287,6 +290,7 @@ impl TaskManager {
             sub_pending: Mutex::new(Vec::new()),
             events: tx,
             client: std::sync::RwLock::new(xfer_http::build_client()),
+            session_hash: std::sync::atomic::AtomicU64::new(0),
             shutdown_token: CancellationToken::new(),
         })
     }
@@ -788,21 +792,50 @@ impl TaskManager {
     }
 
     /// 立即保存会话（未开启持久化时为空操作）。
+    ///
+    /// 内容与上次落盘一致时跳过写盘：定期保存每 30s 触发一次，而分片位图
+    /// 会让会话文件达到数百 KB，空闲（暂停/做种/无变化）时反复重写纯属
+    /// 无谓磁盘 IO 与 SSD 写入量。
     fn save_session_now(&self) {
         let path = self.inner.lock().unwrap().session.clone();
         let Some(path) = path else { return };
         let v = self.session_json();
+        let text = match serde_json::to_string_pretty(&v) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "会话序列化失败");
+                return;
+            }
+        };
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut h);
+            h.finish()
+        };
+        if self
+            .session_hash
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == hash
+        {
+            tracing::trace!(path = %path.display(), "会话内容未变化，跳过写入");
+            return;
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let tmp = path.with_extension("json.tmp");
-        match serde_json::to_string_pretty(&v)
+        match std::fs::write(&tmp, text)
             .map_err(|e| e.to_string())
-            .and_then(|text| {
-                std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-                std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
-            }) {
-            Ok(()) => tracing::debug!(path = %path.display(), "会话已保存"),
+            .and_then(|_| std::fs::rename(&tmp, &path).map_err(|e| e.to_string()))
+        {
+            Ok(()) => {
+                // 写成功后才记账：写失败（磁盘满/权限）不能被当成已落盘，
+                // 否则内容不变的后续保存会一直跳过，文件永远是旧的
+                self.session_hash
+                    .store(hash, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(path = %path.display(), "会话已保存");
+            }
             Err(e) => tracing::warn!(path = %path.display(), error = %e, "会话保存失败"),
         }
     }
@@ -2327,7 +2360,7 @@ impl TaskManager {
                     // 未选择的文件不属于本次下载，不参与校验
                     .filter(|(i, _)| is_selected(*i))
                     .map(|(_, f)| {
-                        let label = format!("{}/{}", meta.info.name, f.path.join("/"));
+                        let label = meta.info.file_rel_path(f);
                         let abs = if Path::new(&label).is_absolute() {
                             PathBuf::from(&label)
                         } else {

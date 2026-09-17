@@ -1137,7 +1137,10 @@ impl TorrentEngine {
             .iter()
             .map(|f| (f.path.clone(), f.length))
             .collect();
-        let layout = PieceLayout::new(meta.info.piece_length, files);
+        // 单文件/多文件由种子结构位决定（`files.len()==1` 无法区分
+        // 「单文件种子」与「只有 1 个文件的多文件种子」）
+        let layout =
+            PieceLayout::new(meta.info.piece_length, files).with_multi_file(meta.info.multi_file);
         let total_bytes = layout.total_length();
         // 按文件选择建库：None 全量；Some(索引) 只建所选文件；
         // Some(空) = 磁力等待勾选占位，不创建任何数据文件
@@ -1168,7 +1171,7 @@ impl TorrentEngine {
             // 稀疏文件，逻辑长度（含空洞）达标而磁盘占用不足说明数据
             // 并未真正落盘，绝不能整文件标记完成（否则以坏数据做种）。
             let complete = meta.info.files.iter().all(|f| {
-                let path = if meta.info.files.len() == 1 {
+                let path = if !meta.info.multi_file {
                     config.dir.join(&meta.info.name)
                 } else {
                     config
@@ -1335,7 +1338,10 @@ impl TorrentEngine {
             .iter()
             .map(|f| (f.path.clone(), f.length))
             .collect();
-        let layout = PieceLayout::new(meta.info.piece_length, files);
+        // 单文件/多文件由种子结构位决定（`files.len()==1` 无法区分
+        // 「单文件种子」与「只有 1 个文件的多文件种子」）
+        let layout =
+            PieceLayout::new(meta.info.piece_length, files).with_multi_file(meta.info.multi_file);
         let total_bytes = layout.total_length();
         // 按文件选择建库（与 TorrentEngine::new 同语义）：
         // 磁力等待勾选期间 selected_files=Some(空) → 不创建任何数据文件，
@@ -1363,7 +1369,7 @@ impl TorrentEngine {
             // 双口径判定，理由同 TorrentEngine::new：稀疏文件的逻辑
             // 长度不可信，磁盘占用不足不得整文件标记完成。
             let complete = meta.info.files.iter().all(|f| {
-                let path = if meta.info.files.len() == 1 {
+                let path = if !meta.info.multi_file {
                     self.config.dir.join(&meta.info.name)
                 } else {
                     self.config
@@ -1919,13 +1925,16 @@ impl TorrentEngine {
             tokio::select! {
                 _ = cancel.cancelled() => {
                     // 先停掉所有后台任务（peer 会话/监听器/连接派发），
-                    // 再持久化续传控制文件：否则僵尸任务在暂停后继续下载、
-                    // 更新控制文件 → 恢复时进度凭空跳变
+                    // 再落缓存、最后持久化续传控制文件：否则僵尸任务在暂停
+                    // 后继续下载、更新控制文件 → 恢复时进度凭空跳变。
+                    // flush_all 必须在 save_resume 之前：先把写回缓存里的片
+                    // 真正落盘，续传位图才能完整声明它们（顺序颠倒时干净的
+                    // 暂停也会按"缓存里的片未落盘"少记进度，恢复后重下）。
                     self.stop_background();
-                    self.save_resume(true);
                     if let Some(store) = self.store.lock().unwrap().as_mut() {
                         store.flush_all().ok();
                     }
+                    self.save_resume(true);
                     self.announce_all_sync(Some("stopped"));
                     return Err("BT 任务已取消".into());
                 }
@@ -5761,7 +5770,10 @@ impl TorrentEngine {
             let Some(store) = guard.as_ref() else {
                 return;
             };
-            (store.bitfield(), store.piece_count())
+            // durable_bitfield 而非 bitfield：开启 disk-cache 时已完成片
+            // 可能还在内存回写缓冲里，位图不得领先于磁盘（崩溃后按位图
+            // 恢复会重现"已完成的空洞"，产出静默损坏的文件）。
+            (store.durable_bitfield(), store.piece_count())
         };
         let info_hash = self.info_hash;
         if force {
@@ -6009,7 +6021,7 @@ fn restore_resume(
     };
     // 各文件现有磁盘长度
     let layout = store.layout();
-    let single = layout.files.len() == 1 && layout.files[0].path.len() == 1;
+    let single = layout.is_single_file();
     let base = dir.join(name);
     let lens: Vec<u64> = layout
         .files
