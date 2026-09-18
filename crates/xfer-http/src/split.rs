@@ -95,6 +95,12 @@ pub struct SplitOptions {
     pub adaptive: Option<AdaptiveConfig>,
     /// 全局限速器（None = 不限速）：所有连接共享，读循环消费令牌。
     pub limiter: Option<Arc<RateLimiter>>,
+    /// 逐任务自定义请求头（`Referer` / `Cookie` / `User-Agent` 等）。
+    ///
+    /// 必须用 [`crate::parse_header_lines`] 产出（已滤掉非法项与
+    /// `Range` / `Host` 等会破坏分段语义的头）；每个分片请求都会带上，
+    /// 否则受保护地址只对缺头的请求回 403，整条任务必然失败。
+    pub headers: crate::RequestHeaders,
 }
 
 /// 引擎轮询的进度句柄（无锁原子）。
@@ -396,6 +402,9 @@ pub async fn download_split(
         .map_err(|e| HttpError::Io(e.to_string()))?;
     desired_workers.store(nworkers, Ordering::Release);
 
+    // 逐任务自定义请求头：所有分片协程共享一份（Arc），每个段请求都带上。
+    let headers: Arc<crate::RequestHeaders> = Arc::new(opts.headers.clone());
+
     // 拉起一个工作协程（初始并发与自适应补拉共用；panic 隔离：
     // 转 Fatal，不让任务静默消失造成死等）。
     let url_arc: Arc<str> = Arc::from(url);
@@ -408,6 +417,7 @@ pub async fn download_split(
             stop: stop.clone(),
             perf_tx: adaptive_tx.clone(),
             limiter: opts.limiter.clone(),
+            headers: Arc::clone(&headers),
         };
         tokio::spawn(run_worker_guarded(ctx))
     };
@@ -1377,6 +1387,9 @@ struct WorkerCtx {
     perf_tx: Option<mpsc::UnboundedSender<ConnPerf>>,
     /// 全局限速器（None = 不限速）。
     limiter: Option<Arc<RateLimiter>>,
+    /// 逐任务自定义请求头（见 [`SplitOptions::headers`]）。Arc 共享：
+    /// 每个工作协程各持一份引用，不重复拷贝整个头列表。
+    headers: Arc<crate::RequestHeaders>,
 }
 
 /// panic 隔离包装：协程 panic → 转致命错误，避免主流程死等。
@@ -1539,9 +1552,7 @@ async fn run_segment(
     // 性能采样开始
     let t_request_start = Instant::now();
 
-    let resp = ctx
-        .client
-        .get(&*ctx.url)
+    let resp = crate::apply_headers(ctx.client.get(&*ctx.url), &ctx.headers)
         .header("Range", format!("bytes={}-{}", from, end - 1))
         .send()
         .await
@@ -1905,6 +1916,7 @@ mod tests {
 
     fn opts(connections: usize, min_split: u64) -> SplitOptions {
         SplitOptions {
+            headers: crate::RequestHeaders::new(),
             connections,
             min_split_size: min_split,
             adaptive: None, // 测试默认不启用自适应
@@ -2510,6 +2522,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let opts = SplitOptions {
+            headers: crate::RequestHeaders::new(),
             connections: 4,
             min_split_size: 64 * 1024,
             adaptive: Some(AdaptiveConfig {
@@ -2558,6 +2571,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let opts = SplitOptions {
+            headers: crate::RequestHeaders::new(),
             connections: 4,
             min_split_size: 16 * 1024,
             adaptive: Some(AdaptiveConfig {
@@ -2594,6 +2608,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let opts = SplitOptions {
+            headers: crate::RequestHeaders::new(),
             connections: 4,
             min_split_size: 64 * 1024,
             adaptive: None, // 显式禁用
@@ -2625,6 +2640,7 @@ mod tests {
         let desired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stats = Arc::new(SplitStats::new(0));
         let opts = SplitOptions {
+            headers: crate::RequestHeaders::new(),
             connections: 4,
             min_split_size: 20 * 1024 * 1024,
             adaptive: None,
@@ -2696,6 +2712,7 @@ mod tests {
         let desired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stats = Arc::new(SplitStats::new(0));
         let opts = SplitOptions {
+            headers: crate::RequestHeaders::new(),
             connections: 2,
             min_split_size: 1024,
             adaptive: None,
@@ -2766,6 +2783,7 @@ mod tests {
         let desired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stats = Arc::new(SplitStats::new(0));
         let opts = SplitOptions {
+            headers: crate::RequestHeaders::new(),
             connections: 1,
             min_split_size: 1024,
             adaptive: None,
@@ -2822,6 +2840,7 @@ mod tests {
         let desired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stats = Arc::new(SplitStats::new(0));
         let opts = SplitOptions {
+            headers: crate::RequestHeaders::new(),
             connections: 2,
             min_split_size: 1024,
             adaptive: None,
@@ -2873,6 +2892,7 @@ mod tests {
         let desired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stats = Arc::new(SplitStats::new(0));
         let opts = SplitOptions {
+            headers: crate::RequestHeaders::new(),
             connections: 2,
             min_split_size: 1024,
             adaptive: None,
@@ -2965,6 +2985,7 @@ mod tests {
         let desired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stats = Arc::new(SplitStats::new(0));
         let opts = SplitOptions {
+            headers: crate::RequestHeaders::new(),
             connections: 2,
             min_split_size: 1024 * 1024,
             adaptive: None,
@@ -3053,6 +3074,7 @@ mod tests {
         let desired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stats = Arc::new(SplitStats::new(0));
         let opts = SplitOptions {
+            headers: crate::RequestHeaders::new(),
             connections: 2,
             min_split_size: 1024 * 1024,
             adaptive: None,
@@ -3107,6 +3129,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let opts = SplitOptions {
+            headers: crate::RequestHeaders::new(),
             // 初始只拉 1 个协程，扩充完全交给自适应调度
             connections: 1,
             min_split_size: 64 * 1024,
@@ -3138,5 +3161,112 @@ mod tests {
             peak >= 3,
             "自适应扩充未生效: peak={peak}（期望从 1 爬坡到 ≥3）"
         );
+    }
+
+    /// 分片下载的每个段请求都必须带上逐任务自定义请求头
+    /// （Referer / Cookie / User-Agent），否则受保护地址只对缺头的
+    /// 请求回 403，任务必然失败；同时调用方下发的 Range 不得覆盖
+    /// 引擎自己算的分段区间。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn split_requests_carry_custom_headers() {
+        let data = Arc::new(sample(256 * 1024));
+        type Seen = Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>;
+        let seen: Seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new().route(
+            "/file.bin",
+            axum::routing::get({
+                let data = data.clone();
+                let seen = seen.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let data = data.clone();
+                    let seen = seen.clone();
+                    async move {
+                        let get = |n: &str| {
+                            headers
+                                .get(n)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string()
+                        };
+                        let range = get("range");
+                        seen.lock().unwrap().push((
+                            get("referer"),
+                            get("cookie"),
+                            get("user-agent"),
+                            range.clone(),
+                        ));
+                        let total = data.len();
+                        let (from, to) = match range
+                            .strip_prefix("bytes=")
+                            .and_then(|r| r.split_once('-'))
+                        {
+                            Some((f, t)) => (
+                                f.trim().parse::<usize>().unwrap_or(0),
+                                t.trim()
+                                    .parse::<usize>()
+                                    .unwrap_or(total - 1)
+                                    .min(total - 1),
+                            ),
+                            None => (0, total - 1),
+                        };
+                        let body = data[from..=to].to_vec();
+                        let mut resp =
+                            axum::response::Response::new(axum::body::Body::from(body));
+                        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                        resp.headers_mut().insert(
+                            header::CONTENT_RANGE,
+                            HeaderValue::from_str(&format!(
+                                "bytes {}-{}/{}",
+                                from, to, total
+                            ))
+                            .unwrap(),
+                        );
+                        resp
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let url = format!("http://{addr}/file.bin");
+        let dir = tmpdir("custom-headers");
+        let path = dir.join("out.bin");
+        let opts = SplitOptions {
+            headers: crate::parse_header_lines([
+                "Referer: https://example.com/page",
+                "Cookie: sid=1",
+                "User-Agent: LerxuTest/1.0",
+                "Range: bytes=0-1", // 必须被丢弃，不得覆盖分段区间
+            ]),
+            connections: 3,
+            min_split_size: 32 * 1024,
+            adaptive: None,
+            limiter: None,
+        };
+        let done = download_split(
+            &crate::build_client(),
+            &url,
+            &path,
+            data.len() as u64,
+            &opts,
+            &CancellationToken::new(),
+            SplitStats::new(0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(done.total_len, data.len() as u64);
+        assert_file(&path, &data);
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() >= 2, "应发出多个段请求: {}", seen.len());
+        for (referer, cookie, ua, range) in seen.iter() {
+            assert_eq!(referer, "https://example.com/page");
+            assert_eq!(cookie, "sid=1");
+            assert_eq!(ua, "LerxuTest/1.0");
+            assert!(range.starts_with("bytes="), "段请求必须带区间: {range}");
+            assert_ne!(range, "bytes=0-1", "调用方下发的 Range 覆盖了分段区间");
+        }
     }
 }

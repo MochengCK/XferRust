@@ -9,6 +9,10 @@
 - 修复 NAT-PMP 的 TCP 端口映射从未生效（opcode 6 → RFC 6886 规定的 2）、DHT 路由表保存必 panic、版本号出现两位数时 peer-id 生成必 panic
 - 冷启动更快、空闲更省：DHT 查询超时 10s → 3s 且 bootstrap 与一轮迭代的 find_node 改为并发，release 构建改按性能优化（详见「构建与发布」）
 
+## 新特性
+
+- 逐任务自定义请求头真正下发：`header` 选项（`["Referer: https://…", "Cookie: a=b"]` 数组，或按 CRLF / LF 分行的字符串）与 `referer` / `user-agent` 便捷键现在会带到实际 HTTP 请求上——此前这些选项只被收进任务选项、下载时从未使用（客户端侧以为发了，实际静默丢弃），于是所有「必须有 `Referer` / `Cookie` 才能访问」的地址一律 403。探测、单连接、多连接分片三条路径使用同一组头（只给下载带头、探测不带，会因探测 403 判错总长与 Range 支持）；`Range` / `Host` / `Content-Length` / `Connection` / `Accept-Encoding` 一律忽略（覆盖它们会破坏分段、续传与虚拟主机路由），且不会注入 `Origin`
+
 ## 问题修复
 
 - 修复非 compact peer 列表中的 IPv6 地址被丢弃：此前把地址与端口拼成 `ip:port` 再解析，裸 IPv6 字面量必然失败（端口被吞进地址）导致整条 peer 丢失；现先按 IP 字面量解析再组装端口，单条非法只跳过该条

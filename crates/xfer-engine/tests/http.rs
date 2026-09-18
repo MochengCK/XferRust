@@ -633,3 +633,143 @@ async fn paused_elapsed_freezes() {
         "恢复后 elapsed 应继续累计: final={final_e} frozen={e2}"
     );
 }
+
+/// 需要请求头校验的模拟服务：必须同时带 `Referer: https://site.example/watch`、
+/// `Cookie: sid=42`、`User-Agent: LerxuTest/1.0`，否则 403。
+/// 返回 (地址, 放行次数, 拒绝次数)。
+async fn start_guarded_server(
+    data: Arc<Vec<u8>>,
+) -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let ok = Arc::new(AtomicUsize::new(0));
+    let denied = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/file.bin",
+        get({
+            let data = data.clone();
+            let ok = ok.clone();
+            let denied = denied.clone();
+            move |headers: axum::http::HeaderMap| {
+                let data = data.clone();
+                let ok = ok.clone();
+                let denied = denied.clone();
+                async move {
+                    let get = |n: &str| {
+                        headers
+                            .get(n)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    if get("referer") != "https://site.example/watch"
+                        || get("cookie") != "sid=42"
+                        || get("user-agent") != "LerxuTest/1.0"
+                    {
+                        denied.fetch_add(1, Ordering::SeqCst);
+                        return StatusCode::FORBIDDEN.into_response();
+                    }
+                    ok.fetch_add(1, Ordering::SeqCst);
+                    let total = data.len();
+                    let range = get("range");
+                    let (from, to) = match range
+                        .strip_prefix("bytes=")
+                        .and_then(|r| r.split_once('-'))
+                    {
+                        Some((f, t)) => (
+                            f.trim().parse::<usize>().unwrap_or(0),
+                            t.trim()
+                                .parse::<usize>()
+                                .unwrap_or(total - 1)
+                                .min(total - 1),
+                        ),
+                        None => (0, total - 1),
+                    };
+                    let body = data[from..=to].to_vec();
+                    let mut resp = Response::new(axum::body::Body::from(body));
+                    if range.is_empty() {
+                        *resp.status_mut() = StatusCode::OK;
+                    } else {
+                        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                        resp.headers_mut().insert(
+                            header::CONTENT_RANGE,
+                            HeaderValue::from_str(&format!(
+                                "bytes {}-{}/{}",
+                                from, to, total
+                            ))
+                            .unwrap(),
+                        );
+                    }
+                    resp
+                }
+            }
+        }),
+    );
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(l, app).await });
+    (addr, ok, denied)
+}
+
+/// 逐任务请求头必须端到端生效：只靠
+/// `Referer` / `Cookie` 才能下的地址（引擎曾把 header 选项收下后丢弃，
+/// 这类地址一律 403——本测试是该回归的守门人）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn custom_headers_unlock_protected_download() {
+    let data = Arc::new(sample(512 * 1024));
+    let (addr, ok, denied) = start_guarded_server(data.clone()).await;
+    let url = format!("http://{addr}/file.bin");
+
+    // 1) 不带请求头：必须判失败（守住「守卫真的在拦」，否则本测试无判别力）
+    let dir_plain = tmpdir("headers-plain");
+    let mgr = TaskManager::start(dir_plain.clone(), 2);
+    let gid = mgr
+        .add_uri(
+            vec![url.clone()],
+            &serde_json::json!({ "dir": dir_plain }),
+            None,
+        )
+        .expect("addUri 应成功");
+    let mut waited = 0u64;
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waited += 50;
+        let st = mgr.tell_status_native(&gid, None).unwrap();
+        let cur = st["status"].as_str().unwrap_or_default();
+        if cur == "error" {
+            break;
+        }
+        assert!(
+            waited < 20_000,
+            "缺少 Referer/Cookie 时任务未判失败（守卫失效？当前状态 {cur}）"
+        );
+    }
+    assert!(
+        denied.load(Ordering::SeqCst) > 0,
+        "服务端一次都没拦到请求，测试前提不成立"
+    );
+
+    // 2) 带请求头（aria2 风格 header 数组 + user-agent 便捷键）：完整下载
+    let dir = tmpdir("headers-with");
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = mgr
+        .add_uri(
+            vec![url],
+            &serde_json::json!({
+                "dir": dir,
+                "header": ["Referer: https://site.example/watch", "Cookie: sid=42"],
+                "user-agent": "LerxuTest/1.0",
+                "split": "4",
+                "min-split-size": "64K",
+            }),
+            None,
+        )
+        .expect("addUri 应成功");
+    wait_status(&mgr, &gid, "complete", 30_000)
+        .await
+        .expect("带 Referer/Cookie 应能下载完成");
+    assert_eq!(
+        std::fs::read(dir.join("file.bin")).unwrap(),
+        *data,
+        "带请求头的下载文件与源数据不一致"
+    );
+    assert!(ok.load(Ordering::SeqCst) >= 1, "服务端从未放行过请求");
+}

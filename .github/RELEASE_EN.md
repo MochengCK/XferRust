@@ -9,6 +9,10 @@
 - Fixed NAT-PMP TCP port mapping never working (opcode 6 → 2 per RFC 6886), DHT routing-table persistence always panicking, and peer-id generation panicking whenever a version component has two digits
 - Faster cold start and lower idle cost: DHT query timeout 10s → 3s with bootstrap and one iteration of find_node running concurrently, and release builds optimized for speed (see "Build & Release")
 
+## New Features
+
+- Per-task custom request headers are now actually sent: the `header` option (an array like `["Referer: https://…", "Cookie: a=b"]`, or a single CRLF/LF-separated string) and the `referer` / `user-agent` convenience keys are applied to real HTTP requests — previously they were collected into the task's options and never used when downloading (callers believed they were sent, but they were silently dropped), so every URL that requires `Referer` / `Cookie` failed with 403. The probe, single-connection and multi-connection split paths all use the same set (sending them on the download but not on the probe makes the probe 403 and misjudge the total length and Range support); `Range` / `Host` / `Content-Length` / `Connection` / `Accept-Encoding` are always ignored (overriding them breaks segmenting, resume and virtual-host routing), and `Origin` is never injected
+
 ## Bug Fixes
 
 - Fixed IPv6 addresses in non-compact peer lists being dropped: the address and port were concatenated into `ip:port` and re-parsed, which always fails for bare IPv6 literals (the port gets swallowed into the address) and discarded the whole peer; peers are now parsed from the IP literal with the port assembled afterwards, so a single invalid entry only skips that entry

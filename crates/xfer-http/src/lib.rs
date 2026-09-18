@@ -68,6 +68,81 @@ pub fn build_client_with(
     builder.build().expect("构建 HTTP 客户端失败")
 }
 
+/// 逐任务自定义请求头（`(名称, 值)`，名称大小写按调用方给出）。
+///
+/// 用于把浏览器侧的真实请求上下文（`Referer` / `Cookie` / `User-Agent`）
+/// 带进下载请求——需要请求头校验的地址缺少它们必然 403。
+pub type RequestHeaders = Vec<(String, String)>;
+
+/// 会被丢弃的请求头：要么破坏下载语义，要么与客户端自身行为冲突。
+///
+/// - `range`：区间由引擎按分段进度计算，覆盖会让续传位图与磁盘错位
+/// - `host`：虚拟主机由客户端按 URL 决定（覆盖会导致请求打错站点）
+/// - `content-length`：请求体长度，引擎不发请求体
+/// - `connection` / `accept-encoding`：连接与压缩编码由客户端接管
+///
+/// 注意**不包含 `origin`**：是否携带由调用方决定。浏览器对跨域 GET
+/// 不会带 `Origin`，伪造 `Origin` 是 CDN/WAF 判定伪造请求的典型特征，
+/// 会被直接 403——调用方应自行避免下发该头。
+const DROPPED_REQUEST_HEADERS: [&str; 5] = [
+    "range",
+    "host",
+    "content-length",
+    "connection",
+    "accept-encoding",
+];
+
+/// 解析 `Name: value` 形式的请求头行（忽略空行）。
+///
+/// - 无冒号、名称为空、值含 CR/LF 或非可见 ASCII → 整行丢弃
+/// - 命中 [`DROPPED_REQUEST_HEADERS`] → 丢弃
+/// - 同名重复（大小写不敏感）：后出现的覆盖先出现的，保留首次出现的位置
+pub fn parse_header_lines<I, S>(lines: I) -> RequestHeaders
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: RequestHeaders = Vec::new();
+    for line in lines {
+        let line = line.as_ref().trim_end_matches(['\r', '\n']);
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+            || reqwest::header::HeaderValue::from_str(value).is_err()
+        {
+            continue;
+        }
+        if DROPPED_REQUEST_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        match out
+            .iter_mut()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        {
+            Some(slot) => slot.1 = value.to_string(),
+            None => out.push((name.to_string(), value.to_string())),
+        }
+    }
+    out
+}
+
+/// 把自定义请求头逐条挂到请求上（入参应已经过 [`parse_header_lines`]）。
+pub(crate) fn apply_headers(
+    mut req: reqwest::RequestBuilder,
+    headers: &[(String, String)],
+) -> reqwest::RequestBuilder {
+    for (name, value) in headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+    req
+}
+
 /// 下载相关错误。`Cancelled` 表示主动暂停/移除，不是任务失败。
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum HttpError {
@@ -142,11 +217,24 @@ pub async fn probe(
     url: &str,
     cancel: &CancellationToken,
 ) -> Result<Probe, HttpError> {
+    probe_with(client, url, cancel, &[]).await
+}
+
+/// 同 [`probe`]，但携带逐任务自定义请求头（`Referer` / `Cookie` /
+/// `User-Agent` 等，见 [`RequestHeaders`]）。
+///
+/// 探测与随后的下载必须带同一组头：受保护地址若只在下载时带头、
+/// 探测时不带，会拿到 403 且总长/文件名全部判错。
+pub async fn probe_with(
+    client: &reqwest::Client,
+    url: &str,
+    cancel: &CancellationToken,
+    headers: &[(String, String)],
+) -> Result<Probe, HttpError> {
     if cancel.is_cancelled() {
         return Err(HttpError::Cancelled);
     }
-    let resp = client
-        .get(url)
+    let resp = apply_headers(client.get(url), headers)
         .header("Range", "bytes=0-0")
         .send()
         .await
@@ -249,10 +337,24 @@ pub async fn download(
     sink: &mut dyn TransferSink,
     limiter: Option<&RateLimiter>,
 ) -> Result<TransferDone, HttpError> {
+    download_with(client, url, start, cancel, sink, limiter, &[]).await
+}
+
+/// 同 [`download`]，但携带逐任务自定义请求头（见 [`RequestHeaders`]）。
+#[allow(clippy::too_many_arguments)]
+pub async fn download_with(
+    client: &reqwest::Client,
+    url: &str,
+    start: u64,
+    cancel: &CancellationToken,
+    sink: &mut dyn TransferSink,
+    limiter: Option<&RateLimiter>,
+    headers: &[(String, String)],
+) -> Result<TransferDone, HttpError> {
     if cancel.is_cancelled() {
         return Err(HttpError::Cancelled);
     }
-    let mut req = client.get(url);
+    let mut req = apply_headers(client.get(url), headers);
     if start > 0 {
         req = req.header("Range", format!("bytes={start}-"));
     }
@@ -644,5 +746,156 @@ mod tests {
         let client = build_client_with(None, Some("http://127.0.0.1:1"), Some("127.0.0.1"));
         let p = probe(&client, &format!("http://{addr}/probe"), &cancel).await;
         assert!(p.is_ok(), "no-proxy 未生效，请求走了不可达代理: {p:?}");
+    }
+
+    // ------------------------------------------------------------------
+    // 逐任务自定义请求头：Referer / Cookie / User-Agent
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn parse_header_lines_keeps_real_headers_only() {
+        let parsed = parse_header_lines([
+            "Referer: https://example.com/watch?v=1",
+            "cookie: sid=abc; t=1",
+            "User-Agent: LerxuTest/1.0",
+            // 以下都必须被丢弃
+            "Range: bytes=0-1",       // 覆盖分段区间会让位图与磁盘错位
+            "Host: evil.example",     // 虚拟主机由客户端按 URL 决定
+            "Content-Length: 999",    // 引擎不发请求体
+            "Connection: close",      // 连接管理归客户端
+            "Accept-Encoding: gzip",  // 压缩编码归客户端
+            "X-Empty:",               // 空值
+            "BadHeaderLine",          // 无冒号
+            "",
+        ]);
+        let names: Vec<&str> = parsed.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, vec!["Referer", "cookie", "User-Agent"]);
+        assert_eq!(parsed[0].1, "https://example.com/watch?v=1");
+        assert_eq!(parsed[1].1, "sid=abc; t=1");
+        assert_eq!(parsed[2].1, "LerxuTest/1.0");
+    }
+
+    #[test]
+    fn parse_header_lines_later_value_wins() {
+        let parsed = parse_header_lines(["Referer: https://a", "referer: https://b"]);
+        assert_eq!(parsed.len(), 1, "同名头只保留一条");
+        assert_eq!(parsed[0].0, "Referer");
+        assert_eq!(parsed[0].1, "https://b");
+    }
+
+    /// 头注入防护：值里带 CR/LF 的行必须整行丢弃，否则可以伪造出
+    /// 第二条请求头（例如偷偷把 Cookie 覆盖掉）。
+    #[test]
+    fn parse_header_lines_rejects_crlf_injection() {
+        assert!(parse_header_lines(["X-Injected: a\r\nCookie: evil=1"]).is_empty());
+        assert!(parse_header_lines(["X-Injected: a\nCookie: evil=1"]).is_empty());
+    }
+
+    /// 自定义请求头必须真的发到线上（探测与下载两条路径都要带），
+    /// 且不得覆盖引擎自己算的 Range。
+    #[tokio::test]
+    async fn custom_headers_reach_the_wire() {
+        /// 内存 sink（断言下载字节数即可）。
+        struct BufSink {
+            buf: Vec<u8>,
+        }
+        impl TransferSink for BufSink {
+            fn begin(&mut self, restarted: bool) -> std::io::Result<u64> {
+                if restarted {
+                    self.buf.clear();
+                }
+                Ok(self.buf.len() as u64)
+            }
+            fn write_chunk(&mut self, data: &[u8]) -> std::io::Result<()> {
+                self.buf.extend_from_slice(data);
+                Ok(())
+            }
+            fn finish(&mut self) -> std::io::Result<u64> {
+                Ok(self.buf.len() as u64)
+            }
+        }
+
+        type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String)>>>;
+        let seen: Seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new().route(
+            "/file.bin",
+            axum::routing::get({
+                let seen = seen.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let seen = seen.clone();
+                    async move {
+                        let get = |n: &str| {
+                            headers
+                                .get(n)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string()
+                        };
+                        seen.lock().unwrap().push((
+                            get("referer"),
+                            get("cookie"),
+                            get("user-agent"),
+                            get("range"),
+                        ));
+                        let body = vec![7u8; 1024];
+                        let mut resp =
+                            axum::response::Response::new(axum::body::Body::from(body));
+                        if get("range").is_empty() {
+                            *resp.status_mut() = axum::http::StatusCode::OK;
+                        } else {
+                            *resp.status_mut() = axum::http::StatusCode::PARTIAL_CONTENT;
+                            resp.headers_mut().insert(
+                                "content-range",
+                                "bytes 0-1023/1024".parse().unwrap(),
+                            );
+                        }
+                        resp
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let headers = parse_header_lines([
+            "Referer: https://example.com/page",
+            "Cookie: sid=1; t=2",
+            "User-Agent: LerxuTest/1.0",
+        ]);
+        let cancel = CancellationToken::new();
+        let client = build_client();
+
+        // 探测路径
+        let p = probe_with(&client, &format!("http://{addr}/file.bin"), &cancel, &headers)
+            .await
+            .expect("带头的探测应成功");
+        assert_eq!(p.total_len, Some(1024));
+
+        // 单连接下载路径
+        let mut sink = BufSink { buf: vec![] };
+        let done = download_with(
+            &client,
+            &format!("http://{addr}/file.bin"),
+            0,
+            &cancel,
+            &mut sink,
+            None,
+            &headers,
+        )
+        .await
+        .expect("带头的下载应成功");
+        assert_eq!(done.transferred, 1024);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "探测 + 下载各一次请求");
+        for (referer, cookie, ua, _) in seen.iter() {
+            assert_eq!(referer, "https://example.com/page");
+            assert_eq!(cookie, "sid=1; t=2");
+            assert_eq!(ua, "LerxuTest/1.0");
+        }
+        // 探测自带 Range（引擎算的），下载 start=0 不带 Range
+        assert_eq!(seen[0].3, "bytes=0-0");
+        assert_eq!(seen[1].3, "");
     }
 }

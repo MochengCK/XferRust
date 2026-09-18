@@ -1551,6 +1551,16 @@ impl TaskManager {
     // 目标路径解析（含 claims 冲突检查）
     // ------------------------------------------------------------------
 
+    /// 任务的逐任务自定义请求头（任务选项优先于全局选项）。
+    ///
+    /// 探测、单连接下载、分片下载三条路径都必须用同一份：
+    /// 见 [`parse_task_headers`]。
+    fn task_headers(&self, task: &Task) -> xfer_http::RequestHeaders {
+        let g = self.inner.lock().unwrap().global_options.clone();
+        let t = task.options.lock().unwrap().clone();
+        parse_task_headers(&t, &g)
+    }
+
     /// 计算 HTTP 分片下载参数：任务选项 > 全局选项 > 默认值。
     /// connections = min(split, max-connection-per-server)，上限 128。
     fn split_options(&self, task: &Task) -> xfer_http::SplitOptions {
@@ -1593,6 +1603,7 @@ impl TaskManager {
             min_split_size: min_split,
             adaptive,
             limiter: Some(task.http_task_limiter()),
+            headers: parse_task_headers(&t, &g),
         }
     }
 
@@ -4034,7 +4045,10 @@ async fn try_uri(
     // 任务级限速器同步（单任务优先覆盖，未设置跟随全局）：新任务/选项变更后
     // 的首次下载都在这里对齐，split 与单连接两条路径共用该限速器
     mgr.apply_task_rate_limits(task);
-    let probe = xfer_http::probe(client, uri, cancel).await?;
+    // 逐任务自定义请求头：探测与下载必须是同一组头，否则受保护地址
+    // 会「探测 403 → 判无总长/无 Range」，整条任务走错分支。
+    let headers = mgr.task_headers(task);
+    let probe = xfer_http::probe_with(client, uri, cancel, &headers).await?;
     task.mark_uri_used(uri_idx);
 
     // 总长度回填
@@ -4140,7 +4154,16 @@ async fn try_uri(
     let mut sink = ResumeSink::new(task.clone(), path, mode);
     // 任务级限速器（单任务优先覆盖，未设置跟随全局，启动时同步一次）
     let limiter = task.http_task_limiter();
-    let done = xfer_http::download(client, uri, start, cancel, &mut sink, Some(&limiter)).await?;
+    let done = xfer_http::download_with(
+        client,
+        uri,
+        start,
+        cancel,
+        &mut sink,
+        Some(&limiter),
+        &headers,
+    )
+    .await?;
 
     // 总长度以传输响应为准（重定向后可能不同）
     {
@@ -4211,6 +4234,56 @@ pub(crate) fn parse_size_bytes(v: &str) -> Option<u64> {
         .parse::<u64>()
         .ok()
         .map(|n| n.saturating_mul(mult))
+}
+
+/// 解析逐任务自定义请求头（`Referer` / `Cookie` / `User-Agent` 等）。
+///
+/// 任务选项优先于全局选项，支持的写法（宽松解析，兼容 aria2 风格调用方）：
+/// - `header`：`["Name: value", ...]` 数组（JSON 文本形态，任务选项经
+///   [`collect_task_options`] 摊平后即此形），或按 CRLF / LF 分行的字符串；
+/// - `referer` / `user-agent`：便捷键，等价于对应的请求头行。
+///
+/// 结果统一经 [`xfer_http::parse_header_lines`] 过滤非法项与
+/// `Range` / `Host` 等会破坏下载语义的头。**不注入 `Origin`**：伪造
+/// `Origin` 会被 CDN/WAF 判为伪造请求，调用方不应下发该头。
+fn parse_task_headers(
+    task_opts: &HashMap<String, String>,
+    global_opts: &HashMap<String, String>,
+) -> xfer_http::RequestHeaders {
+    let mut lines: Vec<String> = Vec::new();
+    for src in [global_opts, task_opts] {
+        if let Some(v) = src.get("header") {
+            lines.extend(split_header_option(v));
+        }
+    }
+    for (key, name) in [("referer", "Referer"), ("user-agent", "User-Agent")] {
+        if let Some(v) = task_opts
+            .get(key)
+            .or_else(|| global_opts.get(key))
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        {
+            lines.push(format!("{name}: {v}"));
+        }
+    }
+    xfer_http::parse_header_lines(lines)
+}
+
+/// `header` 选项的两种形态：JSON 数组文本，或按行分隔的字符串。
+fn split_header_option(v: &str) -> Vec<String> {
+    let t = v.trim();
+    if t.starts_with('[') {
+        if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(t) {
+            return items
+                .into_iter()
+                .filter_map(|it| match it {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect();
+        }
+    }
+    t.split(['\r', '\n']).map(|s| s.to_string()).collect()
 }
 
 /// 从 addUri/addTorrent 的 options 中提取任务级选项（排除 dir/out/checksum
@@ -4555,5 +4628,116 @@ mod tests {
             "清空单任务限速后应回落跟随全局 1M"
         );
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // 逐任务自定义请求头（Referer / Cookie / User-Agent）
+    // ------------------------------------------------------------------
+
+    /// aria2 风格的 `header` 数组 + `user-agent` 便捷键都要能解析出来。
+    #[test]
+    fn parse_task_headers_accepts_aria2_style_options() {
+        let mut t = HashMap::new();
+        t.insert(
+            "header".to_string(),
+            r#"["Referer: https://a/b","Cookie: s=1"]"#.to_string(),
+        );
+        t.insert("user-agent".to_string(), "LerxuTest/1.0".to_string());
+        let h = parse_task_headers(&t, &HashMap::new());
+        assert_eq!(h.len(), 3);
+        let get = |name: &str| {
+            h.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("referer"), Some("https://a/b"));
+        assert_eq!(get("cookie"), Some("s=1"));
+        assert_eq!(get("user-agent"), Some("LerxuTest/1.0"));
+    }
+
+    /// 任务级 `header` 覆盖全局同名头；全局头里非重名的仍保留；
+    /// CRLF 分行形态（全局选项 / CLI 写法）同样支持。
+    #[test]
+    fn parse_task_headers_task_overrides_global() {
+        let mut g = HashMap::new();
+        g.insert(
+            "header".to_string(),
+            "Referer: https://global\r\nX-Global: 1".to_string(),
+        );
+        let mut t = HashMap::new();
+        t.insert("header".to_string(), "Referer: https://task".to_string());
+        let h = parse_task_headers(&t, &g);
+        let get = |name: &str| {
+            h.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("referer"), Some("https://task"), "任务级应覆盖全局");
+        assert_eq!(get("x-global"), Some("1"), "非重名的全局头应保留");
+    }
+
+    /// 危险/非法项必须被丢弃：`Range` 覆盖会让分段错位；便捷键
+    /// `referer` 与 `header` 里的同名行合并为一条（后者为准）。
+    #[test]
+    fn parse_task_headers_drops_range_and_dedups_referer() {
+        let mut t = HashMap::new();
+        t.insert(
+            "header".to_string(),
+            r#"["Referer: https://from-header","Range: bytes=0-1","NoColonLine"]"#.to_string(),
+        );
+        t.insert("referer".to_string(), "https://from-option".to_string());
+        let h = parse_task_headers(&t, &HashMap::new());
+        assert!(
+            !h.iter().any(|(k, _)| k.eq_ignore_ascii_case("range")),
+            "Range 必须被丢弃"
+        );
+        let referers: Vec<&String> = h
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("referer"))
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(referers.len(), 1, "同名头只留一条");
+        assert_eq!(referers[0], "https://from-option");
+    }
+
+    /// 端到端：经 `add_uri` 建的任务，其逐任务头能被读出来
+    /// （任何一环漏传都会让浏览器侧带 Cookie 的下载退化成 403）。
+    #[tokio::test]
+    async fn added_task_exposes_custom_headers() {
+        let dir = std::env::temp_dir().join(format!("xfer-hdr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = TaskManager::start(dir.clone(), 1);
+        let gid = mgr
+            .add_uri(
+                vec!["http://127.0.0.1:1/never.bin".to_string()],
+                &serde_json::json!({
+                    "dir": dir.to_string_lossy(),
+                    "header": ["Referer: https://site.example/watch", "Cookie: sid=9"],
+                    "user-agent": "LerxuAndroid/1.0"
+                }),
+                None,
+            )
+            .expect("add_uri 应成功");
+        let task = mgr.task_of(&gid).expect("任务应可查");
+        let h = mgr.task_headers(&task);
+        let get = |name: &str| {
+            h.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("referer"), Some("https://site.example/watch"));
+        assert_eq!(get("cookie"), Some("sid=9"));
+        assert_eq!(get("user-agent"), Some("LerxuAndroid/1.0"));
+
+        // 同一份头也必须进入分片选项（探测 / 分片 / 单连接三条路径同源）
+        let opts = mgr.split_options(&task);
+        assert!(
+            opts.headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("referer") && v == "https://site.example/watch"),
+            "分片下载路径未带上逐任务头"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
