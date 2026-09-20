@@ -66,6 +66,24 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// FIN）"与尾段断流一样是可再生瞬态。10s 无字节即从水位重连续传——
 /// 已收字节不丢、不占致命预算，恢复速度也从最坏 30s 缩短到 10s。
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 尾声读空闲超时的生效门槛：剩余待下字节 ≤ 该值即视为尾声。
+///
+/// 取 8MiB：既覆盖"最后一个分片还在收尾"的典型现场（99% 时剩余通常
+/// 只有几 MB），又不会在下载中段误伤慢连接。
+const ENDGAME_IDLE_THRESHOLD: u64 = 8 * 1024 * 1024;
+/// 尾声读空闲超时：比常规值短得多。
+///
+/// 线上"下载到 99% 卡十几秒"的主因就在这里：最后一个分片的连接僵死
+/// （对端无数据也无 FIN），其余协程早已 Park，整条任务停在 99% 零速，
+/// 直到常规读空闲超时（10s）才断开重连——加上退避与重连，用户看到的
+/// 就是十几秒不动。
+///
+/// 尾声里这个等待没有任何收益：剩余数据已经很少，一次重连（RTT + 从
+/// 水位续传）的成本远低于干等 10s。因此剩余 ≤ [`ENDGAME_IDLE_THRESHOLD`]
+/// 时改用本值。代价是"尾部突发式发数据的慢服务器"可能被多断几次——
+/// 短读不消耗致命失败预算（见 [`MAX_SHORT_READS`]），断掉后从水位续传，
+/// 只是多几次重连，不会失败。
+const ENDGAME_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 控制文件的最小落盘间隔（节流 fsync）。
 const CTRL_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 /// 请求批水位（通道容量）：过高徒增内存，过低限制吞吐。
@@ -109,17 +127,41 @@ pub struct SplitStats {
     pub completed: AtomicU64,
     /// 当前活跃连接数。
     pub connections: AtomicUsize,
+    /// 剩余待下字节数（写线程在启动与每次落盘后更新）。
+    ///
+    /// 供工作协程判断"是否已到尾声"：尾声里一个僵死连接的代价是
+    /// 整条任务停在 99% 零速，早断开早重连远比等满常规读空闲超时划算
+    /// （见 [`ENDGAME_READ_IDLE_TIMEOUT`]）。[`Self::new`] 初始化为
+    /// [`REMAINING_UNKNOWN`]，此时按"非尾声"处理，不影响未走写线程的场景。
+    remaining: AtomicU64,
     /// 实时分片位图（下载启动时挂接一次，写线程增量维护）。
     pieces: OnceLock<Arc<PieceTrack>>,
 }
+
+/// `remaining` 的"未知"哨兵：未启动写线程（或测试直接构造）时取该值。
+const REMAINING_UNKNOWN: u64 = u64::MAX;
 
 impl SplitStats {
     pub fn new(baseline: u64) -> Arc<Self> {
         Arc::new(Self {
             completed: AtomicU64::new(baseline),
             connections: AtomicUsize::new(0),
+            remaining: AtomicU64::new(REMAINING_UNKNOWN),
             pieces: OnceLock::new(),
         })
+    }
+
+    /// 更新剩余待下字节数（写线程调用）。
+    fn set_remaining(&self, remaining: u64) {
+        self.remaining.store(remaining, Ordering::Relaxed);
+    }
+
+    /// 剩余待下字节数；未知时返回 `None`。
+    fn remaining(&self) -> Option<u64> {
+        match self.remaining.load(Ordering::Relaxed) {
+            REMAINING_UNKNOWN => None,
+            v => Some(v),
+        }
     }
 
     /// 挂接分片位图（下载启动时一次；重复调用忽略后续）。
@@ -837,6 +879,8 @@ impl Writer {
             base + (total - base).saturating_sub(todo),
             Ordering::Relaxed,
         );
+        // 剩余量初始值：工作协程据此判定尾声（收尾阶段的读空闲超时取值）
+        stats.set_remaining(todo);
         let mut w = Self {
             file: file.clone(),
             path: path.to_path_buf(),
@@ -926,6 +970,9 @@ impl Writer {
         }
         self.todo -= n as u64;
         self.last_progress = Instant::now();
+        // 同步剩余量给工作协程（尾声判定用；relaxed 即可，早一拍晚一拍
+        // 只影响读空闲超时选 3s 还是 10s，不影响正确性）
+        self.stats.set_remaining(self.todo);
         if seg.written == seg.end - seg.start && !seg.done {
             seg.done = true;
             // 段完成不触发 save_ctrl：由 1s 心跳统一节流保存。
@@ -1588,6 +1635,18 @@ async fn run_segment(
     let mut bytes_since_report: u64 = 0;
     let mut last_report = t_first_byte;
     loop {
+        // 读空闲超时按"是否已到尾声"取值：尾声里干等常规 10s 就是
+        // 用户看到的"99% 卡十几秒"，此时重连远比干等划算（详见常量注释）。
+        // 每轮循环重新判定：剩余量在收尾过程中是持续下降的。
+        let idle_timeout = if ctx
+            .stats
+            .remaining()
+            .is_some_and(|r| r <= ENDGAME_IDLE_THRESHOLD)
+        {
+            ENDGAME_READ_IDLE_TIMEOUT
+        } else {
+            READ_IDLE_TIMEOUT
+        };
         let chunk = tokio::select! {
             biased;
             _ = ctx.stop.cancelled() => return Ok(()), // 收尾由主流程统一处理
@@ -1599,7 +1658,7 @@ async fn run_segment(
             // 读空闲超时：连接静默停摆（对端无数据也无 FIN）时按短读
             // 处理——从水位重连续传，不占普通失败预算。每次循环新建
             // 定时器，计时的自然是"距上一块的间隔"。
-            _ = tokio::time::sleep(READ_IDLE_TIMEOUT) => {
+            _ = tokio::time::sleep(idle_timeout) => {
                 return Err(HttpError::ShortRead);
             }
         };
@@ -2155,6 +2214,112 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(25),
             "读空闲恢复耗时 {elapsed:?}，疑似仍卡在 30s read_timeout"
+        );
+    }
+
+    /// 回归：尾声读空闲超时收紧。同样注入 12s 静默停摆，但剩余量落在
+    /// 尾声门槛内——此时应当用 [`ENDGAME_READ_IDLE_TIMEOUT`]（3s）断开
+    /// 重连，而不是等满常规 [`READ_IDLE_TIMEOUT`]（10s）。
+    ///
+    /// 这条守护的正是线上「下载到 99% 卡十几秒」：最后一个分片的连接
+    /// 僵死，其余协程全在 Park，任务停在 99% 零速等满读空闲超时。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn endgame_idle_stall_recovers_faster() {
+        let len = 4 * 1024 * 1024;
+        let data = Arc::new(sample(len));
+        let expect = data.clone();
+        let stall_flag = Arc::new(AtomicBool::new(false));
+        let app = axum::Router::new().route(
+            "/file.bin",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let data = data.clone();
+                let stall_flag = stall_flag.clone();
+                async move {
+                    let range = headers
+                        .get(header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let total = data.len();
+                    let (from, to) =
+                        match range.strip_prefix("bytes=").and_then(|r| r.split_once('-')) {
+                            Some((f, t)) => (
+                                f.parse::<usize>().unwrap_or(0),
+                                t.parse::<usize>().unwrap_or(total),
+                            ),
+                            None => (0, total),
+                        };
+                    let from = from.min(total);
+                    let to = (to + 1).min(total).max(from);
+                    // 仅首个请求注入 12s 静默停摆（远大于尾声的 3s 读空闲）
+                    let stall = !stall_flag.swap(true, Ordering::SeqCst);
+                    let mut head: Vec<Result<Bytes, std::io::Error>> = Vec::new();
+                    let mut rest: Vec<Result<Bytes, std::io::Error>> = Vec::new();
+                    let mut off = from;
+                    while off < to {
+                        let end = (off + 8192).min(to);
+                        let c = Ok(Bytes::copy_from_slice(&data[off..end]));
+                        if stall && off == from {
+                            head.push(c);
+                        } else {
+                            rest.push(c);
+                        }
+                        off = end;
+                    }
+                    let stalled = stall;
+                    let stream = futures_util::stream::iter(head)
+                        .chain(futures_util::stream::once(async move {
+                            if stalled {
+                                tokio::time::sleep(Duration::from_secs(12)).await;
+                            }
+                            Ok(Bytes::new())
+                        }))
+                        .chain(futures_util::stream::iter(rest));
+                    let body = axum::body::Body::from_stream(stream);
+                    let mut resp = axum::response::Response::new(body);
+                    if from > 0 || to < total {
+                        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                        resp.headers_mut().insert(
+                            header::CONTENT_RANGE,
+                            HeaderValue::from_str(&format!(
+                                "bytes {}-{}/{}",
+                                from,
+                                to.saturating_sub(1),
+                                total
+                            ))
+                            .unwrap(),
+                        );
+                    }
+                    resp
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let url = format!("http://{addr}/file.bin");
+        let dir = tmpdir("endgame-idle-stall");
+        let path = dir.join("out.bin");
+        let cancel = CancellationToken::new();
+        let t0 = Instant::now();
+        download_split(
+            &crate::build_client(),
+            &url,
+            &path,
+            len as u64,
+            &opts(4, 256 * 1024),
+            &cancel,
+            SplitStats::new(0),
+        )
+        .await
+        .expect("分片下载失败");
+        let elapsed = t0.elapsed();
+        assert_file(&path, &expect);
+        // 4MiB 总量全程落在尾声门槛（8MiB）内，应走 3s 读空闲。
+        // 上限取 8s：既证明没等满常规 10s，又留足 CI 抖动余量。
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "尾声读空闲恢复耗时 {elapsed:?}，疑似仍按常规 10s 超时等待"
         );
     }
 
