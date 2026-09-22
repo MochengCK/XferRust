@@ -4,9 +4,9 @@
 
 # XferRust
 
-一个用 Rust 编写的高性能、低资源占用的独立下载引擎，支持 **HTTP(S)** 与
-**BitTorrent（BT）** 下载。自带全屏终端界面，也可作为后台服务运行，供网页端、
-桌面应用等客户端通过 JSON-RPC 远程控制。
+一个用 Rust 编写的高性能、低资源占用的独立下载引擎，支持 **HTTP(S)**、
+**HLS（M3U8）** 与 **BitTorrent（BT）** 下载。自带全屏终端界面，也可作为
+后台服务运行，供网页端、桌面应用等客户端通过 JSON-RPC 远程控制。
 
 ## 它能做什么
 
@@ -15,6 +15,13 @@
 - **HTTP / HTTPS**：多连接分片下载（`split`、`max-connection-per-server`、
   `min-split-size`）、断点续传，并写出控制文件——中断后从实际
   停下的位置继续，而不是从头再来。
+- **HLS（M3U8）**：`.m3u8` 地址按播放列表下载——主清单自动选流
+  （`hls-variant=worst` 可改取最低码率），分片并发拉取后按清单顺序拼成
+  **一个**文件，不需要事后合并。支持 `#EXT-X-MAP`（fMP4 初始化段）、
+  `#EXT-X-BYTERANGE` 区间分片与 `#EXT-X-KEY` AES-128
+  分片加密（含密钥轮换；`SAMPLE-AES` 会明确报错而不是静默产出坏文件）。
+  分片大小会先预探测一遍，总长因此可知，进度与剩余时间可用；断点续传按
+  "已 fsync 的连续前缀"续接（`hls-probe-size=false` 可关闭预探测）。
 - **BitTorrent**：种子与磁力链接，多 peer 并行 + rarest-first 选片；底层是
   完整网络栈：DHT（BEP 5）、IPv6 DHT（BEP 32）、peer 交换（BEP 11）、
   本地节点发现、uTP 与 MSE/PE 加密。

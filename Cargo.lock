@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -121,6 +132,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-padding"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -145,6 +165,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "cbc"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -178,6 +207,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
 ]
 
 [[package]]
@@ -755,6 +794,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "block-padding",
+ "generic-array",
 ]
 
 [[package]]
@@ -2342,7 +2391,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xfer-bencode"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "hex",
  "proptest",
@@ -2353,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-bt"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "axum",
  "futures-util",
@@ -2379,7 +2428,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-crypto"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -2390,7 +2439,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-dht"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -2407,7 +2456,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-discovery"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
@@ -2426,7 +2475,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-engine"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "axum",
  "base64",
@@ -2452,14 +2501,16 @@ dependencies = [
 
 [[package]]
 name = "xfer-geo"
-version = "0.3.2"
+version = "0.3.3"
 
 [[package]]
 name = "xfer-http"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
+ "aes",
  "axum",
  "bytes",
+ "cbc",
  "futures-util",
  "hex",
  "reqwest",
@@ -2470,13 +2521,14 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
  "xfer-storage",
  "xfer-types",
 ]
 
 [[package]]
 name = "xfer-rpc"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "axum",
  "base64",
@@ -2500,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-storage"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "hex",
  "md-5",
@@ -2513,7 +2565,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-transport"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "getrandom 0.3.4",
  "tokio",
@@ -2522,7 +2574,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-types"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "encoding_rs",
  "getrandom 0.3.4",
@@ -2531,7 +2583,7 @@ dependencies = [
 
 [[package]]
 name = "xferrust"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64",
  "crossterm",

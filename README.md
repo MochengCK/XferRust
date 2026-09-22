@@ -5,9 +5,9 @@
 # XferRust
 
 A high-performance, lightweight standalone download engine written in Rust,
-supporting **HTTP(S)** and **BitTorrent (BT)** downloads. It ships with a
-full-screen terminal UI and can also run as a background daemon controlled over
-JSON-RPC by web apps, desktop applications and other clients.
+supporting **HTTP(S)**, **HLS (M3U8)** and **BitTorrent (BT)** downloads. It
+ships with a full-screen terminal UI and can also run as a background daemon
+controlled over JSON-RPC by web apps, desktop applications and other clients.
 
 ## What It Can Do
 
@@ -17,6 +17,16 @@ JSON-RPC by web apps, desktop applications and other clients.
   (`split`, `max-connection-per-server`, `min-split-size`), resume support, and
   a control file so an interrupted transfer picks up where it actually stopped
   instead of starting over.
+- **HLS (M3U8)** playlists: a `.m3u8` URL is fetched as a playlist — master
+  playlists pick a stream automatically (`hls-variant=worst` for the lowest
+  bitrate), segments are downloaded concurrently and concatenated **into a
+  single file** in playlist order, no post-processing merge step. Supports
+  `#EXT-X-MAP` (fMP4 init segment), `#EXT-X-BYTERANGE` and `#EXT-X-KEY`
+  AES-128 segment encryption (including key rotation; `SAMPLE-AES` fails
+  loudly instead of silently producing a broken file). Segment sizes are
+  probed up front so the total length — and therefore progress and ETA — is
+  known, and resume continues from the last fsynced contiguous prefix
+  (`hls-probe-size=false` disables probing).
 - **BitTorrent** torrents and magnet links with multi-peer parallel
   downloading and rarest-first piece selection, on top of a complete network
   stack: DHT (BEP 5), IPv6 DHT (BEP 32), peer exchange (BEP 11), local peer

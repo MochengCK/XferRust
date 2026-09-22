@@ -46,14 +46,86 @@ impl Status {
     }
 }
 
+/// 任务种类：决定驱动循环（见 `TaskManager::run_task`）。
+///
+/// 历史判据（`bt_meta` / `bt_info_hash` 是否为 `Some`）只足以区分
+/// HTTP 与 BT——HLS 播放列表与普通 HTTP 共用"无 BT 元信息"的形态，
+/// 不显式记录种类就会被当成普通文件整段下载（拿到一个几百字节的
+/// 清单文本当产物）。因此种类在**创建任务时**判定并落到任务上，
+/// 与 BT 元信息无关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    /// 普通 HTTP(S) 单文件下载。
+    Http,
+    /// BitTorrent（.torrent 或磁力）。
+    Bt,
+    /// HLS（M3U8）播放列表：先取清单，再并发拉分片并顺序拼接。
+    Playlist,
+}
+
+impl TaskKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskKind::Http => "http",
+            TaskKind::Bt => "bt",
+            TaskKind::Playlist => "playlist",
+        }
+    }
+}
+
+/// URL 是否为 HLS 清单地址（按路径扩展名判定，忽略查询串与矩阵参数）。
+///
+/// 只认 `.m3u8`：`.m3u` 是通用播放列表容器（常见于纯音频列表），
+/// 按 HLS 解析必然失败；这类地址仍可经响应头 `Content-Type` 嗅探
+/// 走播放列表路径（见 [`crate::manager`] 的 `try_uri`）。
+pub fn is_playlist_url(u: &str) -> bool {
+    let path = u.split(['?', '#']).next().unwrap_or(u);
+    let path = path
+        .split(';')
+        .next()
+        .unwrap_or(path)
+        .trim()
+        .to_ascii_lowercase();
+    path.ends_with(".m3u8")
+}
+
+/// `hls` / `hls-playlist` 选项的显式取值（None = 未设置，按扩展名自动判定）。
+pub fn hls_option_value(options: &HashMap<String, String>) -> Option<bool> {
+    for key in ["hls", "hls-playlist"] {
+        if let Some(v) = options.get(key) {
+            let v = v.trim().to_ascii_lowercase();
+            let off = v == "false" || v == "0" || v == "no" || v == "off";
+            return Some(!off);
+        }
+    }
+    None
+}
+
+/// 从 URIs 与任务选项判定任务种类。
+///
+/// 新增任务与重启恢复共用同一判据，保证恢复后的任务回到同一条驱动
+/// 循环。显式选项优先：`hls=false`（或 `0`）可强制按普通 HTTP 下载
+/// 一个扩展名像清单的地址。
+pub fn detect_kind(uris: &[String], options: &HashMap<String, String>) -> TaskKind {
+    if uris.iter().any(|u| u.trim().starts_with("magnet:")) {
+        return TaskKind::Bt;
+    }
+    if let Some(on) = hls_option_value(options) {
+        return if on { TaskKind::Playlist } else { TaskKind::Http };
+    }
+    if uris.iter().any(|u| is_playlist_url(u)) {
+        TaskKind::Playlist
+    } else {
+        TaskKind::Http
+    }
+}
+
 /// 单个 URI 的使用状态（files[].uris[].status）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UriState {
     Used,
     Waiting,
-}
-
-impl UriState {
+}impl UriState {
     pub fn as_str(self) -> &'static str {
         match self {
             UriState::Used => "used",
@@ -136,6 +208,8 @@ pub struct TaskShared {
 /// 一个下载任务。
 pub struct Task {
     pub gid: Gid,
+    /// 任务种类（创建时判定；决定驱动循环）。
+    pub kind: TaskKind,
     /// 任务 URI 列表（可经 task.changeUri 运行时更新，Mutex 保护）。
     pub uris: Mutex<Vec<String>>,
     pub dir: PathBuf,
@@ -222,6 +296,7 @@ pub struct Task {
 impl Task {
     pub fn new(
         gid: Gid,
+        kind: TaskKind,
         uris: Vec<String>,
         dir: PathBuf,
         out: Option<String>,
@@ -232,6 +307,7 @@ impl Task {
         Self {
             uri_states: Mutex::new(vec![UriState::Waiting; uris.len()]),
             gid,
+            kind,
             uris: Mutex::new(uris),
             dir,
             out,
@@ -293,6 +369,7 @@ impl Task {
         Self {
             uri_states: Mutex::new(Vec::new()),
             gid,
+            kind: TaskKind::Bt,
             uris: Mutex::new(Vec::new()),
             dir,
             out: None,
@@ -354,6 +431,7 @@ impl Task {
         Self {
             uri_states: Mutex::new(Vec::new()),
             gid,
+            kind: TaskKind::Bt,
             uris: Mutex::new(Vec::new()),
             dir,
             out: None,
@@ -400,6 +478,14 @@ impl Task {
             avg_active_ms: AtomicU64::new(0),
             avg_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// 任务是否被显式关掉 HLS（`hls=false`）。
+    ///
+    /// 关闭后连"响应头声明 mpegurl"的内容嗅探也要跳过——否则这个选项
+    /// 只是把种类改成 HTTP，嗅探又会把任务拽回播放列表路径。
+    pub fn hls_disabled(&self) -> bool {
+        hls_option_value(&self.options.lock().unwrap()) == Some(false)
     }
 
     pub fn status(&self) -> Status {
@@ -459,8 +545,7 @@ impl Task {
     }
 
     /// 任务级 HTTP 限速器（惰性创建，rate 由 Manager 同步维护）。
-    pub fn http_task_limiter(&self) -> Arc<xfer_http::RateLimiter> {
-        self.http_limiter
+    pub fn http_task_limiter(&self) -> Arc<xfer_http::RateLimiter> {        self.http_limiter
             .get_or_init(|| xfer_http::RateLimiter::new(0))
             .clone()
     }

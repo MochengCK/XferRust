@@ -21,7 +21,8 @@ use xfer_types::{Gid, PeerId};
 use futures_util::future::FutureExt;
 
 use crate::task::{
-    filter_keys, snapshot, status_json, status_json_native, Intent, Status, Task, TaskFailure,
+    detect_kind, filter_keys, snapshot, status_json, status_json_native, Intent, Status, Task,
+    TaskFailure, TaskKind,
 };
 use xfer_storage::{
     existing_len, file_digest_hex, verify_file_hash, FileSink, HashAlgo,
@@ -45,6 +46,13 @@ pub const DEFAULT_MIN_SPLIT_SIZE: u64 = 4 * 1024 * 1024;
 /// 不是同一服务器上的 Range 分片，两者的最优并发度没有可比性。
 const DEFAULT_BT_MAX_PEERS: usize = 50;
 const MAX_BT_MAX_PEERS: usize = 200;
+
+/// HLS 分片并发上限。
+///
+/// 分片下载的并发单位是"整个分片"（通常 1~6MiB），不像 HTTP 分片
+/// 那样可以细到几十 KB 一段；16 路已足以跑满常见带宽，再高只会给
+/// CDN 制造 429 与连接中断——而一个分片失败就要整段重下。
+const MAX_HLS_CONNECTIONS: usize = 32;
 
 /// 生成 16 字符 hex ID（用于订阅源标识）。
 fn generate_id() -> String {
@@ -564,7 +572,16 @@ impl TaskManager {
                     .map(Arc::new)
             });
 
-            let task = Arc::new(Task::new(gid.clone(), uris, dir, out, checksum, task_opts));
+            let kind = detect_kind(&uris, &task_opts);
+            let task = Arc::new(Task::new(
+                gid.clone(),
+                kind,
+                uris,
+                dir,
+                out,
+                checksum,
+                task_opts,
+            ));
             // 恢复 BT 相关字段
             {
                 let bt_trackers: Vec<String> = t["btTrackers"]
@@ -915,9 +932,13 @@ impl TaskManager {
         let cancel = task.cancel.read().unwrap().clone();
         let ticker = tokio::spawn(speed_ticker(task.clone(), self.events.clone()));
         // M6：panic 隔离 — 任务级 panic 不应崩垮整个引擎
-        let failure = if task.bt_meta.lock().unwrap().is_some()
-            || task.bt_info_hash.lock().unwrap().is_some()
-        {
+        // 种类优先按任务上的显式字段判定；BT 元信息作为兜底，保证旧会话
+        // 恢复出来的任务（未记录种类）仍走同一条驱动。
+        let kind = task.kind;
+        let is_bt = matches!(kind, TaskKind::Bt)
+            || task.bt_meta.lock().unwrap().is_some()
+            || task.bt_info_hash.lock().unwrap().is_some();
+        let failure = if is_bt {
             match std::panic::AssertUnwindSafe(drive_bt_download(&self, &task, &cancel))
                 .catch_unwind()
                 .await
@@ -928,6 +949,18 @@ impl TaskManager {
                     "任务 panic: {}",
                     panic_downcast(panic)
                 ))),
+            }
+        } else if matches!(kind, TaskKind::Playlist) {
+            match std::panic::AssertUnwindSafe(drive_playlist(&self, &task, &cancel))
+                .catch_unwind()
+                .await
+            {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err(e),
+                Err(panic) => Err(TaskFailure::Http(xfer_http::HttpError::Protocol(format!(
+                    "任务 panic: {}",
+                    panic_downcast(panic)
+                )))),
             }
         } else {
             match std::panic::AssertUnwindSafe(drive_download(&self, &task, &cancel))
@@ -1086,9 +1119,12 @@ impl TaskManager {
             .and_then(parse_checksum_option);
         // 任务级选项（split / min-split-size 等，下载时与全局合并）
         let task_opts = collect_task_options(&opts);
+        // 任务种类：`.m3u8` / `.m3u` 走 HLS 播放列表驱动（可用 hls=false
+        // 强制按普通 HTTP 下载），其余一律普通 HTTP。
+        let kind = detect_kind(&uris, &task_opts);
 
         let gid = Gid::generate();
-        let task = Arc::new(Task::new(gid.clone(), uris, dir, out, checksum, task_opts));
+        let task = Arc::new(Task::new(gid.clone(), kind, uris, dir, out, checksum, task_opts));
         {
             let mut inner = self.inner.lock().unwrap();
             inner.tasks.insert(gid.clone(), task);
@@ -1100,7 +1136,7 @@ impl TaskManager {
                 _ => inner.queue.push_back(gid.clone()),
             }
         }
-        tracing::info!(gid = %gid, "新增任务");
+        tracing::info!(gid = %gid, kind = kind.as_str(), "新增任务");
         self.kick();
         self.save_session_now();
         Ok(gid)
@@ -1607,11 +1643,159 @@ impl TaskManager {
         }
     }
 
+    /// 计算 HLS 播放列表下载参数：任务选项 > 全局选项 > 默认值。
+    ///
+    /// 并发沿用 `split` / `max-connection-per-server` 的配置（两端设置页
+    /// 已有这两个键，用户不必再学一组新选项），上限收紧到
+    /// [`MAX_HLS_CONNECTIONS`]；`hls-variant=worst` 取最低码率变体，
+    /// `hls-probe-size=false` 关闭分片预探测（总长将未知），
+    /// `hls-segment-retries` 覆盖单分片重试次数。
+    fn playlist_options(
+        &self,
+        task: &Task,
+        headers: &xfer_http::RequestHeaders,
+    ) -> xfer_http::PlaylistOptions {
+        let g = self.inner.lock().unwrap().global_options.clone();
+        let t = task.options.lock().unwrap().clone();
+        let get = |k: &str| t.get(k).or_else(|| g.get(k));
+        let num = |k: &str, d: usize| {
+            get(k)
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(d)
+        };
+        let split = num("split", DEFAULT_SPLIT_CONNECTIONS);
+        let max_conn = num("max-connection-per-server", DEFAULT_SPLIT_CONNECTIONS);
+        let concurrency = split.min(max_conn).clamp(1, MAX_HLS_CONNECTIONS);
+        let retries = get("hls-segment-retries")
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(xfer_http::DEFAULT_SEGMENT_RETRIES)
+            .clamp(1, 10);
+        let probe_sizes = get("hls-probe-size")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        let prefer_worst = get("hls-variant")
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "worst" || v == "lowest" || v == "min"
+            })
+            .unwrap_or(false);
+        xfer_http::PlaylistOptions {
+            concurrency,
+            retries,
+            probe_sizes,
+            prefer_worst,
+            limiter: Some(task.http_task_limiter()),
+            headers: headers.clone(),
+        }
+    }
+
+    /// HLS 任务的一次 URI 尝试：取清单 → 落位 → 并发拉分片顺序拼接。
+    ///
+    /// 与 [`try_uri`] 同构：探测（这里是取清单）→ 路径解析 → 进度基线
+    /// （这里是控制文件记录的连续前缀）→ 下载 → 完成校验。
+    async fn try_playlist(
+        &self,
+        task: &Arc<Task>,
+        client: &reqwest::Client,
+        uri: &str,
+        uri_idx: usize,
+        cancel: &CancellationToken,
+        headers: &xfer_http::RequestHeaders,
+    ) -> Result<(), TaskFailure> {
+        self.apply_task_rate_limits(task);
+        let opts = self.playlist_options(task, headers);
+        let plan = match xfer_http::fetch_plan(client, uri, cancel, headers, &opts).await {
+            Ok(p) => p,
+            Err(e) => return Err(TaskFailure::Http(e)),
+        };
+        task.mark_uri_used(uri_idx);
+        if !plan.chain.is_empty() {
+            tracing::info!(
+                gid = %task.gid, variant = %plan.source,
+                segments = plan.segments.len(), "主清单选流完成"
+            );
+        }
+        if plan.live {
+            // 直播/滚动窗口清单没有 ENDLIST：只能下载"当前这一窗"，
+            // 后续新增的分片不会出现在产物里（不是失败，但要看得见）
+            tracing::warn!(
+                gid = %task.gid, segments = plan.segments.len(),
+                "播放列表没有 #EXT-X-ENDLIST（直播/滚动窗口），按当前窗口快照下载"
+            );
+        }
+
+        // 总长度回填：分片大小全部已知时进度条才有意义
+        if let Some(total) = plan.total {
+            let mut sh = task.shared.lock().unwrap();
+            sh.total_len = Some(total);
+            sh.file_len = total;
+        }
+        let path = self.resolve_playlist_path(task, &plan, uri);
+
+        // 续传基线：控制文件记录的"已 fsync 连续前缀"
+        let (resume_bytes, _) = xfer_http::playlist_resume_point(&path, &plan);
+        let min_split = self.split_options(task).min_split_size;
+        if let Some(total) = plan.total.filter(|t| *t > 0) {
+            let pieces = xfer_http::PieceTrack::new(total, min_split);
+            if resume_bytes > 0 {
+                pieces.add_range(0, resume_bytes);
+            }
+            *task.http_pieces.write().unwrap() = Some(pieces);
+        } else {
+            *task.http_pieces.write().unwrap() = None;
+        }
+        {
+            let mut sh = task.shared.lock().unwrap();
+            sh.completed = resume_bytes;
+            sh.connections = 0;
+        }
+        task.completed_atomic.store(resume_bytes, Ordering::Relaxed);
+        task.connections_atomic.store(0, Ordering::Relaxed);
+
+        let stats = xfer_http::PlaylistStats::new(resume_bytes);
+        let sampler = spawn_playlist_sampler(task, &stats);
+        let r = xfer_http::download_playlist(client, &path, &plan, &opts, cancel, stats.clone()).await;
+        sampler.abort();
+        match r {
+            Ok(done) => {
+                {
+                    let mut sh = task.shared.lock().unwrap();
+                    sh.completed = done.bytes;
+                    sh.connections = 0;
+                    sh.file_len = done.bytes;
+                    if plan.total.is_none() {
+                        // 总长未知（未预探测/服务器不支持 Range）：
+                        // 完成后按实际字节数定格，进度不留在不确定态
+                        sh.total_len = Some(done.bytes);
+                    }
+                }
+                task.completed_atomic.store(done.bytes, Ordering::Relaxed);
+                task.connections_atomic.store(0, Ordering::Relaxed);
+                tracing::info!(
+                    gid = %task.gid, bytes = done.bytes, segments = done.segments,
+                    file = %path.display(), "播放列表下载完成"
+                );
+                finish_http_task(task, &path).await
+            }
+            Err(e) => {
+                let completed = stats.completed.load(Ordering::Relaxed);
+                {
+                    let mut sh = task.shared.lock().unwrap();
+                    sh.completed = completed;
+                    sh.connections = 0;
+                }
+                task.completed_atomic.store(completed, Ordering::Relaxed);
+                task.connections_atomic.store(0, Ordering::Relaxed);
+                Err(TaskFailure::Http(e))
+            }
+        }
+    }
+
     /// 计算 BT 下载参数：任务选项 > 全局选项 > 默认值。
     ///
     /// 返回 `(预分配连接数, 是否启用智能调度)`。BT 连接数独立于 HTTP 的 split。
-    fn bt_options(&self, task: &Task) -> (usize, bool) {
-        let g = self.inner.lock().unwrap().global_options.clone();
+    fn bt_options(&self, task: &Task) -> (usize, bool) {        let g = self.inner.lock().unwrap().global_options.clone();
         let t = task.options.lock().unwrap().clone();
         let get = |k: &str| t.get(k).or_else(|| g.get(k));
 
@@ -1735,6 +1919,14 @@ impl TaskManager {
             .unwrap_or(false)
     }
 
+    /// 全局「断点续传」开关（`continue` 选项，默认开）。
+    fn continue_enabled(&self) -> bool {
+        let g = self.inner.lock().unwrap().global_options.clone();
+        g.get("continue")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true)
+    }
+
     fn resolve_path(&self, task: &Arc<Task>, probe: &xfer_http::Probe) -> PathBuf {
         // 暂停恢复：沿用已解析路径
         if let Some(p) = task.shared.lock().unwrap().path.clone() {
@@ -1745,7 +1937,57 @@ impl TaskManager {
             .clone()
             .or_else(|| probe.filename.clone())
             .unwrap_or_else(|| "download".to_string());
+        let continue_enabled = self.continue_enabled();
+        // continue=false（设置页「断点续传」关闭）时即使服务器支持
+        // Range 也强制重新下载：文件冲突按「重命名新文件」处理，
+        // 已有文件保持不变（与 aria2 语义一致）。
+        self.claim_path(task, base_name, |existing, _| {
+            continue_enabled
+                && probe.accepts_ranges
+                && existing > 0
+                && probe.total_len.is_none_or(|t| existing < t)
+        })
+    }
 
+    /// HLS 任务的目标路径：默认文件名由**用户给出的清单地址**推导
+    /// （末段去扩展名，通用名回退父目录名），扩展名按 fMP4 / TS 选择。
+    ///
+    /// 刻意不用最终变体地址（`plan.source`）：主清单会跳到
+    /// `/1080p/index.m3u8` 这类目录，产物名会变成 `1080p.ts` 而不是
+    /// 用户看到的那个名字。
+    ///
+    /// 同名文件只有在**存在分片控制文件**时才视为可续传；否则一律
+    /// 重命名新文件——不能把别人完整的同名视频截断重写。
+    fn resolve_playlist_path(
+        &self,
+        task: &Arc<Task>,
+        plan: &xfer_http::PlaylistPlan,
+        uri: &str,
+    ) -> PathBuf {
+        if let Some(p) = task.shared.lock().unwrap().path.clone() {
+            return p;
+        }
+        let base_name = task
+            .out
+            .clone()
+            .unwrap_or_else(|| xfer_http::playlist_default_filename(uri, plan.fmp4));
+        let continue_enabled = self.continue_enabled();
+        self.claim_path(task, base_name, |existing, candidate| {
+            continue_enabled
+                && existing > 0
+                && xfer_storage::ctrl_path(candidate).exists()
+                && plan.total.is_none_or(|t| existing <= t)
+        })
+    }
+
+    /// 占用一个不与磁盘/其他任务冲突的目标路径。
+    ///
+    /// `can_resume(existing, candidate)` 判定"同名文件是否可以就地续传"；
+    /// 返回 false 且文件已存在 → 视为冲突，改用 `name.1.ext` 继续试。
+    fn claim_path<F>(&self, task: &Arc<Task>, base_name: String, can_resume: F) -> PathBuf
+    where
+        F: Fn(u64, &Path) -> bool,
+    {
         let mut n = 0usize;
         loop {
             let name = if n == 0 {
@@ -1755,20 +1997,7 @@ impl TaskManager {
             };
             let candidate = task.dir.join(&name);
             let existing = existing_len(&candidate);
-            // continue=false（设置页「断点续传」关闭）时即使服务器支持
-            // Range 也强制重新下载：文件冲突按「重命名新文件」处理，
-            // 已有文件保持不变（与 aria2 语义一致）。
-            let continue_enabled = {
-                let g = self.inner.lock().unwrap().global_options.clone();
-                g.get("continue")
-                    .map(|v| v != "false" && v != "0")
-                    .unwrap_or(true)
-            };
-            let can_resume = continue_enabled
-                && probe.accepts_ranges
-                && existing > 0
-                && probe.total_len.is_none_or(|t| existing < t);
-            let disk_conflict = !can_resume && existing > 0;
+            let disk_conflict = !can_resume(existing, &candidate) && existing > 0;
             let claimed = {
                 let mut inner = self.inner.lock().unwrap();
                 let claimed = inner.claims.contains(&candidate);
@@ -1929,10 +2158,14 @@ impl TaskManager {
                     | "user-agent"
                     | "all-proxy"
                     | "no-proxy"
+                    | "hls-variant"
+                    | "hls-probe-size"
+                    | "hls-segment-retries"
             ) {
                 // HTTP 分片参数 / BT 连接参数 / BT 做种配置 / 网络发现开关
-                // / 磁力存种子 / 磁盘缓存 / HTTP 续传与客户端配置：存储后
-                // 在下载时生效（user-agent/all-proxy 变更时重建 HTTP 客户端）
+                // / 磁力存种子 / 磁盘缓存 / HTTP 续传与客户端配置 / HLS
+                // 选流与分片参数：存储后在下载时生效
+                // （user-agent/all-proxy 变更时重建 HTTP 客户端）
                 if k == "bt-seed-time" && v.trim().parse::<u64>().is_err() {
                     tracing::warn!(value = %v, "bt-seed-time 取值无效（应为分钟数），已忽略该键");
                     continue;
@@ -4049,6 +4282,23 @@ async fn try_uri(
     // 会「探测 403 → 判无总长/无 Range」，整条任务走错分支。
     let headers = mgr.task_headers(task);
     let probe = xfer_http::probe_with(client, uri, cancel, &headers).await?;
+
+    // 内容嗅探：扩展名不像清单、但服务器声明（或重定向到）M3U8——
+    // 交给播放列表驱动。已是 Playlist 种类的任务不再嗅探（它会由
+    // drive_playlist 的兜底回到这里，再嗅探就成了来回打转）；
+    // 显式 hls=false 的任务也不嗅探（用户明确要求按普通文件下载）。
+    if matches!(task.kind, TaskKind::Http) && !task.hls_disabled() && probe.is_playlist_hint() {
+        match mgr
+            .try_playlist(task, client, uri, uri_idx, cancel, &headers)
+            .await
+        {
+            Err(TaskFailure::Http(xfer_http::HttpError::NotPlaylist)) => {
+                tracing::info!(gid = %task.gid, "目标内容不是 M3U8 清单，按普通 HTTP 下载");
+            }
+            other => return other,
+        }
+    }
+
     task.mark_uri_used(uri_idx);
 
     // 总长度回填
@@ -4195,12 +4445,65 @@ async fn try_uri(
     finish_http_task(task, sink.path.as_path()).await
 }
 
+/// HLS（M3U8）任务驱动：依次尝试 URI 列表（镜像故障转移）。
+///
+/// 目标扩展名像清单、内容却是普通资源时回退到普通 HTTP 驱动——
+/// 用户粘一个 `.m3u8` 后缀但实际是直链的地址不至于直接失败。
+async fn drive_playlist(
+    mgr: &TaskManager,
+    task: &Arc<Task>,
+    cancel: &CancellationToken,
+) -> Result<(), TaskFailure> {
+    let uris_snapshot = task.uris.lock().unwrap().clone();
+    let mut last_err: Option<TaskFailure> = None;
+    for (idx, uri) in uris_snapshot.iter().enumerate() {
+        let mut attempt = 1u32;
+        loop {
+            let headers = mgr.task_headers(task);
+            // 克隆客户端：避免 RwLock 读锁跨 await 持有（guard 非 Send）
+            let client = mgr.client.read().unwrap().clone();
+            // allow_http_fallback=false：地址扩展名已声明自己是清单，
+            // 内容却不是——报错比悄悄存下一个错误页更诚实
+            match mgr
+                .try_playlist(task, &client, uri, idx, cancel, &headers)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(f) if f.is_cancelled() => return Err(f),
+                Err(f) => {
+                    if is_transient_failure(&f) && attempt < URI_TRANSIENT_ATTEMPTS {
+                        attempt += 1;
+                        tracing::warn!(
+                            gid = %task.gid, uri = idx, attempt,
+                            error = %f, "播放列表瞬态失败，断点续传重试"
+                        );
+                        let backoff = match attempt {
+                            2 => Duration::from_secs(1),
+                            _ => Duration::from_secs(3),
+                        };
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff) => {}
+                            _ = cancel.cancelled() => return Err(f),
+                        }
+                        continue;
+                    }
+                    tracing::warn!(gid = %task.gid, uri = idx, error = %f, "播放列表下载失败，切换下一个");
+                    last_err = Some(f);
+                    break;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or(TaskFailure::Http(xfer_http::HttpError::Protocol(
+        "无可用下载地址".into(),
+    ))))
+}
+
 /// HTTP 任务完成收尾：校验和（如配置）。
 ///
 /// 哈希校验走阻塞线程池：大文件整读可能耗时数秒，同步执行会卡住
 /// tokio 工作线程（§7.18⑤：async 上下文禁止同步磁盘 IO）。
-async fn finish_http_task(task: &Arc<Task>, path: &Path) -> Result<(), TaskFailure> {
-    if let Some((algo, expect)) = task.checksum.clone() {
+async fn finish_http_task(task: &Arc<Task>, path: &Path) -> Result<(), TaskFailure> {    if let Some((algo, expect)) = task.checksum.clone() {
         let p = path.to_path_buf();
         tokio::task::spawn_blocking(move || verify_file_hash(&p, algo, &expect))
             .await
@@ -4311,6 +4614,28 @@ fn collect_task_options(opts: &serde_json::Map<String, Value>) -> HashMap<String
 fn spawn_split_sampler(
     task: &Arc<Task>,
     stats: &Arc<xfer_http::SplitStats>,
+) -> tokio::task::JoinHandle<()> {
+    let task = task.clone();
+    let stats = stats.clone();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(Duration::from_millis(200));
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            iv.tick().await;
+            task.completed_atomic
+                .store(stats.completed.load(Ordering::Relaxed), Ordering::Relaxed);
+            task.connections_atomic.store(
+                stats.connections.load(Ordering::Relaxed) as u64,
+                Ordering::Relaxed,
+            );
+        }
+    })
+}
+
+/// HLS 播放列表进度采样：与 [`spawn_split_sampler`] 同构（无锁原子）。
+fn spawn_playlist_sampler(
+    task: &Arc<Task>,
+    stats: &Arc<xfer_http::PlaylistStats>,
 ) -> tokio::task::JoinHandle<()> {
     let task = task.clone();
     let stats = stats.clone();

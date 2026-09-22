@@ -2316,9 +2316,12 @@ mod tests {
         let elapsed = t0.elapsed();
         assert_file(&path, &expect);
         // 4MiB 总量全程落在尾声门槛（8MiB）内，应走 3s 读空闲。
-        // 上限取 8s：既证明没等满常规 10s，又留足 CI 抖动余量。
+        // 上限取 9.5s：既证明没等满常规 10s（常规路径还要叠加重连与
+        // 从水位续传的开销，实测 ≥11s），又给 CI 抖动留足余量——
+        // 原先的 8s 在并发跑测试的机器上会被连接/退避开销顶破（实测
+        // 8.5~8.9s 反复闪断），而它并没有证明任何额外的行为差异。
         assert!(
-            elapsed < Duration::from_secs(8),
+            elapsed < Duration::from_millis(9500),
             "尾声读空闲恢复耗时 {elapsed:?}，疑似仍按常规 10s 超时等待"
         );
     }

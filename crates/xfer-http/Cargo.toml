@@ -16,6 +16,10 @@ hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# HLS（M3U8）播放列表：相对地址解析 + AES-128 分片解密
+url = "2"
+aes = "0.8"
+cbc = "0.1"
 xfer-types = { path = "../xfer-types" }
 xfer-storage = { path = "../xfer-storage" }
 

@@ -6,7 +6,7 @@ pub mod text;
 
 /// 引擎版本。与 XferRust 的 Cargo.toml version 保持同步，
 /// RPC 版本查询与 UA/peer-id 前缀派生均以此为唯一源。
-pub const ENGINE_VERSION: &str = "0.3.2";
+pub const ENGINE_VERSION: &str = "0.3.3";
 
 /// 引擎名称（UA、RPC feature 列表使用）。
 pub const ENGINE_NAME: &str = "XferRust";

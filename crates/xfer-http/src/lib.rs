@@ -1,12 +1,19 @@
 //! HTTP(S) 下载：探测（总长度 / 文件名 / Range 支持）、单连接流式下载
 //! 与多连接分片下载（见 [`split`] 模块：单写线程调度 + 工作窃取对冲
-//! + 段级控制文件断点续传）。
+//! + 段级控制文件断点续传）。HLS（M3U8）播放列表下载见 [`playlist`]。
 
 mod adaptive;
+mod playlist;
 mod rate;
 mod split;
 
 pub use adaptive::{AdaptiveConfig, AdaptiveScheduler, ConnPerf, ScheduleAction};
+pub use playlist::{
+    default_filename as playlist_default_filename, download_playlist, fetch_plan,
+    resume_point as playlist_resume_point, PlaylistDone, PlaylistOptions, PlaylistPlan,
+    PlaylistStats, Segment as PlaylistSegment, SegmentKey as PlaylistKey,
+    DEFAULT_SEGMENT_RETRIES,
+};
 pub use rate::RateLimiter;
 pub use split::{
     ctrl_path, download_split, PieceSnapshot, PieceTrack, SplitDone, SplitOptions, SplitStats,
@@ -163,6 +170,12 @@ pub enum HttpError {
     /// 调用方应回退单连接模式（此时本地文件已被截断为连续前缀）。
     #[error("服务器不支持分段下载: {0}")]
     NotSplittable(String),
+    /// 目标地址返回的内容不是 M3U8 清单（内容嗅探落空）。
+    ///
+    /// 调用方据此回退普通 HTTP 下载：把"看起来像清单、实际是普通
+    /// 资源"的地址当播放列表处理会把整个响应体下载成产物。
+    #[error("目标内容不是 M3U8 播放列表")]
+    NotPlaylist,
     #[error("本地写入失败: {0}")]
     Io(String),
     #[error("已取消")]
@@ -171,7 +184,7 @@ pub enum HttpError {
 
 impl HttpError {
     /// 从 reqwest 错误归类。
-    fn from_reqwest(e: &reqwest::Error) -> Self {
+    pub fn from_reqwest(e: &reqwest::Error) -> Self {
         if e.is_timeout() {
             Self::Timeout
         } else if e.is_connect() {
@@ -181,12 +194,26 @@ impl HttpError {
         }
     }
 
+    /// 是否为可重试的瞬时失败（连接类/超时/中途断流/5xx）。
+    ///
+    /// 4xx、本地 IO、取消都不重试：重试只会重复同一个确定性结果。
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Timeout | Self::Connect(_) | Self::Protocol(_) | Self::ShortRead => true,
+            Self::Http(code) => *code >= 500,
+            Self::NotSplittable(_) | Self::NotPlaylist | Self::Io(_) | Self::Cancelled => false,
+        }
+    }
+
     /// 映射到线上协议的任务错误码。
     pub fn error_code(&self) -> i64 {
         match self {
             HttpError::Timeout => 2,
             HttpError::Http(_) => 3,
-            HttpError::Connect(_) | HttpError::Protocol(_) | HttpError::NotSplittable(_) => 5,
+            HttpError::Connect(_)
+            | HttpError::Protocol(_)
+            | HttpError::NotSplittable(_)
+            | HttpError::NotPlaylist => 5,
             HttpError::Io(_) => 1,
             HttpError::Cancelled => 0,
             HttpError::ShortRead => 5,
@@ -205,6 +232,32 @@ pub struct Probe {
     pub accepts_ranges: bool,
     /// 重定向后的最终 URL（文件名兜底解析用）。
     pub final_url: String,
+    /// 响应声明的 MIME 类型（小写，含参数前的部分）。
+    pub content_type: Option<String>,
+}
+
+impl Probe {
+    /// 是否**像是** HLS 播放列表（MIME 命中或文件名以 `.m3u8` 结尾）。
+    ///
+    /// 只是嗅探：`m3u8` 的 MIME 在线上五花八门（`application/vnd.apple.mpegurl`、
+    /// `application/x-mpegurl`、`audio/mpegurl`、甚至 `text/plain`），因此
+    /// 命中后仍必须读正文确认首行是 `#EXTM3U`（见 [`crate::fetch_plan`]
+    /// 的 [`HttpError::NotPlaylist`]）。
+    pub fn is_playlist_hint(&self) -> bool {
+        if let Some(ct) = &self.content_type {
+            let ct = ct.to_ascii_lowercase();
+            if ct.contains("mpegurl") || ct.contains("m3u8") || ct.contains("vnd.apple") {
+                return true;
+            }
+        }
+        let path = self
+            .final_url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(&self.final_url)
+            .to_ascii_lowercase();
+        path.ends_with(".m3u8") || path.ends_with(".m3u")
+    }
 }
 
 /// 探测资源：`GET` + `Range: bytes=0-0`。
@@ -260,6 +313,7 @@ pub async fn probe_with(
                 filename: probe_filename(&headers, &final_url),
                 accepts_ranges: true,
                 final_url,
+                content_type: probe_content_type(&headers),
             });
         }
     }
@@ -282,13 +336,22 @@ pub async fn probe_with(
     };
 
     let filename = probe_filename(&headers, &final_url);
+    let content_type = probe_content_type(&headers);
 
     Ok(Probe {
         total_len,
         filename,
         accepts_ranges,
         final_url,
+        content_type,
     })
+}
+
+/// 响应 MIME（小写；去掉 `;charset=...` 参数）。
+fn probe_content_type(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let raw = headers.get("content-type")?.to_str().ok()?;
+    let mime = raw.split(';').next().unwrap_or(raw).trim().to_ascii_lowercase();
+    (!mime.is_empty()).then_some(mime)
 }
 
 /// 文件名解析：Content-Disposition 优先，URL 路径兜底。
@@ -442,7 +505,7 @@ fn filename_from_content_disposition(cd: &str) -> Option<String> {
 }
 
 /// 从 URL 路径解析文件名（percent 解码后取最后一段）。
-fn filename_from_url(url: &str) -> Option<String> {
+pub(crate) fn filename_from_url(url: &str) -> Option<String> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let last = path.rsplit('/').next().unwrap_or("");
     if last.is_empty() {
