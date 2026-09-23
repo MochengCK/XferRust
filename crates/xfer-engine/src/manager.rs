@@ -305,11 +305,51 @@ impl TaskManager {
 
     /// 注入命令行携带的初始全局选项（与 engine.changeOptions 同一存储；
     /// 会话恢复的设置随后会覆盖同名键）。
+    /// 注入命令行运行时选项（split / bt-* / all-proxy 等）。
+    ///
+    /// **`user-agent` / `all-proxy` / `no-proxy` 必须顺带重建 HTTP 客户端**：
+    /// 客户端在构造时是用默认值建的（`build_client()`，无代理 + 引擎默认 UA），
+    /// 只把这三个键写进 `global_options` 而不重建，CLI 传进来的代理与 UA 就
+    /// 只被存下来、从不生效 —— 表现为"配置里明明填了代理，下载却仍是直连"，
+    /// 对按地区/机房 IP 做拦截的 CDN 直接返回 403。桌面端每次启动都走这条
+    /// 路径注入配置，所以这不是边角情况。
     pub fn set_initial_options(&self, opts: &[(String, String)]) {
-        let mut inner = self.inner.lock().unwrap();
-        for (k, v) in opts {
-            inner.global_options.insert(k.clone(), v.clone());
+        let client_changed = {
+            let mut inner = self.inner.lock().unwrap();
+            let mut changed = false;
+            for (k, v) in opts {
+                if k == "user-agent" || k == "all-proxy" || k == "no-proxy" {
+                    changed = true;
+                }
+                inner.global_options.insert(k.clone(), v.clone());
+            }
+            changed
+        };
+        if client_changed {
+            self.rebuild_http_client();
         }
+    }
+
+    /// 按当前全局 `user-agent` / `all-proxy` / `no-proxy` 重建 HTTP 客户端。
+    ///
+    /// 唯一实现：CLI 注入（[`Self::set_initial_options`]）与运行期热更新
+    /// （`changeGlobalOption`）都必须走这里，否则两条路各写一份，迟早分叉。
+    fn rebuild_http_client(&self) {
+        let (ua, proxy, no_proxy) = {
+            let g = self.inner.lock().unwrap().global_options.clone();
+            (
+                g.get("user-agent").cloned(),
+                g.get("all-proxy").cloned(),
+                g.get("no-proxy").cloned(),
+            )
+        };
+        *self.client.write().unwrap() =
+            xfer_http::build_client_with(ua.as_deref(), proxy.as_deref(), no_proxy.as_deref());
+        tracing::info!(
+            proxy = proxy.as_deref().unwrap_or("(直连)"),
+            user_agent = ua.as_deref().unwrap_or("(引擎默认)"),
+            "HTTP 客户端已按 user-agent / all-proxy / no-proxy 重建"
+        );
     }
 
     /// 启动调度器循环（须在 tokio runtime 内调用，幂等性由调用方保证）。
@@ -2288,20 +2328,7 @@ impl TaskManager {
         // 客户端，后续新连接（含 tracker 订阅）即用新配置；进行中的连接
         // 不受影响（reqwest 连接池按需复用）。
         if client_changed {
-            let (ua, proxy, no_proxy) = {
-                let g = self.inner.lock().unwrap().global_options.clone();
-                (
-                    g.get("user-agent").cloned(),
-                    g.get("all-proxy").cloned(),
-                    g.get("no-proxy").cloned(),
-                )
-            };
-            *self.client.write().unwrap() = xfer_http::build_client_with(
-                ua.as_deref(),
-                proxy.as_deref(),
-                no_proxy.as_deref(),
-            );
-            tracing::info!("HTTP 客户端已按 user-agent / all-proxy / no-proxy 重建");
+            self.rebuild_http_client();
         }
         self.kick();
         self.save_session_now();
@@ -4984,6 +5011,81 @@ mod tests {
             .build()
             .is_ok());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CLI 注入的代理必须**立刻生效**。
+    ///
+    /// `set_initial_options` 早先只把选项写进全局 map、不重建 HTTP 客户端，
+    /// 而客户端是构造时用默认值建的（无代理 + 引擎默认 UA）——于是桌面端
+    /// 每次启动通过 `--all-proxy` 注入的代理形同虚设，下载仍走直连。对按
+    /// 地区/机房 IP 拦截的 CDN（在线视频站的 HLS 清单很常见）表现为
+    /// "配置里明明有代理，下载却 403"。
+    ///
+    /// 这里用一个"假代理"验证：客户端若真的带上了代理，请求会打到本地假
+    /// 代理端口并拿到我们伪造的响应；没带代理时请求会去解析 `example.invalid`
+    /// 而失败。全程离线。
+    #[tokio::test]
+    async fn initial_options_rebuild_http_client_with_proxy() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_in_thread = hits.clone();
+        // 非阻塞 + 30s 上限：拿到请求立刻回伪造响应（正常路径毫秒级返回）；
+        // 客户端没带代理时请求根本不会打到这个端口，线程到期自行退出，
+        // 测试不会挂死（全量并行跑用例时机器繁忙，窗口必须留够）
+        let proxy = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        sock.set_nonblocking(false).ok();
+                        let mut buf = [0u8; 2048];
+                        let _ = sock.read(&mut buf);
+                        let _ =
+                            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nPROXIED");
+                        hits_in_thread.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("xfer-init-proxy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = TaskManager::start(dir.clone(), 1);
+        // 模拟引擎启动时由命令行注入的运行时选项（桌面端每次启动都走这里）
+        mgr.set_initial_options(&[
+            ("all-proxy".to_string(), format!("http://127.0.0.1:{port}")),
+            ("user-agent".to_string(), "UnitUA/9".to_string()),
+        ]);
+
+        let client = mgr.client.read().unwrap().clone();
+        let body = client
+            .get("http://example.invalid/should-go-through-proxy")
+            .send()
+            .await
+            .expect("请求应走假代理")
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(body, "PROXIED", "set_initial_options 注入的 all-proxy 没有生效");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "请求没有打到代理端口");
+        assert_eq!(
+            mgr.get_global_option()["all-proxy"],
+            serde_json::json!(format!("http://127.0.0.1:{port}"))
+        );
+
+        proxy.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
