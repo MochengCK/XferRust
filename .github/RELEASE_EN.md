@@ -3,7 +3,8 @@
 - New HLS (M3U8) support: `.m3u8` URLs are downloaded as playlists, with segments fetched concurrently and concatenated into a **single** file in playlist order — no post-processing merge step
 - Master playlists pick a stream automatically; fMP4 init segments (`#EXT-X-MAP`), byte-range segments (`#EXT-X-BYTERANGE`) and AES-128 segment encryption are all supported
 - Segment-size probing now only runs for small playlists (≤ 32 segments, giving an exact total); a large playlist fires **no probe requests at all** and derives the total live from "bytes downloaded ÷ duration covered" — a 756-segment movie playlist used to fire 756 probe requests and show a frozen progress bar for up to minutes
-- Progress is reported from **bytes received** (including segments still queued for writing), so the speed and byte counters move continuously instead of jumping a segment at a time
+- Progress is **bytes on disk + bytes received for the segment being written**: it keeps moving smoothly, without counting segments that finished downloading but are still buffered in memory waiting for their turn (those bytes are discarded on pause — the UI used to show 40MB and drop to the 1.4MB actually on disk)
+- In-flight downloads are tracked separately from "downloaded, waiting to be written", so one slow segment no longer leaves the other connections idle (measured 1.75–2.6× throughput on a jittery CDN)
 - A segment that stops delivering data for 10s is dropped and reconnected (instead of waiting out the global 30s read timeout), so a silent server no longer stalls the whole in-order write pipeline
 - Resume continues from the last durable contiguous prefix; if the playlist changes, the download restarts from scratch instead of gluing two different playlists together
 - Per-task request headers (`header` / `referer` / `user-agent`) now apply to the playlist, the key and every segment as well
@@ -21,15 +22,17 @@
 - Unsupported cases fail loudly instead of producing a broken file: `SAMPLE-AES` encryption is rejected outright, and when a URL looks like a playlist by extension but the content is not one (a 403 error page, say) the task fails rather than saving that page as a video.
 - When a URL does not look like a playlist but the response declares `mpegurl` (e.g. `application/vnd.apple.mpegurl`), it is tried as a playlist first; if the content really is not a playlist, the download falls back to plain HTTP — neither kind of URL fails because of the sniffing.
 
-### HLS options (`hls-variant` / `hls-probe-size` / `hls-segment-retries`)
+### HLS options (`hls-concurrency` / `hls-variant` / `hls-probe-size` / `hls-segment-retries`)
 
+- `hls-concurrency` sets the segment concurrency (number of in-flight requests, capped at 32) directly. When omitted it is derived from the user's **explicitly set** `max-connection-per-server` / `split` (the smaller of the two when both are set) and defaults to 16 when neither is set.
 - `hls-variant=worst` selects the lowest bitrate variant instead of the highest (the default).
 - `hls-probe-size=false` disables the segment size probe: saves that round of requests, and the total length comes from the live estimate instead. Note that **large playlists are no longer probed anyway** (see above), so this switch only affects playlists with ≤ 32 segments.
 - `hls-segment-retries` sets the transient-failure retry count for a single segment (3 by default).
-- Segment concurrency reuses `split` and `max-connection-per-server` (capped at 32); the per-task `max-download-limit` applies as well.
+- The per-task `max-download-limit` applies as well.
 - `hls=false` forces plain HTTP downloading for a URL whose extension looks like a playlist.
 
 ## Behavior Changes
 
 - A URL ending in `.m3u8` is now downloaded as an HLS playlist instead of as a plain file: the result is a concatenated video file (`.ts` by default, `.mp4` for fMP4) rather than the few-hundred-byte manifest text. Pass `hls=false` for that task to keep the old behavior.
 - URLs whose response declares `mpegurl` (not necessarily ending in `.m3u8`) are now also tried as a playlist first, and fall back to plain HTTP when the content is not a playlist.
+- HLS segment concurrency is no longer squeezed by unset defaults: it used to be `min(split, max-connection-per-server)`, and since both default to 16, raising "max connections per server" to 128 still ran only 16 segments in parallel. Only explicitly set values count now (the smaller of the two), still capped at 32.

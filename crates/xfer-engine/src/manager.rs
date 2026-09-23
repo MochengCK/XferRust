@@ -52,7 +52,12 @@ const MAX_BT_MAX_PEERS: usize = 200;
 /// 分片下载的并发单位是"整个分片"（通常 1~6MiB），不像 HTTP 分片
 /// 那样可以细到几十 KB 一段；16 路已足以跑满常见带宽，再高只会给
 /// CDN 制造 429 与连接中断——而一个分片失败就要整段重下。
+/// 用户显式调高连接数时才放宽到 32（同时在飞的分片各自占着整段内存，
+/// 上限也是内存闸门）。
 const MAX_HLS_CONNECTIONS: usize = 32;
+
+/// HLS 分片并发的默认值（用户没有显式设置任何连接数选项时）。
+const DEFAULT_HLS_CONNECTIONS: usize = 16;
 
 /// 生成 16 字符 hex ID（用于订阅源标识）。
 fn generate_id() -> String {
@@ -1685,11 +1690,11 @@ impl TaskManager {
 
     /// 计算 HLS 播放列表下载参数：任务选项 > 全局选项 > 默认值。
     ///
-    /// 并发沿用 `split` / `max-connection-per-server` 的配置（两端设置页
-    /// 已有这两个键，用户不必再学一组新选项），上限收紧到
-    /// [`MAX_HLS_CONNECTIONS`]；`hls-variant=worst` 取最低码率变体，
-    /// `hls-probe-size=false` 关闭分片预探测（总长将未知），
-    /// `hls-segment-retries` 覆盖单分片重试次数。
+    /// 并发取 `hls-concurrency`，未设置时按用户**显式写过**的
+    /// `max-connection-per-server` / `split` 推导（都不写则
+    /// [`DEFAULT_HLS_CONNECTIONS`]），上限 [`MAX_HLS_CONNECTIONS`]；
+    /// `hls-variant=worst` 取最低码率变体，`hls-probe-size=false`
+    /// 关闭分片预探测（总长将未知），`hls-segment-retries` 覆盖单分片重试次数。
     fn playlist_options(
         &self,
         task: &Task,
@@ -1698,15 +1703,31 @@ impl TaskManager {
         let g = self.inner.lock().unwrap().global_options.clone();
         let t = task.options.lock().unwrap().clone();
         let get = |k: &str| t.get(k).or_else(|| g.get(k));
-        let num = |k: &str, d: usize| {
+        // 只认"用户真的写过"的值：默认值不参与这个判断
+        let explicit = |k: &str| {
             get(k)
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .filter(|n| *n > 0)
-                .unwrap_or(d)
         };
-        let split = num("split", DEFAULT_SPLIT_CONNECTIONS);
-        let max_conn = num("max-connection-per-server", DEFAULT_SPLIT_CONNECTIONS);
-        let concurrency = split.min(max_conn).clamp(1, MAX_HLS_CONNECTIONS);
+        // 分片并发（在飞请求数）。
+        //
+        // HLS 的并发单位是**整个分片**，且所有分片都在同一台主机上：
+        // - `max-connection-per-server`（对单台服务器的连接数上限）最贴语义；
+        // - `split`（把一个文件切成几段下）对分片清单没有意义，但用户常拿它
+        //   当总连接数调，所以也认；
+        // - 两者都**只在用户显式设置时才参与**：它们的默认值都是 16，若一律
+        //   取 min()，用户明确调高的 `max-connection-per-server=128` 会被
+        //   "没人设过"的 split 默认值吃掉，实际只跑 16 路（实测并发 32 在
+        //   CDN 限制单连接吞吐时明显更快）。
+        let concurrency = explicit("hls-concurrency")
+            .or_else(|| match (explicit("split"), explicit("max-connection-per-server")) {
+                (Some(s), Some(m)) => Some(s.min(m)),
+                (Some(s), None) => Some(s),
+                (None, Some(m)) => Some(m),
+                (None, None) => None,
+            })
+            .unwrap_or(DEFAULT_HLS_CONNECTIONS)
+            .clamp(1, MAX_HLS_CONNECTIONS);
         let retries = get("hls-segment-retries")
             .and_then(|v| v.trim().parse::<u32>().ok())
             .unwrap_or(xfer_http::DEFAULT_SEGMENT_RETRIES)
@@ -4686,11 +4707,13 @@ fn spawn_playlist_sampler(
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             iv.tick().await;
-            let completed = stats.completed.load(Ordering::Relaxed);
-            // 进度按**已接收**上报：分片整段写盘，只报落盘字节会让界面在
-            // 两条分片之间长时间不动（用户看到的就是"下一会停一会"）。
-            let received = stats.received.load(Ordering::Relaxed);
-            let progress = received.max(completed);
+            // 进度 = 已落盘字节 + 待写分片已接收字节（`PlaylistStats::progress`）。
+            //
+            // 不能用"全部已接收字节"：分片按清单顺序整段拼接，慢分片前面的
+            // 分片会先下完等在内存里，把这些算进进度会让界面显示一个暂停后
+            // 立刻消失的数字（实测 40MB → 暂停回落 1.4MB）。光标处那一个
+            // 分片算进去，进度才能在两条分片之间连续走字。
+            let progress = stats.progress();
             task.completed_atomic.store(progress, Ordering::Relaxed);
             task.connections_atomic.store(
                 stats.connections.load(Ordering::Relaxed) as u64,
@@ -5108,6 +5131,51 @@ mod tests {
 
         proxy.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// HLS 分片并发只认用户**显式**写过的连接数选项。
+    ///
+    /// 回归点：原先一律取 `min(split, max-connection-per-server)`，而这两个键
+    /// 没设置时都取默认 16 —— 用户把"每服务器最大连接数"调到 128（桌面设置页
+    /// 里就有这一项）实际仍只跑 16 路，调高完全无效。
+    #[tokio::test]
+    async fn hls_concurrency_uses_explicit_connection_options() {
+        let tmp = std::env::temp_dir().join(format!("xfer-hls-conn-{}", std::process::id()));
+        let mgr = TaskManager::new(tmp.clone(), 5);
+        let gid = mgr
+            .add_uri(
+                vec!["http://127.0.0.1:1/movie.m3u8".into()],
+                &serde_json::json!({"pause": "true"}),
+                None,
+            )
+            .unwrap();
+        let task = mgr.task_of(&gid).unwrap();
+        let conn = || mgr.playlist_options(&task, &Vec::new()).concurrency;
+
+        // 谁都没设 → 默认
+        assert_eq!(conn(), DEFAULT_HLS_CONNECTIONS);
+
+        // 用户调高"每服务器最大连接数" → 跟着上去（封顶）
+        mgr.change_global_option(&serde_json::json!({"max-connection-per-server": "128"}))
+            .unwrap();
+        assert_eq!(conn(), MAX_HLS_CONNECTIONS);
+
+        // 显式把 split 调小（"别太猛"）→ 以小的为准
+        mgr.change_global_option(&serde_json::json!({"split": "4"}))
+            .unwrap();
+        assert_eq!(conn(), 4);
+
+        // 专用键优先
+        mgr.change_global_option(&serde_json::json!({"hls-concurrency": "8"}))
+            .unwrap();
+        assert_eq!(conn(), 8);
+
+        // 任务级覆盖全局
+        mgr.change_option(&gid, &serde_json::json!({"hls-concurrency": "2"}))
+            .unwrap();
+        assert_eq!(conn(), 2);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]

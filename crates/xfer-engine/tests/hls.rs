@@ -67,6 +67,17 @@ async fn start_hls_server(
     content_types: HashMap<String, String>,
     seg_delay_ms: u64,
 ) -> HlsServer {
+    start_hls_server_slow(files, content_types, seg_delay_ms, HashMap::new()).await
+}
+
+/// 同上，另可对**指定路径**追加延迟（毫秒）：模拟 CDN 抖动 —— 队头慢、
+/// 后面的分片先下完等在内存里，是"HLS 进度虚高"的现场。
+async fn start_hls_server_slow(
+    files: HashMap<String, Vec<u8>>,
+    content_types: HashMap<String, String>,
+    seg_delay_ms: u64,
+    slow: HashMap<String, u64>,
+) -> HlsServer {
     let mut hits: HashMap<String, Arc<AtomicUsize>> = HashMap::new();
     let mut app = Router::new();
     for (path, body) in files {
@@ -74,6 +85,7 @@ async fn start_hls_server(
         let hit = Arc::new(AtomicUsize::new(0));
         let ct = content_types.get(&path).cloned();
         let delayed = path.starts_with("/show/seg");
+        let extra = slow.get(&path).copied().unwrap_or(0);
         hits.insert(path.clone(), hit.clone());
         app = app.route(
             &path,
@@ -83,8 +95,9 @@ async fn start_hls_server(
                 let ct = ct.clone();
                 async move {
                     hit.fetch_add(1, Ordering::SeqCst);
-                    if delayed && seg_delay_ms > 0 {
-                        tokio::time::sleep(Duration::from_millis(seg_delay_ms)).await;
+                    let wait = if delayed { seg_delay_ms } else { 0 } + extra;
+                    if wait > 0 {
+                        tokio::time::sleep(Duration::from_millis(wait)).await;
                     }
                     let total = data.len();
                     let range = headers
@@ -300,6 +313,68 @@ async fn hls_pause_resume_keeps_prefix() {
         "已持久化的首段不应在恢复后重下"
     );
     assert!(!ctrl_path(&file_of(&st)).exists());
+}
+
+/// 进度不得把"已收但还没轮到写盘"的分片算进去。
+///
+/// 现场：分片按清单顺序整段拼接，队头慢时后面的分片会先下完等在内存里。
+/// 旧实现把这些字节按"已接收"上报，界面能显示 40MB、一暂停回落成磁盘上的
+/// 1.4MB（那些字节还在内存，取消即丢弃）。进度最多只该领先磁盘一个分片。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hls_progress_never_runs_ahead_of_disk_by_more_than_one_segment() {
+    let dir = tmpdir("progress");
+    // 分片要足够大：`FileSink` 自带 512KB 写回缓冲（`position()` 是逻辑位置，
+    // 最多领先文件长度一个缓冲）
+    let seg_bytes = 512 * 1024usize;
+    let count = 6usize;
+    const SINK_BUF: i64 = 512 * 1024;
+    let names: Vec<String> = (1..=count).map(|i| format!("seg{i}.ts")).collect();
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let mut files = HashMap::new();
+    files.insert(
+        "/show/index.m3u8".to_string(),
+        media_playlist(&refs, true).into_bytes(),
+    );
+    for (i, n) in names.iter().enumerate() {
+        files.insert(format!("/show/{n}"), sample(i as u8 + 1, seg_bytes));
+    }
+    // 队头（首片）慢 2.5s，其余分片正常：这段时间里后面的分片会先下完等在
+    // 内存里（旧实现把它们按"已接收"算成已下载，暂停即整段丢弃）
+    let mut slow = HashMap::new();
+    slow.insert("/show/seg1.ts".to_string(), 2_500u64);
+    let srv = start_hls_server_slow(files, HashMap::new(), 0, slow).await;
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = mgr
+        .add_uri(
+            vec![srv.url("/show/index.m3u8")],
+            &serde_json::json!({"dir": dir, "split": "3", "hls-probe-size": "false"}),
+            None,
+        )
+        .expect("addUri 应成功");
+
+    let mut worst: i64 = 0;
+    let mut samples = 0;
+    loop {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let st = tell(&mgr, &gid).await;
+        let disk = std::fs::metadata(file_of(&st)).map(|m| m.len()).unwrap_or(0) as i64;
+        let done = st["completedLength"].as_u64().unwrap_or(0) as i64;
+        // 队头慢的那些采样点 done 就是 0 —— 正是要观察的对象，不能跳过
+        worst = worst.max(done - disk);
+        samples += 1;
+        match st["status"].as_str().unwrap_or_default() {
+            "complete" | "error" => break,
+            _ => {}
+        }
+    }
+    assert!(samples > 3, "采样点太少，没覆盖到下载过程：{samples}");
+    let bound = seg_bytes as i64 + SINK_BUF;
+    assert!(
+        worst <= bound,
+        "进度比磁盘超前 {worst} 字节（上限 {bound} = 一个分片 + 写回缓冲）——\
+         在飞/待写的分片被当成已下载了（旧实现按「全部已接收字节」上报，超前量\
+         约等于并发数 × 分片大小，界面显示 40MB、一暂停回落成磁盘上的 1.4MB）"
+    );
 }
 
 /// 内容嗅探：地址不像清单、但响应声明 mpegurl —— 内容是清单就按 HLS
