@@ -49,6 +49,8 @@ fn media_playlist(paths: &[&str], endlist: bool) -> String {
 struct HlsServer {
     addr: SocketAddr,
     hits: HashMap<String, Arc<AtomicUsize>>,
+    /// 每个请求记一条：(路径, `Range` 头)
+    requests: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>,
 }
 
 impl HlsServer {
@@ -57,6 +59,16 @@ impl HlsServer {
     }
     fn hits(&self, p: &str) -> usize {
         self.hits.get(p).map(|c| c.load(Ordering::SeqCst)).unwrap_or(0)
+    }
+    /// 某个路径收到过的全部 `Range` 头（按时间顺序）。
+    fn ranges(&self, p: &str) -> Vec<Option<String>> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == p)
+            .map(|(_, r)| r.clone())
+            .collect()
     }
 }
 
@@ -70,6 +82,9 @@ async fn start_hls_server(
     start_hls_server_slow(files, content_types, seg_delay_ms, HashMap::new()).await
 }
 
+/// 分块慢发 `(块字节, 块间隔毫秒)`：制造"段内只下到一半就被暂停"的现场。
+type Trickle = HashMap<String, (usize, u64)>;
+
 /// 同上，另可对**指定路径**追加延迟（毫秒）：模拟 CDN 抖动 —— 队头慢、
 /// 后面的分片先下完等在内存里，是"HLS 进度虚高"的现场。
 async fn start_hls_server_slow(
@@ -78,7 +93,19 @@ async fn start_hls_server_slow(
     seg_delay_ms: u64,
     slow: HashMap<String, u64>,
 ) -> HlsServer {
+    start_hls_server_trickle(files, content_types, seg_delay_ms, slow, HashMap::new()).await
+}
+
+async fn start_hls_server_trickle(
+    files: HashMap<String, Vec<u8>>,
+    content_types: HashMap<String, String>,
+    seg_delay_ms: u64,
+    slow: HashMap<String, u64>,
+    trickle: Trickle,
+) -> HlsServer {
     let mut hits: HashMap<String, Arc<AtomicUsize>> = HashMap::new();
+    let requests: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut app = Router::new();
     for (path, body) in files {
         let data = Arc::new(body);
@@ -86,6 +113,9 @@ async fn start_hls_server_slow(
         let ct = content_types.get(&path).cloned();
         let delayed = path.starts_with("/show/seg");
         let extra = slow.get(&path).copied().unwrap_or(0);
+        let trickle_cfg = trickle.get(&path).copied();
+        let requests = requests.clone();
+        let route = path.clone();
         hits.insert(path.clone(), hit.clone());
         app = app.route(
             &path,
@@ -93,8 +123,15 @@ async fn start_hls_server_slow(
                 let data = data.clone();
                 let hit = hit.clone();
                 let ct = ct.clone();
+                let requests = requests.clone();
+                let route = route.clone();
                 async move {
                     hit.fetch_add(1, Ordering::SeqCst);
+                    let range_hdr = headers
+                        .get(header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    requests.lock().unwrap().push((route.clone(), range_hdr.clone()));
                     let wait = if delayed { seg_delay_ms } else { 0 } + extra;
                     if wait > 0 {
                         tokio::time::sleep(Duration::from_millis(wait)).await;
@@ -116,7 +153,25 @@ async fn start_hls_server_slow(
                     let from = from.min(total);
                     let to = (to + 1).min(total).max(from);
                     let body = data[from..to].to_vec();
-                    let mut resp = axum::response::Response::new(axum::body::Body::from(body));
+                    let mut resp = match trickle_cfg {
+                        // 分块慢发：制造"段内只收到一半"的现场
+                        Some((chunk, gap)) => {
+                            let stream = futures_util::stream::unfold(
+                                (body, 0usize),
+                                move |(b, off)| async move {
+                                    if off >= b.len() {
+                                        return None;
+                                    }
+                                    let end = (off + chunk).min(b.len());
+                                    let piece = b[off..end].to_vec();
+                                    tokio::time::sleep(Duration::from_millis(gap)).await;
+                                    Some((Ok::<_, std::io::Error>(piece), (b, end)))
+                                },
+                            );
+                            axum::response::Response::new(axum::body::Body::from_stream(stream))
+                        }
+                        None => axum::response::Response::new(axum::body::Body::from(body)),
+                    };
                     if let Some(ct) = &ct {
                         resp.headers_mut().insert(
                             header::CONTENT_TYPE,
@@ -146,7 +201,11 @@ async fn start_hls_server_slow(
     tokio::spawn(async move {
         let _ = axum::serve(l, app).await;
     });
-    HlsServer { addr, hits }
+    HlsServer {
+        addr,
+        hits,
+        requests,
+    }
 }
 
 async fn tell(mgr: &TaskManager, gid: &Gid) -> serde_json::Value {
@@ -301,6 +360,11 @@ async fn hls_pause_resume_keeps_prefix() {
         .expect("暂停未生效");
     let partial = std::fs::metadata(file_of(&st)).map(|m| m.len()).unwrap_or(0);
     assert!(partial > 0, "暂停时应已落盘部分数据");
+    assert_eq!(
+        st["completedLength"].as_u64().unwrap_or(0),
+        partial,
+        "暂停后的进度必须等于磁盘上的真实字节（含段内续传留住的半截）"
+    );
 
     mgr.unpause(&gid).expect("unpause 应成功");
     let st = wait_status(&mgr, &gid, "complete", 40_000)
@@ -315,16 +379,20 @@ async fn hls_pause_resume_keeps_prefix() {
     assert!(!ctrl_path(&file_of(&st)).exists());
 }
 
-/// 进度不得把"已收但还没轮到写盘"的分片算进去。
+/// 进度 = **已交给文件的字节**，且**绝不倒退**（暂停也不倒退）。
 ///
 /// 现场：分片按清单顺序整段拼接，队头慢时后面的分片会先下完等在内存里。
 /// 旧实现把这些字节按"已接收"上报，界面能显示 40MB、一暂停回落成磁盘上的
-/// 1.4MB（那些字节还在内存，取消即丢弃）。进度最多只该领先磁盘一个分片。
+/// 1.4MB（那些字节还在内存，取消即丢弃）。这条用例钉两件事：
+///   1. 进度不得超前文件（含 `FileSink` 那 512KB 写回缓冲）；
+///   2. 暂停后读到的进度不得小于暂停前看到的峰值。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hls_progress_never_runs_ahead_of_disk_by_more_than_one_segment() {
+async fn hls_progress_is_committed_bytes_and_never_regresses() {
+    use std::time::Instant;
+
     let dir = tmpdir("progress");
-    // 分片要足够大：`FileSink` 自带 512KB 写回缓冲（`position()` 是逻辑位置，
-    // 最多领先文件长度一个缓冲）
+    // 分片要足够大：`FileSink` 自带 512KB 写回缓冲（进度含它，取消时会被
+    // flush 落盘，不算虚报），分片太小就全被缓冲吃掉、磁盘恒为 0
     let seg_bytes = 512 * 1024usize;
     let count = 6usize;
     const SINK_BUF: i64 = 512 * 1024;
@@ -338,8 +406,7 @@ async fn hls_progress_never_runs_ahead_of_disk_by_more_than_one_segment() {
     for (i, n) in names.iter().enumerate() {
         files.insert(format!("/show/{n}"), sample(i as u8 + 1, seg_bytes));
     }
-    // 队头（首片）慢 2.5s，其余分片正常：这段时间里后面的分片会先下完等在
-    // 内存里（旧实现把它们按"已接收"算成已下载，暂停即整段丢弃）
+    // 队头（首片）慢 2.5s，其余分片正常：这段时间里后面的分片会先下完等内存
     let mut slow = HashMap::new();
     slow.insert("/show/seg1.ts".to_string(), 2_500u64);
     let srv = start_hls_server_slow(files, HashMap::new(), 0, slow).await;
@@ -352,28 +419,49 @@ async fn hls_progress_never_runs_ahead_of_disk_by_more_than_one_segment() {
         )
         .expect("addUri 应成功");
 
+    let started = Instant::now();
     let mut worst: i64 = 0;
-    let mut samples = 0;
+    let mut peak: i64 = 0;
+    let mut paused: Option<(i64, i64)> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let st = tell(&mgr, &gid).await;
         let disk = std::fs::metadata(file_of(&st)).map(|m| m.len()).unwrap_or(0) as i64;
         let done = st["completedLength"].as_u64().unwrap_or(0) as i64;
-        // 队头慢的那些采样点 done 就是 0 —— 正是要观察的对象，不能跳过
         worst = worst.max(done - disk);
-        samples += 1;
+        peak = peak.max(done);
+
+        // 队头还在下的时候就暂停：验证"暂停不倒退"
+        if paused.is_none() && started.elapsed() >= Duration::from_millis(700) {
+            mgr.pause(&gid).expect("pause 应成功");
+            let st = wait_status(&mgr, &gid, "paused", 15_000)
+                .await
+                .expect("暂停未生效");
+            paused = Some((
+                st["completedLength"].as_u64().unwrap_or(0) as i64,
+                std::fs::metadata(file_of(&st)).map(|m| m.len()).unwrap_or(0) as i64,
+            ));
+            break;
+        }
         match st["status"].as_str().unwrap_or_default() {
             "complete" | "error" => break,
             _ => {}
         }
     }
-    assert!(samples > 3, "采样点太少，没覆盖到下载过程：{samples}");
-    let bound = seg_bytes as i64 + SINK_BUF;
+
+    let (paused_done, paused_disk) = paused.expect("用例没走到暂停点（下载比预期快？）");
     assert!(
-        worst <= bound,
-        "进度比磁盘超前 {worst} 字节（上限 {bound} = 一个分片 + 写回缓冲）——\
-         在飞/待写的分片被当成已下载了（旧实现按「全部已接收字节」上报，超前量\
-         约等于并发数 × 分片大小，界面显示 40MB、一暂停回落成磁盘上的 1.4MB）"
+        paused_done >= peak,
+        "暂停后进度倒退了：暂停前峰值 {peak} → 暂停后 {paused_done}"
+    );
+    assert!(
+        paused_done <= paused_disk,
+        "暂停后的进度（{paused_done}）比磁盘上的字节（{paused_disk}）还多——虚报"
+    );
+    assert!(
+        worst <= SINK_BUF,
+        "进度比磁盘超前 {worst} 字节（上限 {SINK_BUF} = 写回缓冲）——\
+         在飞/待写的分片被当成已下载了（那些字节暂停即丢弃）"
     );
 }
 
@@ -519,4 +607,81 @@ async fn hls_can_be_disabled_per_task() {
         .expect("应完成");
     assert_eq!(std::fs::read(dir.join("raw.m3u8")).unwrap(), body);
     assert_eq!(srv.hits("/x/seg1.ts"), 0, "不得请求任何分片");
+}
+
+/// **段内续传（引擎级）**：暂停时"下一待写段"已经收到的部分留在文件里，
+/// 恢复时对这一段发 `Range` 接着下 —— 而不是整段重下（一次暂停能省几十 MB）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hls_pause_resume_continues_within_segment() {
+    let dir = tmpdir("partial");
+    let seg_len = 256 * 1024usize;
+    let names = ["seg1.ts", "seg2.ts", "seg3.ts", "seg4.ts"];
+    let segs: Vec<Vec<u8>> = (1..=4).map(|i| sample(i, seg_len)).collect();
+    let mut files = HashMap::new();
+    files.insert(
+        "/show/index.m3u8".to_string(),
+        media_playlist(&names, true).into_bytes(),
+    );
+    for (i, s) in segs.iter().enumerate() {
+        files.insert(format!("/show/seg{}.ts", i + 1), s.clone());
+    }
+    // seg2 慢发：32KB 一块、每块 60ms → 整段约 480ms，暂停点落在中途
+    let mut trickle = HashMap::new();
+    trickle.insert("/show/seg2.ts".to_string(), (32 * 1024usize, 60u64));
+    let srv = start_hls_server_trickle(files, HashMap::new(), 0, HashMap::new(), trickle).await;
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    // 并发 1：严格按序，暂停时"下一待写段"就是 seg2
+    let gid = mgr
+        .add_uri(
+            vec![srv.url("/show/index.m3u8")],
+            &serde_json::json!({"dir": dir, "split": "1", "hls-probe-size": "false"}),
+            None,
+        )
+        .expect("addUri 应成功");
+
+    assert!(
+        wait_progress(&mgr, &gid, seg_len as u64, 20_000).await,
+        "20s 内未看到首段落盘"
+    );
+    let mut waited = 0u64;
+    while srv.hits("/show/seg2.ts") == 0 && waited < 5_000 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waited += 20;
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    mgr.pause(&gid).expect("pause 应成功");
+    let st = wait_status(&mgr, &gid, "paused", 15_000)
+        .await
+        .expect("暂停未生效");
+    let file = file_of(&st);
+    let paused_len = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        paused_len > seg_len as u64 && paused_len < (seg_len * 2) as u64,
+        "暂停时应留住第 2 段的半截（实际 {paused_len} 字节）"
+    );
+    assert_eq!(
+        st["completedLength"].as_u64().unwrap_or(0),
+        paused_len,
+        "暂停后的进度必须等于磁盘上的真实字节"
+    );
+    let part = paused_len - seg_len as u64;
+
+    mgr.unpause(&gid).expect("unpause 应成功");
+    let st = wait_status(&mgr, &gid, "complete", 40_000)
+        .await
+        .expect("恢复后 40s 内未完成");
+    let expected: Vec<u8> = segs.iter().flatten().copied().collect();
+    assert_eq!(
+        std::fs::read(file_of(&st)).unwrap(),
+        expected,
+        "段内续传产物必须严丝合缝（多写一遍开头就会错位）"
+    );
+    let rs = srv.ranges("/show/seg2.ts");
+    assert_eq!(rs.len(), 2, "seg2 只应被请求两次：首次 + 续传，不该整段重下");
+    assert_eq!(
+        rs[1].as_deref(),
+        Some(format!("bytes={part}-").as_str()),
+        "续传请求必须从段内续传位置接着下"
+    );
 }

@@ -164,29 +164,24 @@ impl Default for PlaylistOptions {
     }
 }
 
-/// 引擎轮询的进度句柄（无锁原子 + 一组分片计数槽位）。
+/// 引擎轮询的进度句柄（无锁原子）。
 pub struct PlaylistStats {
-    /// 已落盘（fsync）字节数，含续传基线。
+    /// 已交给文件的字节数（含 `FileSink` 那 512KB 写回缓冲——取消/失败收尾
+    /// 会 `flush()` 把它落盘，所以这些字节**不会被丢弃**），含续传基线。
     pub completed: AtomicU64,
     /// 已从网络读到的字节数（**含还没轮到写盘的在飞分片**），含续传基线。
     ///
-    /// 只作诊断，**不参与进度**：这里面有一大截还在内存里，取消/暂停时
-    /// 整段丢弃。曾经拿它当进度上报，界面能显示 40MB、一暂停回落成 1.4MB。
+    /// 只作诊断与**速度**来源（见 [`Self::progress`]），不参与进度：
+    /// 这里面有一大截还在内存里，取消/暂停时整段丢弃。
     pub received: AtomicU64,
     /// 当前在飞分片数。
     pub connections: AtomicUsize,
-    /// 下一个待写分片的序号（绝对序号，`#EXT-X-MAP` 初始化段算 0）。
-    pub cursor: AtomicUsize,
     /// 总字节数的**实时估算**（0 = 还没法估）。
     ///
     /// 大清单不做预探测，改用「已下字节 ÷ 已覆盖时长 × 总时长」外推：
     /// 一开始只有粗估值，随着分片落地越来越准；`plan.total` 已知时
     /// （小清单探测过）这里始终为 0，由调用方优先用精确值。
     pub estimated_total: AtomicU64,
-    /// 每个分片各自的已接收字节（按绝对序号，按需增长）。
-    ///
-    /// 进度只取[`Self::cursor`]处那一个：见 [`Self::progress`]。
-    slots: Mutex<Vec<Arc<AtomicU64>>>,
 }
 
 impl PlaylistStats {
@@ -195,39 +190,27 @@ impl PlaylistStats {
             completed: AtomicU64::new(baseline),
             received: AtomicU64::new(baseline),
             connections: AtomicUsize::new(0),
-            cursor: AtomicUsize::new(0),
             estimated_total: AtomicU64::new(0),
-            slots: Mutex::new(Vec::new()),
         })
     }
 
-    /// 某个分片的计数槽位（不存在就按需建，槽位只增不删）。
-    pub fn slot(&self, index: usize) -> Arc<AtomicU64> {
-        let mut slots = self.slots.lock().unwrap();
-        if index >= slots.len() {
-            slots.resize_with(index + 1, || Arc::new(AtomicU64::new(0)));
-        }
-        slots[index].clone()
-    }
-
-    /// 进度 = **已落盘字节 + 待写分片已接收字节**。
+    /// 进度 = **已交给文件、且取消时不会被丢弃的字节数**（即 `completed`）。
     ///
-    /// 为什么不是"全部已接收字节"：分片整段下完、按序追加，下一个待写的
-    /// 分片若是慢分片，其余分片会先下完等在内存里 —— 把这些字节算作
-    /// "已下载"，界面显示的是**随时会被丢掉**的字节数（暂停即从 40MB
-    /// 回落成磁盘上的 1.4MB）。
+    /// 这个口径只有一个要求：**绝不倒退**。界面上的数字一旦回落，用户第一
+    /// 反应就是"进度虚报"。
     ///
-    /// 光标处那一个分片的字节要算：它就是紧接着要落盘的内容，算上它
-    /// 进度才能在两条分片之间连续走字（这也是当初改用"已接收"的原因）。
-    /// 代价是进度最多领先磁盘一个分片。
+    /// 所以不能算「在飞分片的已收字节」：
+    /// - 分片是整段下完、按清单顺序追加的，队头慢时后面的分片会先下完等在
+    ///   内存里。把这些字节算进进度，界面能显示 40MB，一暂停回落成磁盘上的
+    ///   1.4MB（那些字节**确实**被丢弃了 —— 进度不能为它们背书）。
+    /// - 反过来，`completed` 里含 `FileSink` 的写回缓冲：取消/失败收尾会
+    ///   `flush()`，它们一定落到磁盘上，留着不算虚报。
+    ///
+    /// 代价是进度只能在**分片落盘的时刻**跳一下（并发 16~32 路时通常是
+    /// 每秒数次），而不是字节级平滑。**速度**不走这里：由 `received` 驱动
+    /// （见 `spawn_playlist_sampler`），所以"速度显示 0"的老问题不会回来。
     pub fn progress(&self) -> u64 {
-        let done = self.completed.load(Ordering::Relaxed);
-        let cursor = self.cursor.load(Ordering::Relaxed);
-        let slots = self.slots.lock().unwrap();
-        match slots.get(cursor) {
-            Some(n) => done.saturating_add(n.load(Ordering::Relaxed)),
-            None => done,
-        }
+        self.completed.load(Ordering::Relaxed)
     }
 }
 
@@ -768,8 +751,16 @@ struct PlaylistCtrl {
     segs: usize,
     /// 已持久化的连续前缀（段数，含初始化段）
     prefix: usize,
-    /// 已持久化字节数（= 对应文件长度）
+    /// 「完整前缀」部分的字节数（文件里 `0..bytes` 这一段由完整的段拼成）
     bytes: u64,
+    /// **段内续传**：第 `prefix` 段（下一个待写的那段）已经有这么多字节落在
+    /// `bytes` 之后。0 = 该段一个字节都没写。
+    ///
+    /// 有它才能"暂停不丢在飞分片"：暂停时把该段已收到的部分直接追加进文件，
+    /// 恢复时对这一段发 `Range: bytes=part-` 接着下，而不是整段重来。
+    /// 老的 v1 控制文件没有这个字段 → 缺省 0，语义与从前一致（只认完整前缀）。
+    #[serde(default)]
+    part: u64,
 }
 
 const CTRL_KIND: &str = "hls-playlist";
@@ -823,19 +814,74 @@ fn save_ctrl(path: &Path, c: &PlaylistCtrl) {
     }
 }
 
+/// 续传现场：文件里已经持久化的内容。
+///
+/// 关键不变式：**文件 = 「完整前缀」+ 「第 prefix 段的开头 part 字节」**，
+/// 所以文件长度恒等于 `prefix_bytes + part`；要丢弃尾巴（例如服务器不支持
+/// `Range`、续不了段内）时截断到 `prefix_bytes` 即可。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResumeState {
+    /// 「完整前缀」部分的字节数（文件里 `0..prefix_bytes` 是完整段拼出来的）
+    pub prefix_bytes: u64,
+    /// 已完成的段数（含初始化段）
+    pub prefix: usize,
+    /// 第 `prefix` 段已经落在文件里的字节数（0 = 该段从未写过）
+    pub part: u64,
+}
+
+impl ResumeState {
+    pub(crate) const NONE: ResumeState = ResumeState {
+        prefix_bytes: 0,
+        prefix: 0,
+        part: 0,
+    };
+
+    /// 文件当前应有的长度（= 完整前缀 + 段内已落部分）。
+    pub(crate) fn file_bytes(&self) -> u64 {
+        self.prefix_bytes.saturating_add(self.part)
+    }
+}
+
+/// 读控制文件并核对磁盘，得到可安全续传的现场。
+///
+/// 三种退化：文件长度够 `prefix_bytes + part` → 原样续传；只够 `prefix_bytes`
+/// （段内那截被截掉了/没落盘）→ 退化成整段重下；连前缀都不够 → 从头来。
+fn resume_state(path: &Path, plan: &PlaylistPlan) -> ResumeState {
+    let ctrl = xfer_storage::ctrl_path(path);
+    let Some(c) = load_ctrl(&ctrl, plan) else {
+        return ResumeState::NONE;
+    };
+    if c.prefix > plan.segment_count() {
+        return ResumeState::NONE;
+    }
+    let Ok(m) = std::fs::metadata(path) else {
+        return ResumeState::NONE;
+    };
+    if m.len() >= c.bytes.saturating_add(c.part) {
+        return ResumeState {
+            prefix_bytes: c.bytes,
+            prefix: c.prefix,
+            part: c.part,
+        };
+    }
+    if m.len() >= c.bytes {
+        return ResumeState {
+            prefix_bytes: c.bytes,
+            prefix: c.prefix,
+            part: 0,
+        };
+    }
+    ResumeState::NONE
+}
+
 /// 续传水位：`(已持久化字节数, 已持久化段数)`。
 ///
 /// 引擎在启动下载前用它回填进度与分片位图基线；`download_playlist`
-/// 内部再算一次（纯函数，结果一致）。
+/// 内部再算一次（纯函数，结果一致）。字节数含段内已落的那一截
+/// （即磁盘上的真实长度）。
 pub fn resume_point(path: &Path, plan: &PlaylistPlan) -> (u64, usize) {
-    let ctrl = xfer_storage::ctrl_path(path);
-    let Some(c) = load_ctrl(&ctrl, plan) else {
-        return (0, 0);
-    };
-    match std::fs::metadata(path) {
-        Ok(m) if m.len() >= c.bytes && c.prefix <= plan.segment_count() => (c.bytes, c.prefix),
-        _ => (0, 0),
-    }
+    let st = resume_state(path, plan);
+    (st.file_bytes(), st.prefix)
 }
 
 // ---------------------------------------------------------------------------
@@ -930,27 +976,47 @@ impl Drop for ConnGuard<'_> {
     }
 }
 
+/// 一个分片取回来的数据。
+struct SegBody {
+    /// 段内续传之后再取到的**剩余部分**（从 `Range` 起点开始）。
+    data: Vec<u8>,
+    /// 服务器无视我们发的 `Range`、回了整段（数据从**段首**开始）。
+    ///
+    /// 这时已有的"段内续传那截"必须丢掉，否则会把同一段开头写两遍。
+    whole: bool,
+}
+
 /// 拉取单个分片（含重试、限速、解密）。
+///
+/// `buf` 是该分片的**共享缓冲**：字节边读边写进去，调用方 `mem::take` 取走。
+/// 之所以不放在 future 内部：暂停/取消会把 future 直接 drop，那时这段数据
+/// 就没了 —— 而"下一待写段"的这截数据是可以留在文件里、下次 `Range` 接着下的。
 async fn fetch_segment(
     ctx: &Ctx<'_>,
     seg: &Segment,
-    slot: &AtomicU64,
-) -> Result<Vec<u8>, HttpError> {
+    buf: &Mutex<Vec<u8>>,
+    resume_from: u64,
+) -> Result<SegBody, HttpError> {
     let mut attempt = 1u32;
     loop {
         if ctx.is_cancelled() {
             return Err(HttpError::Cancelled);
         }
+        buf.lock().unwrap().clear();
         let r = async {
             let _conn = ConnGuard::new(&ctx.stats.connections);
             let key = match &seg.key {
                 Some(k) => Some(fetch_key(ctx, &k.url).await?),
                 None => None,
             };
-            let body = fetch_body(ctx, seg, slot).await?;
+            let whole = fetch_body(ctx, seg, buf, resume_from).await?;
+            let data = std::mem::take(&mut *buf.lock().unwrap());
             match (&key, &seg.key) {
-                (Some(k), Some(sk)) => decrypt_segment(k, &sk.iv, &body),
-                _ => Ok(body),
+                (Some(k), Some(sk)) => decrypt_segment(k, &sk.iv, &data).map(|d| SegBody {
+                    data: d,
+                    whole: false,
+                }),
+                _ => Ok(SegBody { data, whole }),
             }
         }
         .await;
@@ -973,24 +1039,22 @@ async fn fetch_segment(
     }
 }
 
-/// 分片字节计数守卫：每读到一个 chunk 就累加到该分片的槽位与全局
-/// `received`；**没走到"成功拿到整段"就 Drop**（失败重试、取消、
-/// future 被直接丢弃）时把这一趟的字节扣回去。
+/// 分片字节计数守卫：每读到一个 chunk 就累加到全局 `received`；
+/// **没走到"成功拿到整段"就 Drop**（失败重试、取消、future 被直接丢弃）时
+/// 把这一趟的字节扣回去。
 ///
 /// 只在 `Err` 分支扣数的写法漏掉了 future 被 drop 的路径 —— 暂停、
 /// 任务提前收尾、`futures` 队列被丢弃时走不到那段清理代码，计数会
-/// 永久虚高。`Drop` 兜住所有路径。
+/// 永久虚高（速度/`received` 就再也对不上真实网速）。
 struct SegCount<'a> {
-    slot: &'a AtomicU64,
     total: &'a AtomicU64,
     counted: u64,
     keep: bool,
 }
 
 impl<'a> SegCount<'a> {
-    fn new(slot: &'a AtomicU64, total: &'a AtomicU64) -> Self {
+    fn new(total: &'a AtomicU64) -> Self {
         Self {
-            slot,
             total,
             counted: 0,
             keep: false,
@@ -999,7 +1063,6 @@ impl<'a> SegCount<'a> {
 
     fn add(&mut self, n: u64) {
         self.counted += n;
-        self.slot.fetch_add(n, Ordering::Relaxed);
         self.total.fetch_add(n, Ordering::Relaxed);
     }
 
@@ -1012,7 +1075,6 @@ impl<'a> SegCount<'a> {
 impl Drop for SegCount<'_> {
     fn drop(&mut self) {
         if !self.keep && self.counted > 0 {
-            self.slot.fetch_sub(self.counted, Ordering::Relaxed);
             self.total.fetch_sub(self.counted, Ordering::Relaxed);
         }
     }
@@ -1025,10 +1087,17 @@ impl Drop for SegCount<'_> {
 /// 服务器"接受连接后不吭声"是线上最常见的假死形态，靠客户端全局的
 /// read_timeout（30s）兜底太钝：一条僵死连接会顶住整条按序写盘的水位，
 /// 表现为"下一会儿停几分钟"；这里超时即断开重连（错误可重试），恢复快得多。
-async fn fetch_body(ctx: &Ctx<'_>, seg: &Segment, slot: &AtomicU64) -> Result<Vec<u8>, HttpError> {
-    // 失败/取消/被丢弃时守卫会把这一趟的字节从计数里扣回去，不会虚高
-    let mut count = SegCount::new(slot, &ctx.stats.received);
-    let r = fetch_body_inner(ctx, seg, &mut count).await;
+///
+/// 返回"服务器是否无视了 `Range`"（见 [`SegBody::whole`]）。
+async fn fetch_body(
+    ctx: &Ctx<'_>,
+    seg: &Segment,
+    buf: &Mutex<Vec<u8>>,
+    resume_from: u64,
+) -> Result<bool, HttpError> {
+    // 失败/取消/被丢弃时守卫会把这一趟的字节从"已接收"里扣回去，不会虚高
+    let mut count = SegCount::new(&ctx.stats.received);
+    let r = fetch_body_inner(ctx, seg, buf, resume_from, &mut count).await;
     if r.is_ok() {
         count.keep();
     }
@@ -1038,11 +1107,21 @@ async fn fetch_body(ctx: &Ctx<'_>, seg: &Segment, slot: &AtomicU64) -> Result<Ve
 async fn fetch_body_inner(
     ctx: &Ctx<'_>,
     seg: &Segment,
+    buf: &Mutex<Vec<u8>>,
+    resume_from: u64,
     count: &mut SegCount<'_>,
-) -> Result<Vec<u8>, HttpError> {
+) -> Result<bool, HttpError> {
+    // 区间起点：清单里的 `#EXT-X-BYTERANGE` 偏移 + 段内续传偏移
+    let base_off = seg.range.map(|(o, _)| o).unwrap_or(0);
+    let end = seg.range.map(|(o, l)| o + l.saturating_sub(1));
+    let start = base_off.saturating_add(resume_from);
     let mut req = apply_headers(ctx.client.get(&seg.url), ctx.headers);
-    if let Some((off, len)) = seg.range {
-        req = req.header("Range", format!("bytes={}-{}", off, off + len.saturating_sub(1)));
+    if resume_from > 0 || end.is_some() {
+        let range = match end {
+            Some(e) => format!("bytes={start}-{e}"),
+            None => format!("bytes={start}-"),
+        };
+        req = req.header("Range", range);
     }
     let resp = tokio::select! {
         biased;
@@ -1057,7 +1136,11 @@ async fn fetch_body_inner(
     if !status.is_success() {
         return Err(HttpError::Http(status.as_u16()));
     }
-    let mut buf: Vec<u8> = Vec::with_capacity(seg.size.unwrap_or(1 << 20) as usize);
+    // 要了区间却回整段（200 而非 206）：段内续传被无视，数据是从段首开始的
+    let whole = resume_from > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT;
+    buf.lock()
+        .unwrap()
+        .reserve(seg.size.unwrap_or(1 << 20) as usize);
     let mut stream = resp.bytes_stream();
     loop {
         let chunk = tokio::select! {
@@ -1079,22 +1162,31 @@ async fn fetch_body_inner(
         if let Some(l) = ctx.limiter {
             l.acquire(chunk.len()).await;
         }
-        // 读到就计数（落到本分片自己的槽位；进度只取光标处那个槽位）
+        // 读到就计数：进度不算它，但**速度**要（见 `PlaylistStats::progress`）
         count.add(chunk.len() as u64);
-        buf.extend_from_slice(&chunk);
+        buf.lock().unwrap().extend_from_slice(&chunk);
     }
-    if let Some(expected) = seg.size {
-        if buf.len() as u64 != expected {
+    let got = buf.lock().unwrap().len() as u64;
+    if whole {
+        // 回了整段：按"整段"校验（调用方会丢掉文件里那截续传数据）
+        if let Some(total) = seg.size {
+            if got != total {
+                return Err(HttpError::ShortRead);
+            }
+        }
+    } else if let Some(expected) = seg.size.map(|s| s.saturating_sub(resume_from)) {
+        if got != expected {
             return Err(HttpError::ShortRead);
         }
     }
-    Ok(buf)
+    Ok(whole)
 }
 
 /// 按计划下载分片并顺序拼接写入 `path`。
 ///
-/// 取消时返回 [`HttpError::Cancelled`]，已持久化的连续前缀保留在控制
-/// 文件中，下次调用从该处续传。
+/// 取消时返回 [`HttpError::Cancelled`]：已持久化的内容（完整前缀 + 「下一
+/// 待写段」已经收到的开头部分）留在文件与控制文件里，下次调用从该处续传，
+/// 段内那截用 `Range` 接着下，不必整段重来。
 pub async fn download_playlist(
     client: &reqwest::Client,
     path: &Path,
@@ -1118,27 +1210,39 @@ pub async fn download_playlist(
 
     let ctrl_path = xfer_storage::ctrl_path(path);
     let fp = fingerprint(plan);
-    // resume_point 返回 (已持久化字节数, 已持久化段数)
-    let (mut bytes, mut prefix) = resume_point(path, plan);
-    if prefix > 0 && bytes == 0 {
-        prefix = 0;
-    }
+
+    // 续传现场：文件 = 「完整前缀」+ 「第 prefix 段的开头 part 字节」
+    let st = resume_state(path, plan);
+    let prefix = st.prefix.min(all.len());
+    let mut complete_bytes = st.prefix_bytes; // 完整前缀的字节数
+    // 段内续传的偏移只对明文段有效：AES-128-CBC 分段从中间接不上（IV 链断）
+    let mut pending_resume = if prefix < all.len() && all[prefix].key.is_none() {
+        st.part
+    } else {
+        0
+    };
+    // 段内续传**不预先探测** `Range` 支持：直接按续传位置发请求，服务器若无视
+    // `Range` 回了整段，`SegBody::whole` 那条回退会把文件截回完整前缀再整段写，
+    // 结果一样正确。省掉一次探测请求（还避开"暂停后连接半死、探测结论不可信"）。
+    let have_bytes = complete_bytes.saturating_add(pending_resume);
 
     // 落位：续传时截断到已持久化水位（丢弃上次未 fsync 的尾巴），否则重建
-    let mut sink = if prefix > 0 {
+    let mut sink = if have_bytes > 0 {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         std::fs::OpenOptions::new()
             .write(true)
             .open(path)
-            .and_then(|f| f.set_len(bytes))
+            .and_then(|f| f.set_len(have_bytes))
             .map_err(|e| HttpError::Io(e.to_string()))?;
-        FileSink::append_at(path, bytes).map_err(|e| HttpError::Io(e.to_string()))?
+        FileSink::append_at(path, have_bytes).map_err(|e| HttpError::Io(e.to_string()))?
     } else {
         FileSink::create(path).map_err(|e| HttpError::Io(e.to_string()))?
     };
-    stats.completed.store(bytes, Ordering::Relaxed);
+    stats.completed.store(have_bytes, Ordering::Relaxed);
+    // 文件当前长度（终局保存水位时用；`complete_bytes` 只到最后一个完整段）
+    let mut file_bytes = have_bytes;
 
     let ctx = Ctx {
         client,
@@ -1157,7 +1261,7 @@ pub async fn download_playlist(
     //   done_bytes/done_dur/done_segs 都从续传基线起步，
     //   估算 = max(按字节密度外推, 已下字节 + 平均分片大小 × 剩余分片数)
     let need_estimate = plan.total.is_none();
-    let mut est_done_bytes: u64 = bytes;
+    let mut est_done_bytes: u64 = have_bytes;
     let mut est_done_dur: f64 = all[..prefix].iter().map(|s| s.duration).sum();
     let publish_estimate = |stats: &PlaylistStats,
                             est_done_bytes: u64,
@@ -1176,7 +1280,8 @@ pub async fn download_playlist(
     };
     publish_estimate(&stats, est_done_bytes, est_done_dur, prefix);
     let mut last_save = std::time::Instant::now() - CTRL_SAVE_INTERVAL;
-    let ctrl_of = |prefix: usize, bytes: u64| PlaylistCtrl {
+    // `bytes` = 完整前缀的字节数；`part` = 紧跟着的段内续传那截
+    let ctrl_of = |prefix: usize, bytes: u64, part: u64| PlaylistCtrl {
         kind: CTRL_KIND.to_string(),
         v: 1,
         fp: fp.clone(),
@@ -1184,23 +1289,22 @@ pub async fn download_playlist(
         segs: total_segments,
         prefix,
         bytes,
+        part,
     };
-
-    // 进度光标：待写分片 = 进度里允许算进去的那一个（见 `PlaylistStats::progress`）
-    stats.cursor.store(prefix, Ordering::Relaxed);
 
     // 重排窗口：**在飞下载**与**已下好待写**分开计。
     //
     // `futures::buffered(conn)` 把"下好但排在慢分片之后"的分片一直留在队列里，
-    // 占着在飞名额、不再补新分片 —— 队头一慢，其余连接全部空转（这些字节还会
-    // 被当成进度，暂停时整段丢弃）。这里改成：并发上限只管真正在跑的请求，
-    // "已下好待写"另有一个内存预算 [`MAX_UNWRITTEN_BYTES`]，预算内继续往前跑，
-    // 写盘只在连续前缀可用时推进。
+    // 占着在飞名额、不再补新分片 —— 队头一慢，其余连接全部空转。这里改成：
+    // 并发上限只管真正在跑的请求，"已下好待写"另有一个内存预算
+    // [`MAX_UNWRITTEN_BYTES`]，预算内继续往前跑，写盘只在连续前缀可用时推进。
     let mut ready: HashMap<usize, Vec<u8>> = HashMap::new();
     let mut ready_bytes: u64 = 0;
     let mut in_flight: usize = 0;
     let mut next_spawn = prefix;
-    let mut futs: FuturesUnordered<BoxFuture<'_, (usize, Result<Vec<u8>, HttpError>)>> =
+    // 在飞分片的共享缓冲（暂停时"下一待写段"的那截靠它落盘续传）
+    let mut partials: HashMap<usize, Arc<Mutex<Vec<u8>>>> = HashMap::new();
+    let mut futs: FuturesUnordered<BoxFuture<'_, (usize, Result<SegBody, HttpError>)>> =
         FuturesUnordered::new();
 
     let mut failure: Option<HttpError> = None;
@@ -1218,9 +1322,9 @@ pub async fn download_playlist(
             }
             written += 1;
             est_done_bytes = sink.position();
+            complete_bytes = est_done_bytes; // 刚写完的是一整段，文件里没有半截尾巴
             est_done_dur += seg_dur;
             stats.completed.store(est_done_bytes, Ordering::Relaxed);
-            stats.cursor.store(written, Ordering::Relaxed);
             publish_estimate(&stats, est_done_bytes, est_done_dur, written);
             if last_save.elapsed() >= CTRL_SAVE_INTERVAL {
                 // 先 fsync 再记水位：控制文件绝不领先磁盘（同上层的续传不变式）
@@ -1228,8 +1332,7 @@ pub async fn download_playlist(
                     failure = Some(HttpError::Io(e.to_string()));
                     break;
                 }
-                bytes = sink.position();
-                save_ctrl(&ctrl_path, &ctrl_of(written, bytes));
+                save_ctrl(&ctrl_path, &ctrl_of(written, complete_bytes, 0));
                 last_save = std::time::Instant::now();
             }
         }
@@ -1244,18 +1347,43 @@ pub async fn download_playlist(
             let i = next_spawn;
             next_spawn += 1;
             in_flight += 1;
+            // 上一次没收完的"下一待写段"：这一段要按段内续传的偏移接着下
+            let resume_from = if i == written { std::mem::take(&mut pending_resume) } else { 0 };
             let seg = &all[i];
-            let slot = stats.slot(i);
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            partials.insert(i, buf.clone());
             let ctx = &ctx;
             futs.push(Box::pin(async move {
-                let r = fetch_segment(ctx, seg, &slot).await;
+                let r = fetch_segment(ctx, seg, &buf, resume_from).await;
                 (i, r)
             }));
         }
         // 3) 等一个下载结果（拿到就先回到 1) 写盘）
         match futs.next().await {
-            Some((i, Ok(data))) => {
+            Some((i, Ok(body))) => {
                 in_flight -= 1;
+                partials.remove(&i);
+                let data = body.data;
+                if body.whole && sink.position() > complete_bytes {
+                    // 服务器无视 Range 回了整段：把文件里那截续传数据丢掉再写，
+                    // 否则同一段的开头会被写两遍
+                    tracing::debug!(seg = i, "分片服务器不支持 Range，丢弃段内续传数据");
+                    if let Err(e) = sink.flush() {
+                        failure = Some(HttpError::Io(e.to_string()));
+                        break;
+                    }
+                    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+                        let _ = f.set_len(complete_bytes);
+                    }
+                    match FileSink::append_at(path, complete_bytes) {
+                        Ok(s) => sink = s,
+                        Err(e) => {
+                            failure = Some(HttpError::Io(e.to_string()));
+                            break;
+                        }
+                    }
+                    stats.completed.store(complete_bytes, Ordering::Relaxed);
+                }
                 ready_bytes = ready_bytes.saturating_add(data.len() as u64);
                 ready.insert(i, data);
             }
@@ -1278,6 +1406,21 @@ pub async fn download_playlist(
     // 收尾：丢掉仍在飞的请求（守卫会把它们这趟读到的字节从计数里扣回去）
     drop(futs);
 
+    // **段内续传**：把"下一待写段"已经收到的那截追加进文件 —— 它不是白下的，
+    // 下次对这一段发 `Range: bytes=part-` 就接着下（暂停不再整段重来）。
+    // 只有"下一待写段"能续：写盘严格按序，别的段都要等它。
+    if failure.is_some() {
+        let encrypted = all.get(written).map(|s| s.key.is_some()).unwrap_or(true);
+        let tail: Vec<u8> = partials
+            .remove(&written)
+            .map(|b| std::mem::take(&mut *b.lock().unwrap()))
+            .unwrap_or_default();
+        if !encrypted && !tail.is_empty() && sink.write(&tail).is_ok() {
+            est_done_bytes = sink.position();
+            stats.completed.store(est_done_bytes, Ordering::Relaxed);
+        }
+    }
+
     // 终局：刷盘 + 保存水位；全部完成时删除控制文件
     let flush = sink.flush().map_err(|e| HttpError::Io(e.to_string()));
     if let Err(e) = flush {
@@ -1285,24 +1428,26 @@ pub async fn download_playlist(
             failure = Some(e);
         }
     } else {
-        bytes = sink.position();
+        file_bytes = sink.position();
     }
+    // 文件尾部多出来的这截就是段内续传部分（完整前缀之外的内容）
+    let part = file_bytes.saturating_sub(complete_bytes);
     match (&failure, written == total_segments) {
         (Some(_), _) => {
-            save_ctrl(&ctrl_path, &ctrl_of(written, bytes));
+            save_ctrl(&ctrl_path, &ctrl_of(written, complete_bytes, part));
             return Err(failure.unwrap());
         }
         (None, true) => {
             let _ = std::fs::remove_file(&ctrl_path);
             return Ok(PlaylistDone {
-                bytes,
+                bytes: file_bytes,
                 segments: written,
                 total_segments,
             });
         }
         (None, false) => {
             // 分片流提前结束（清单被服务端截断）：保留水位，按失败上报
-            save_ctrl(&ctrl_path, &ctrl_of(written, bytes));
+            save_ctrl(&ctrl_path, &ctrl_of(written, complete_bytes, part));
             return Err(HttpError::Protocol(format!(
                 "播放列表未下载完整: {written}/{total_segments} 段"
             )));
@@ -1547,6 +1692,8 @@ mod tests {
     struct TestServer {
         base: String,
         hits: HashMap<String, Arc<AtomicUsize>>,
+        /// 每个请求记一条：(路径, `Range` 头)
+        requests: Arc<Mutex<Vec<(String, Option<String>)>>>,
     }
 
     impl TestServer {
@@ -1556,6 +1703,30 @@ mod tests {
         fn hits(&self, p: &str) -> usize {
             self.hits.get(p).map(|c| c.load(Ordering::SeqCst)).unwrap_or(0)
         }
+        /// 某个路径上收到的全部 `Range` 头（按时间顺序）。
+        fn ranges(&self, p: &str) -> Vec<Option<String>> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _)| path == p)
+                .map(|(_, r)| r.clone())
+                .collect()
+        }
+    }
+
+    /// 测试服务端行为开关（默认全关）。
+    #[derive(Default, Clone)]
+    struct ServerOpts {
+        /// 前 N 次请求返回 500（模拟瞬时故障）
+        fail_first: HashMap<String, usize>,
+        /// 响应前的固定延迟（毫秒），模拟 CDN 抖动
+        delays: HashMap<String, u64>,
+        /// 分块慢发 `(块字节, 块间隔毫秒)`：用来制造"段内只下到一半"的场景
+        trickle: HashMap<String, (usize, u64)>,
+        /// 只认"从 0 开始"的 `Range`：非 0 起点的区间请求一律回整段（200）。
+        /// 这是线上真实存在的 CDN 怪癖，用来验证段内续传被拒时的回退。
+        range_only_from_zero: std::collections::HashSet<String>,
     }
 
     /// 起一个支持 Range 的静态文件服务；`fail_first` 里列出的路径前 N 次
@@ -1564,7 +1735,14 @@ mod tests {
         files: HashMap<String, Vec<u8>>,
         fail_first: HashMap<String, usize>,
     ) -> TestServer {
-        start_server_with_delay(files, fail_first, HashMap::new()).await
+        start_server_opts(
+            files,
+            ServerOpts {
+                fail_first,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
     /// 同上，另可按路径注入"响应前延迟"（毫秒）——模拟 CDN 抖动，
@@ -1574,18 +1752,38 @@ mod tests {
         fail_first: HashMap<String, usize>,
         delays: HashMap<String, u64>,
     ) -> TestServer {
+        start_server_opts(
+            files,
+            ServerOpts {
+                fail_first,
+                delays,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    async fn start_server_opts(files: HashMap<String, Vec<u8>>, opts: ServerOpts) -> TestServer {
         use axum::http::{header, HeaderValue, StatusCode};
         use axum::response::IntoResponse;
         use axum::routing::get;
         use axum::Router;
 
         let mut hits: HashMap<String, Arc<AtomicUsize>> = HashMap::new();
+        let requests: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
         let mut app = Router::new();
         for (path, body) in files {
             let data = Arc::new(body);
             let hit = Arc::new(AtomicUsize::new(0));
-            let fail = fail_first.get(&path).map(|n| Arc::new(AtomicUsize::new(*n)));
-            let delay = delays.get(&path).copied().unwrap_or(0);
+            let fail = opts
+                .fail_first
+                .get(&path)
+                .map(|n| Arc::new(AtomicUsize::new(*n)));
+            let delay = opts.delays.get(&path).copied().unwrap_or(0);
+            let trickle = opts.trickle.get(&path).copied();
+            let zero_only = opts.range_only_from_zero.contains(&path);
+            let requests = requests.clone();
+            let route = path.clone();
             hits.insert(path.clone(), hit.clone());
             app = app.route(
                 &path,
@@ -1593,8 +1791,15 @@ mod tests {
                     let data = data.clone();
                     let hit = hit.clone();
                     let fail = fail.clone();
+                    let requests = requests.clone();
+                    let route = route.clone();
                     async move {
                         let seen = hit.fetch_add(1, Ordering::SeqCst);
+                        let range_hdr = headers
+                            .get(header::RANGE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+                        requests.lock().unwrap().push((route.clone(), range_hdr.clone()));
                         if delay > 0 {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                         }
@@ -1604,11 +1809,7 @@ mod tests {
                             }
                         }
                         let total = data.len();
-                        let range = headers
-                            .get(header::RANGE)
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or_default()
-                            .to_string();
+                        let range = range_hdr.clone().unwrap_or_default();
                         let (from, to) = match range
                             .strip_prefix("bytes=")
                             .and_then(|r| r.split_once('-'))
@@ -1621,11 +1822,45 @@ mod tests {
                         };
                         let from = from.min(total);
                         let to = (to + 1).min(total).max(from);
+                        // CDN 怪癖：非 0 起点的区间请求直接回整段（200），
+                        // 客户端必须能识别并回退
+                        let (from, to) = if zero_only && from > 0 {
+                            (0, total)
+                        } else {
+                            (from, to)
+                        };
+                        let partial = from > 0 || to < total;
                         let body = data[from..to].to_vec();
-                        if from > 0 || to < total {
-                            let mut r = axum::response::Response::new(axum::body::Body::from(body));
-                            *r.status_mut() = StatusCode::PARTIAL_CONTENT;
-                            r.headers_mut().insert(
+                        let status = if partial {
+                            StatusCode::PARTIAL_CONTENT
+                        } else {
+                            StatusCode::OK
+                        };
+                        let mut resp = match trickle {
+                            // 分块慢发：制造"段内只收到一半"的现场
+                            Some((chunk, gap)) => {
+                                let stream = futures_util::stream::unfold(
+                                    (body, 0usize),
+                                    move |(b, off)| async move {
+                                        if off >= b.len() {
+                                            return None;
+                                        }
+                                        let end = (off + chunk).min(b.len());
+                                        let piece = b[off..end].to_vec();
+                                        tokio::time::sleep(Duration::from_millis(gap)).await;
+                                        Some((
+                                            Ok::<_, std::io::Error>(bytes::Bytes::from(piece)),
+                                            (b, end),
+                                        ))
+                                    },
+                                );
+                                axum::response::Response::new(axum::body::Body::from_stream(stream))
+                            }
+                            None => axum::response::Response::new(axum::body::Body::from(body)),
+                        };
+                        *resp.status_mut() = status;
+                        if partial {
+                            resp.headers_mut().insert(
                                 header::CONTENT_RANGE,
                                 HeaderValue::from_str(&format!(
                                     "bytes {}-{}/{}",
@@ -1635,10 +1870,8 @@ mod tests {
                                 ))
                                 .unwrap(),
                             );
-                            r
-                        } else {
-                            axum::response::Response::new(axum::body::Body::from(body))
                         }
+                        resp
                     }
                 }),
             );
@@ -1651,6 +1884,7 @@ mod tests {
         TestServer {
             base: format!("http://{addr}"),
             hits,
+            requests,
         }
     }
 
@@ -1982,25 +2216,21 @@ mod tests {
     /// 分片字节计数的 Drop 兜底：没走到"整段到手"就必须扣回去。
     ///
     /// 只清 `Err` 分支的写法漏掉 future 被 drop 的路径（暂停、提前收尾），
-    /// 计数会永久虚高。
+    /// "已接收"会永久虚高（速度再也对不上真实网速）。
     #[test]
     fn seg_count_guard_reverts_bytes_on_drop() {
-        let slot = AtomicU64::new(0);
         let total = AtomicU64::new(100);
-        let mut c = SegCount::new(&slot, &total);
+        let mut c = SegCount::new(&total);
         c.add(64);
-        assert_eq!(slot.load(Ordering::Relaxed), 64);
         assert_eq!(total.load(Ordering::Relaxed), 164);
         drop(c);
-        assert_eq!(slot.load(Ordering::Relaxed), 0, "被丢弃的分片计数必须归零");
         assert_eq!(total.load(Ordering::Relaxed), 100, "被丢弃的分片不得留在已接收里");
 
         // 整段到手（keep）后不再扣
-        let mut c2 = SegCount::new(&slot, &total);
+        let mut c2 = SegCount::new(&total);
         c2.add(32);
         c2.keep();
         drop(c2);
-        assert_eq!(slot.load(Ordering::Relaxed), 32);
         assert_eq!(total.load(Ordering::Relaxed), 132);
     }
 
@@ -2071,10 +2301,12 @@ mod tests {
             received >= 8 * seg_size as u64,
             "队头慢时后续分片应已下好等在内存里（received={received}）"
         );
-        assert!(
-            stats.progress() <= seg_size as u64,
-            "进度把在飞缓冲的字节算进去了：progress={} received={received}",
-            stats.progress()
+        // 队头一个字节都没给、也没写下任何东西 → 进度必须是 0：
+        // 那些"已下好等在内存里"的分片会被暂停整段丢掉，进度不能为它们背书
+        assert_eq!(
+            stats.progress(),
+            0,
+            "进度把在飞/待写的字节算进去了（进度一旦回落，界面就是「虚报」）"
         );
         assert!(
             srv.hits("/m/s11.ts") >= 1,
@@ -2087,5 +2319,177 @@ mod tests {
             .flat_map(|i| sample(i as u8 + 1, seg_size))
             .collect();
         assert_eq!(std::fs::read(&path).unwrap(), expected, "分片必须按清单顺序拼接");
+    }
+    /// 造一个"下到第 2 段中途被取消"的现场：返回 (服务端, 输出路径, 清单, 取消时落盘的长度)。
+    async fn cancel_mid_second_segment(
+        tag: &str,
+        opts: ServerOpts,
+    ) -> (TestServer, PathBuf, PlaylistPlan, u64) {
+        // 每个用例各自的目录：`tmpdir` 会删同名的旧目录，两个用例并行跑时
+        // 共用目录会互相清掉对方的产物与控制文件（表现为间歇性"续传没生效"）
+        let dir = tmpdir(tag);
+        let seg_len = 64 * 1024usize;
+        let segs: Vec<Vec<u8>> = (1..=4).map(|i| sample(i, seg_len)).collect();
+        let mut files = HashMap::new();
+        files.insert(
+            "/m/index.m3u8".to_string(),
+            media_playlist(&["s1.ts", "s2.ts", "s3.ts", "s4.ts"]).into_bytes(),
+        );
+        for (i, s) in segs.iter().enumerate() {
+            files.insert(format!("/m/s{}.ts", i + 1), s.clone());
+        }
+        let srv = start_server_opts(files, opts).await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        // 并发 1：严格按序，取消时"下一待写段"就是 s2
+        let po = PlaylistOptions {
+            concurrency: 1,
+            probe_sizes: false,
+            ..Default::default()
+        };
+        let plan = fetch_plan(&client, &srv.url("/m/index.m3u8"), &cancel, &[], &po)
+            .await
+            .expect("取清单");
+        let path = dir.join("out.ts");
+        let dl = tokio::spawn({
+            let client = client.clone();
+            let path = path.clone();
+            let plan = plan.clone();
+            let po = po.clone();
+            let cancel = cancel.clone();
+            async move {
+                download_playlist(&client, &path, &plan, &po, &cancel, PlaylistStats::new(0)).await
+            }
+        });
+
+        // 等 s2 真的开始发（trickle 已经在往缓冲写），再给它 150ms
+        let mut waited = 0u64;
+        while srv.hits("/m/s2.ts") == 0 && waited < 5000 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 20;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cancel.cancel();
+        let err = dl.await.unwrap().expect_err("取消应上报");
+        assert!(matches!(err, HttpError::Cancelled), "实际: {err:?}");
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        (srv, path, plan, file_len)
+    }
+
+    /// **段内续传**：取消时把"下一待写段"已经收到的那截留在文件里，
+    /// 恢复时对这一段发 `Range: bytes=part-` 接着下，而不是整段重来。
+    ///
+    /// 旧行为：在飞分片的字节整段丢弃，恢复时重下 —— 一次暂停能白下几十 MB。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resumes_within_segment_using_range() {
+        let seg_len = 64 * 1024u64;
+        let mut opts = ServerOpts::default();
+        // s2 慢发：6KB 一块、每块 60ms → 整段约 640ms，够在中途取消
+        opts.trickle.insert("/m/s2.ts".to_string(), (6 * 1024, 60));
+        let (srv, path, plan, file_len) =
+            cancel_mid_second_segment("hls-partial-range", opts).await;
+
+        // 取消后：第 1 段完整落盘 + 第 2 段的半截
+        assert!(file_len > seg_len, "取消时第 1 段应已落盘：{file_len}");
+        let part = file_len - seg_len;
+        assert!(
+            part > 0 && part < seg_len,
+            "取消时应保留第 2 段的半截：已落 {part} 字节"
+        );
+        let ctrl: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(xfer_storage::ctrl_path(&path)).unwrap())
+                .unwrap();
+        assert_eq!(ctrl["prefix"], 1, "第 1 段是完整前缀");
+        assert_eq!(ctrl["bytes"], seg_len, "完整前缀的字节数");
+        assert_eq!(ctrl["part"], part, "段内续传位置应记进控制文件");
+        assert_eq!(
+            resume_point(&path, &plan),
+            (file_len, 1),
+            "续传水位应等于磁盘真实长度（含段内那截）"
+        );
+
+        // 恢复：只补下第 2 段剩下的部分
+        let client = crate::build_client();
+        let po = PlaylistOptions {
+            concurrency: 1,
+            probe_sizes: false,
+            ..Default::default()
+        };
+        let done = download_playlist(
+            &client,
+            &path,
+            &plan,
+            &po,
+            &CancellationToken::new(),
+            PlaylistStats::new(file_len),
+        )
+        .await
+        .expect("续传应成功");
+        let expected: Vec<u8> = (1..=4).flat_map(|i| sample(i as u8, seg_len as usize)).collect();
+        assert_eq!(done.bytes, expected.len() as u64);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            expected,
+            "段内续传必须严丝合缝（多写一遍开头就会错位）"
+        );
+        // 探测（`bytes=0-0`）不算真实抓取，滤掉后应该只有"首次 + 续传"两次
+        let rs: Vec<Option<String>> = srv
+            .ranges("/m/s2.ts")
+            .into_iter()
+            .filter(|r| r.as_deref() != Some("bytes=0-0"))
+            .collect();
+        assert_eq!(
+            rs.len(),
+            2,
+            "s2 只应有两次真实请求（首次 + 续传，不该整段重下）：{rs:?}"
+        );
+        assert_eq!(
+            rs.last().cloned().flatten(),
+            Some(format!("bytes={part}-")),
+            "续传请求必须从段内续传位置接着下：{rs:?}"
+        );
+    }
+
+    /// 服务器只认"0 起点"的 `Range`（CDN 线上真实怪癖）：探测（`bytes=0-0`）
+    /// 说支持，真正的续传请求却被回了整段 —— 必须丢掉文件里那截续传数据、
+    /// 按整段重写，否则同一段的前半会被写两遍。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resume_drops_partial_when_server_ignores_range() {
+        let seg_len = 64 * 1024u64;
+        let mut opts = ServerOpts::default();
+        opts.trickle.insert("/m/s2.ts".to_string(), (6 * 1024, 60));
+        opts.range_only_from_zero.insert("/m/s2.ts".to_string());
+        let (srv, path, plan, file_len) =
+            cancel_mid_second_segment("hls-partial-norange", opts).await;
+        assert!(file_len > seg_len, "取消时应留下第 2 段的半截：{file_len}");
+
+        let client = crate::build_client();
+        let po = PlaylistOptions {
+            concurrency: 1,
+            probe_sizes: false,
+            ..Default::default()
+        };
+        let done = download_playlist(
+            &client,
+            &path,
+            &plan,
+            &po,
+            &CancellationToken::new(),
+            PlaylistStats::new(file_len),
+        )
+        .await
+        .expect("续传应成功（回退成整段重下）");
+        let expected: Vec<u8> = (1..=4).flat_map(|i| sample(i as u8, seg_len as usize)).collect();
+        assert_eq!(done.bytes, expected.len() as u64);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            expected,
+            "服务器无视 Range 时必须丢掉半截重写，不能重复写开头"
+        );
+        assert!(
+            srv.ranges("/m/s2.ts").len() >= 2,
+            "续传仍应发出带 Range 的请求（被服务器无视）"
+        );
     }
 }

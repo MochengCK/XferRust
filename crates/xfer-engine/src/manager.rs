@@ -4707,14 +4707,17 @@ fn spawn_playlist_sampler(
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             iv.tick().await;
-            // 进度 = 已落盘字节 + 待写分片已接收字节（`PlaylistStats::progress`）。
-            //
-            // 不能用"全部已接收字节"：分片按清单顺序整段拼接，慢分片前面的
-            // 分片会先下完等在内存里，把这些算进进度会让界面显示一个暂停后
-            // 立刻消失的数字（实测 40MB → 暂停回落 1.4MB）。光标处那一个
-            // 分片算进去，进度才能在两条分片之间连续走字。
-            let progress = stats.progress();
-            task.completed_atomic.store(progress, Ordering::Relaxed);
+            // 进度：**只认已经交给文件、取消时不会被丢弃的字节**
+            // （`PlaylistStats::progress`）。界面上的数字绝不倒退 —— 拿"在飞分片
+            // 已收字节"当进度，显示的会是随时被丢掉的内存数据（实测界面 40MB、
+            // 一暂停回落成磁盘上的 1.4MB）。
+            task.completed_atomic
+                .store(stats.progress(), Ordering::Relaxed);
+            // 速度另走"已接收"：进度只能按分片落盘跳，字节级的实时速度得看网络
+            // （`speed_ticker` 在 received > 0 时用它算 3s 窗口速度，所以
+            //  "速度频繁显示 0" 不会回来）。
+            task.received_atomic
+                .store(stats.received.load(Ordering::Relaxed), Ordering::Relaxed);
             task.connections_atomic.store(
                 stats.connections.load(Ordering::Relaxed) as u64,
                 Ordering::Relaxed,
@@ -4722,6 +4725,7 @@ fn spawn_playlist_sampler(
             if allow_estimate {
                 let est = stats.estimated_total.load(Ordering::Relaxed);
                 if est > 0 {
+                    let progress = stats.progress();
                     let mut sh = task.shared.lock().unwrap();
                     let next = est.max(progress).max(sh.total_len.unwrap_or(0));
                     if sh.total_len != Some(next) {
