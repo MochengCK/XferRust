@@ -155,6 +155,18 @@ pub struct PlaylistOptions {
     ///
     /// 清单、密钥、每个分片都带同一组头——受保护地址缺任意一处必然 403。
     pub headers: RequestHeaders,
+    /// **顺序落盘**：true = 边下边按清单顺序直接写产物文件（下载中途的产物
+    /// 就已经是能播的完整前缀）；false（默认）= **乱序落盘**，每个分片先写
+    /// 自己的段文件、连续前缀就位后再拼进产物。
+    ///
+    /// 为什么默认选乱序：顺序落盘时"下好但还没轮到写"的分片必须留在内存里，
+    /// 于是有两笔硬开销 —— ① 内存预算（[`MAX_UNWRITTEN_BYTES`]）用满后
+    /// **不再派发新分片**，队头慢的时候其余连接成片空转（实测某视频站单连接
+    /// ~65KB/s，一个 1.45MB 的分片要 20 秒，那 20 秒里总吞吐会从 3MB/s 掉到
+    /// 单路）；② 进度只能吸附"光标那一段"的速度，总速度与进度显示对不上
+    /// （用户报"速度几 MB、文件却几 KB 几 KB 地涨"）。乱序落盘把每个分片
+    /// 直接写进磁盘（不占内存），进度就是磁盘上的真实字节数，与速度一致。
+    pub ordered_write: bool,
 }
 
 impl Default for PlaylistOptions {
@@ -166,6 +178,8 @@ impl Default for PlaylistOptions {
             prefer_worst: false,
             limiter: None,
             headers: Vec::new(),
+            // 默认乱序：见字段说明（内存/吞吐/进度三者都更好）
+            ordered_write: false,
         }
     }
 }
@@ -194,9 +208,17 @@ pub struct PlaylistStats {
     /// 外推（写完第一段后接管，越来越准）。`plan.total` 已知时（小清单探测
     /// 过）这里始终为 0，由调用方优先用精确值。
     pub estimated_total: AtomicU64,
+    /// **乱序落盘**模式下，已经写进各段文件、但还没拼进产物的字节总数。
+    ///
+    /// 这些字节躺在磁盘上（取消也不会丢），进度直接算作已下载 —— 所以乱序
+    /// 模式的进度**恰好等于磁盘上的真实字节**，与 `speed` 对得上。拼接时它们
+    /// 只是"转移"（`spilled` 减该段长度、`completed` 加同样多），进度单调不减。
+    pub spilled: AtomicU64,
+    /// 是否乱序落盘（决定 [`Self::progress`] 的口径）。
+    unordered: AtomicBool,
     /// 每个分片各自的已接收字节（按绝对序号，按需增长）。
     ///
-    /// 进度只取 [`Self::cursor`] 处那一个：见 [`Self::progress`]。
+    /// 顺序落盘时进度只取 [`Self::cursor`] 处那一个：见 [`Self::progress`]。
     slots: Mutex<Vec<Arc<AtomicU64>>>,
 }
 
@@ -209,8 +231,15 @@ impl PlaylistStats {
             cursor: AtomicUsize::new(0),
             cursor_counted: AtomicBool::new(true),
             estimated_total: AtomicU64::new(0),
+            spilled: AtomicU64::new(0),
+            unordered: AtomicBool::new(false),
             slots: Mutex::new(Vec::new()),
         })
+    }
+
+    /// 切到**乱序落盘**口径（进度 = 产物已拼字节 + 各段文件字节）。
+    pub fn mark_unordered(&self) {
+        self.unordered.store(true, Ordering::Relaxed);
     }
 
     /// 某个分片的计数槽位（不存在就按需建，槽位只增不删）。
@@ -247,7 +276,15 @@ impl PlaylistStats {
     /// 曾经的"界面显示 40MB、一暂停回落成磁盘上的 1.4MB"。加密分片（`AES-128`）
     /// 不做段内续传，光标处也不计入，退化成"按分片跳"。
     pub fn progress(&self) -> u64 {
-        let done = self.completed.load(Ordering::Relaxed);
+        let done = self
+            .completed
+            .load(Ordering::Relaxed)
+            .saturating_add(self.spilled.load(Ordering::Relaxed));
+        if self.unordered.load(Ordering::Relaxed) {
+            // 乱序：段文件里的字节全在磁盘上（取消也不丢），一个不落地算数 ——
+            // 进度因此与 speed 完全同步，"速度几 MB、进度几 KB"不会再有。
+            return done;
+        }
         if !self.cursor_counted.load(Ordering::Relaxed) {
             return done;
         }
@@ -811,6 +848,87 @@ struct PlaylistCtrl {
     /// 老的 v1 控制文件没有这个字段 → 缺省 0，语义与从前一致（只认完整前缀）。
     #[serde(default)]
     part: u64,
+    /// 落盘方式：`"unordered"` = 乱序落盘（各段先落自己的段文件、再按序拼接）。
+    /// 空字符串 = 顺序落盘（老控制文件没有这个字段，语义就是顺序）。
+    ///
+    /// 两种模式的产物结构、续传方式都不一样，所以**互相不认**：模式不匹配
+    /// 一律丢开重来，绝不把两种模式的中间状态拼在一起。
+    #[serde(default)]
+    mode: String,
+    /// 乱序落盘：哪些分片已经**完整**（hex 位图，最高位对应第 0 段）。
+    ///
+    /// 段文件长度只能说明"下到哪了"，说明不了"下完了没有"（大清单不预探测、
+    /// 段大小未知），所以"完整"必须记在这里。
+    #[serde(default)]
+    mask: String,
+}
+
+/// 乱序落盘的模式标记（控制文件里的 `mode` 字段）。
+const CTRL_MODE_UNORDERED: &str = "unordered";
+
+fn is_unordered_ctrl(c: &PlaylistCtrl) -> bool {
+    c.mode == CTRL_MODE_UNORDERED
+}
+
+/// 段文件目录：与产物同级、以产物名加后缀（一眼能看出是谁的）。
+fn seg_dir(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "out".to_string());
+    path.with_file_name(format!("{name}.hlseg"))
+}
+
+/// 第 `i` 段的段文件路径（文件名用 6 位数字，便于按序浏览）。
+fn seg_file(path: &Path, i: usize) -> PathBuf {
+    seg_dir(path).join(format!("{i:06}"))
+}
+
+/// 把段文件追加进产物，然后删掉它。返回搬运的字节数。
+fn splice_seg(seg: &Path, sink: &mut xfer_storage::FileSink) -> Result<u64, HttpError> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(seg).map_err(|e| HttpError::Io(e.to_string()))?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut moved = 0u64;
+    loop {
+        let n = f.read(&mut buf).map_err(|e| HttpError::Io(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        sink.write(&buf[..n]).map_err(|e| HttpError::Io(e.to_string()))?;
+        moved += n as u64;
+    }
+    let _ = std::fs::remove_file(seg);
+    Ok(moved)
+}
+
+/// `Vec<bool>` → hex 位图（最高位对应第 0 段）。
+fn mask_to_hex(mask: &[bool]) -> String {
+    let mut out = String::with_capacity(mask.len().div_ceil(8) * 2);
+    let mut byte = 0u8;
+    for (i, d) in mask.iter().enumerate() {
+        if *d {
+            byte |= 1 << (7 - (i % 8));
+        }
+        if i % 8 == 7 {
+            out.push_str(&format!("{byte:02x}"));
+            byte = 0;
+        }
+    }
+    if mask.len() % 8 != 0 {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// hex 位图 → `Vec<bool>`（长度不足补 false，超长忽略）。
+fn mask_from_hex(hex: &str, len: usize) -> Vec<bool> {
+    let bytes: Vec<u8> = (0..hex.len() / 2)
+        .filter_map(|i| u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok())
+        .collect();
+    (0..len)
+        .map(|i| bytes.get(i / 8).is_some_and(|b| (b >> (7 - (i % 8))) & 1 == 1))
+        .collect()
 }
 
 const CTRL_KIND: &str = "hls-playlist";
@@ -901,6 +1019,10 @@ fn resume_state(path: &Path, plan: &PlaylistPlan) -> ResumeState {
     let Some(c) = load_ctrl(&ctrl, plan) else {
         return ResumeState::NONE;
     };
+    // 乱序落盘的控制文件不属于这条路径（产物结构完全不同），别拿来续
+    if is_unordered_ctrl(&c) {
+        return ResumeState::NONE;
+    }
     if c.prefix > plan.segment_count() {
         return ResumeState::NONE;
     }
@@ -930,6 +1052,20 @@ fn resume_state(path: &Path, plan: &PlaylistPlan) -> ResumeState {
 /// 内部再算一次（纯函数，结果一致）。字节数含段内已落的那一截
 /// （即磁盘上的真实长度）。
 pub fn resume_point(path: &Path, plan: &PlaylistPlan) -> (u64, usize) {
+    let ctrl = xfer_storage::ctrl_path(path);
+    if let Some(c) = load_ctrl(&ctrl, plan) {
+        if is_unordered_ctrl(&c) {
+            // 乱序落盘：已下载字节 = 产物里已拼好的 + 各段文件里还没拼的。
+            // 引擎拿它当进度基线（从这儿接着显示，不从头开始数）。
+            let mut total = c.bytes;
+            for i in 0..plan.segment_count() {
+                if let Ok(m) = std::fs::metadata(seg_file(path, i)) {
+                    total = total.saturating_add(m.len());
+                }
+            }
+            return (total, c.prefix.min(plan.segment_count()));
+        }
+    }
     let st = resume_state(path, plan);
     (st.file_bytes(), st.prefix)
 }
@@ -1029,95 +1165,145 @@ impl Drop for ConnGuard<'_> {
 /// 一个分片取回来的数据。
 struct SegBody {
     /// 段内续传之后再取到的**剩余部分**（从 `Range` 起点开始）。
+    ///
+    /// 只有 [`SegTarget::Mem`] 才会填这里；[`SegTarget::Disk`] 的数据已经
+    /// 直接写进段文件了（不经过内存）。
     data: Vec<u8>,
     /// 服务器无视我们发的 `Range`、回了整段（数据从**段首**开始）。
     ///
     /// 这时已有的"段内续传那截"必须丢掉，否则会把同一段开头写两遍。
+    /// `Disk` 目标下由写入器自己截断，这里的值只作诊断。
     whole: bool,
+    /// `Disk` 目标：这一趟写进段文件的字节数（进度统计用）。
+    on_disk: u64,
 }
 
-/// 拉取单个分片（含重试、限速、解密）。
-///
-/// `buf` 是该分片的**共享缓冲**：字节边读边写进去，调用方 `mem::take` 取走。
-/// 之所以不放在 future 内部：暂停/取消会把 future 直接 drop，那时这段数据
-/// 就没了 —— 而"下一待写段"的这截数据是可以留在文件里、下次 `Range` 接着下的。
-async fn fetch_segment(
-    ctx: &Ctx<'_>,
-    seg: &Segment,
-    buf: &Mutex<Vec<u8>>,
-    resume_from: u64,
-    slot: &AtomicU64,
-) -> Result<SegBody, HttpError> {
-    let mut attempt = 1u32;
-    loop {
-        if ctx.is_cancelled() {
-            return Err(HttpError::Cancelled);
+/// 分片数据的落点。
+enum SegTarget {
+    /// 收进内存（**顺序落盘**模式；加密段也走这里 —— 解密要整段）。
+    Mem(Arc<Mutex<Vec<u8>>>),
+    /// **边收边追加写进段文件**（乱序落盘的明文段）。
+    ///
+    /// 不占内存、取消时半截直接留在文件里（恢复按文件长度发 `Range` 接着下），
+    /// 而且落盘字节立刻计入进度 —— 这是"进度与速度对得上"的关键。
+    Disk(Arc<Mutex<SegFile>>),
+}
+
+/// 段文件的写入器：直接写（无写回缓冲），所以 `written` 恒等于磁盘长度。
+struct SegFile {
+    file: std::fs::File,
+    written: u64,
+}
+
+impl SegFile {
+    /// 打开段文件。`truncate=true` 时清空重写（首下 / 服务器无视 Range），
+    /// 否则沿用已有长度（走 `Range` 接着下）。
+    fn open(path: &Path, truncate: bool) -> Result<Self, HttpError> {
+        use std::io::Seek;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| HttpError::Io(e.to_string()))?;
         }
-        buf.lock().unwrap().clear();
-        let r = async {
-            let _conn = ConnGuard::new(&ctx.stats.connections);
-            let key = match &seg.key {
-                Some(k) => Some(fetch_key(ctx, &k.url).await?),
-                None => None,
-            };
-            let whole = fetch_body(ctx, seg, buf, resume_from, slot).await?;
-            let data = std::mem::take(&mut *buf.lock().unwrap());
-            match (&key, &seg.key) {
-                (Some(k), Some(sk)) => decrypt_segment(k, &sk.iv, &data).map(|d| SegBody {
-                    data: d,
-                    whole: false,
-                }),
-                _ => Ok(SegBody { data, whole }),
-            }
-        }
-        .await;
-        match r {
-            Ok(body) => return Ok(body),
-            Err(e) => {
-                if e.is_retryable() && attempt < ctx.retries.max(1) {
-                    let backoff = Duration::from_millis(400 * u64::from(attempt));
-                    tokio::select! {
-                        biased;
-                        _ = ctx.cancel.cancelled() => return Err(HttpError::Cancelled),
-                        _ = tokio::time::sleep(backoff) => {}
-                    }
-                    attempt += 1;
-                    continue;
-                }
-                return Err(e);
-            }
-        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(truncate)
+            .open(path)
+            .map_err(|e| HttpError::Io(e.to_string()))?;
+        let written = if truncate {
+            0
+        } else {
+            // **必须把写位置挪到文件末尾**：`File` 默认从 0 开始写，续传时
+            // 会从段首覆盖旧数据（文件长度不变、而 `written` 照累加），
+            // 产物于是缺一截
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            file.seek(std::io::SeekFrom::End(0))
+                .map_err(|e| HttpError::Io(e.to_string()))?;
+            len
+        };
+        Ok(Self { file, written })
+    }
+
+    fn append(&mut self, data: &[u8]) -> Result<(), HttpError> {
+        use std::io::Write;
+        self.file
+            .write_all(data)
+            .map_err(|e| HttpError::Io(e.to_string()))?;
+        // 先落地再记账：进度绝不能领先磁盘（取消时这些字节必须在文件里）
+        self.written += data.len() as u64;
+        Ok(())
+    }
+
+    /// 服务器无视 `Range` 回了整段：丢掉已有内容从头写。返回被丢弃的字节数
+    /// （调用方要从 `spilled` 里扣掉）。
+    fn reset(&mut self) -> Result<u64, HttpError> {
+        let old = self.written;
+        self.file
+            .set_len(0)
+            .map_err(|e| HttpError::Io(e.to_string()))?;
+        self.written = 0;
+        Ok(old)
+    }
+
+    fn finish(&mut self) -> Result<u64, HttpError> {
+        use std::io::Write;
+        self.file
+            .flush()
+            .map_err(|e| HttpError::Io(e.to_string()))?;
+        let _ = self.file.sync_data();
+        Ok(self.written)
     }
 }
 
-/// 分片字节计数守卫：每读到一个 chunk 就累加到**该分片的槽位**与全局
-/// `received`；**没走到"成功拿到整段"就 Drop**（失败重试、取消、
-/// future 被直接丢弃）时把这一趟的字节扣回去。
+/// 分片字节计数守卫：每读到一个 chunk 就计入几个计数器；**没走到"成功拿到
+/// 整段"就 Drop**（失败重试、取消、future 被直接丢弃）时把这一趟的字节扣回去。
 ///
-/// 只在 `Err` 分支扣数的写法漏掉了 future 被 drop 的路径 —— 暂停、
-/// 任务提前收尾、`futures` 队列被丢弃时走不到那段清理代码，计数会
-/// 永久虚高（进度/速度就再也对不上真实值）。
+/// 计数器分工：
+/// - `total`（`stats.received`）：网络已收到多少 —— **速度**的唯一来源；
+/// - `disk`（`stats.spilled`）：落进段文件的字节 —— **乱序模式的进度**来源；
+/// - `slot`（该分片的槽位）：顺序模式下只有"光标那一段"计入进度。
+///
+/// 只在 `Err` 分支扣数的写法漏掉了 future 被 drop 的路径 —— 暂停、任务提前
+/// 收尾、`futures` 队列被丢弃时走不到那段清理代码，计数会永久虚高。
 struct SegCount<'a> {
-    slot: &'a AtomicU64,
     total: &'a AtomicU64,
+    disk: Option<&'a AtomicU64>,
+    slot: Option<&'a AtomicU64>,
     counted: u64,
     keep: bool,
+    /// 取消/失败时是否把这一趟的计数扣回去。
+    ///
+    /// 内存目标要扣（数据还在内存里、取消即丢，留着就是虚报）；**段文件目标
+    /// 不能扣** —— 那些字节已经写进磁盘（取消也不会丢），它们本来就是"已下
+    /// 载"的一部分。这一条正是"乱序模式下进度等于磁盘真实字节"的前提。
+    rollback: bool,
 }
 
 impl<'a> SegCount<'a> {
-    fn new(slot: &'a AtomicU64, total: &'a AtomicU64) -> Self {
+    fn new(
+        total: &'a AtomicU64,
+        disk: Option<&'a AtomicU64>,
+        slot: Option<&'a AtomicU64>,
+        rollback: bool,
+    ) -> Self {
         Self {
-            slot,
             total,
+            disk,
+            slot,
             counted: 0,
             keep: false,
+            rollback,
         }
     }
 
     fn add(&mut self, n: u64) {
         self.counted += n;
-        self.slot.fetch_add(n, Ordering::Relaxed);
         self.total.fetch_add(n, Ordering::Relaxed);
+        if let Some(d) = self.disk {
+            d.fetch_add(n, Ordering::Relaxed);
+        }
+        if let Some(s) = self.slot {
+            s.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     /// 整段到手，计数保留。
@@ -1128,9 +1314,14 @@ impl<'a> SegCount<'a> {
 
 impl Drop for SegCount<'_> {
     fn drop(&mut self) {
-        if !self.keep && self.counted > 0 {
-            self.slot.fetch_sub(self.counted, Ordering::Relaxed);
+        if !self.keep && self.rollback && self.counted > 0 {
             self.total.fetch_sub(self.counted, Ordering::Relaxed);
+            if let Some(d) = self.disk {
+                d.fetch_sub(self.counted, Ordering::Relaxed);
+            }
+            if let Some(s) = self.slot {
+                s.fetch_sub(self.counted, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -1140,20 +1331,24 @@ impl Drop for SegCount<'_> {
 /// 两个**空闲**超时（不是总时长超时，大分片正常下多久都行）：等响应头
 /// [`SEGMENT_HEADER_TIMEOUT`]、读到两段数据之间 [`SEGMENT_IDLE_TIMEOUT`]。
 /// 服务器"接受连接后不吭声"是线上最常见的假死形态，靠客户端全局的
-/// read_timeout（30s）兜底太钝：一条僵死连接会顶住整条按序写盘的水位，
-/// 表现为"下一会儿停几分钟"；这里超时即断开重连（错误可重试），恢复快得多。
-///
-/// 返回"服务器是否无视了 `Range`"（见 [`SegBody::whole`]）。
+/// read_timeout（30s）兜底太钝；这里超时即断开重连（错误可重试），恢复快得多。
 async fn fetch_body(
     ctx: &Ctx<'_>,
     seg: &Segment,
-    buf: &Mutex<Vec<u8>>,
+    target: &SegTarget,
     resume_from: u64,
-    slot: &AtomicU64,
-) -> Result<bool, HttpError> {
-    // 失败/取消/被丢弃时守卫会把这一趟的字节从槽位与"已接收"里扣回去，不会虚高
-    let mut count = SegCount::new(slot, &ctx.stats.received);
-    let r = fetch_body_inner(ctx, seg, buf, resume_from, &mut count).await;
+    slot: Option<&AtomicU64>,
+) -> Result<SegBody, HttpError> {
+    let mut count = match target {
+        // 内存目标：取消/失败要把这一趟的计数扣回去（数据会丢）
+        SegTarget::Mem(_) => SegCount::new(&ctx.stats.received, None, slot, true),
+        // 乱序：字节直接落段文件，按**磁盘**记账（进度即磁盘真实字节）；
+        // 而且**不回滚** —— 那些字节确实在磁盘上
+        SegTarget::Disk(_) => {
+            SegCount::new(&ctx.stats.received, Some(&ctx.stats.spilled), None, false)
+        }
+    };
+    let r = fetch_body_inner(ctx, seg, target, resume_from, &mut count).await;
     if r.is_ok() {
         count.keep();
     }
@@ -1163,10 +1358,10 @@ async fn fetch_body(
 async fn fetch_body_inner(
     ctx: &Ctx<'_>,
     seg: &Segment,
-    buf: &Mutex<Vec<u8>>,
+    target: &SegTarget,
     resume_from: u64,
     count: &mut SegCount<'_>,
-) -> Result<bool, HttpError> {
+) -> Result<SegBody, HttpError> {
     // 区间起点：清单里的 `#EXT-X-BYTERANGE` 偏移 + 段内续传偏移
     let base_off = seg.range.map(|(o, _)| o).unwrap_or(0);
     let end = seg.range.map(|(o, l)| o + l.saturating_sub(1));
@@ -1194,9 +1389,21 @@ async fn fetch_body_inner(
     }
     // 要了区间却回整段（200 而非 206）：段内续传被无视，数据是从段首开始的
     let whole = resume_from > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT;
-    buf.lock()
-        .unwrap()
-        .reserve(seg.size.unwrap_or(1 << 20) as usize);
+    if whole {
+        // 段文件里已有的那截作废 —— 否则同一段的开头会被写两遍
+        if let SegTarget::Disk(f) = target {
+            let mut f = f.lock().unwrap();
+            let dropped = f.reset()?;
+            if dropped > 0 {
+                ctx.stats.spilled.fetch_sub(dropped, Ordering::Relaxed);
+            }
+        }
+    }
+    if let SegTarget::Mem(buf) = target {
+        buf.lock()
+            .unwrap()
+            .reserve(seg.size.unwrap_or(1 << 20) as usize);
+    }
     let mut stream = resp.bytes_stream();
     loop {
         let chunk = tokio::select! {
@@ -1208,7 +1415,7 @@ async fn fetch_body_inner(
                     Some(Err(e)) => return Err(HttpError::from_reqwest(&e)),
                     None => break,
                 },
-                // 期间一个字节都没到：断开重连（重试从本分片开头重新下）
+                // 期间一个字节都没到：断开重连（重试）
                 Err(_) => return Err(HttpError::Timeout),
             },
         };
@@ -1218,34 +1425,460 @@ async fn fetch_body_inner(
         if let Some(l) = ctx.limiter {
             l.acquire(chunk.len()).await;
         }
-        // 先把数据放进共享缓冲，再计数：反过来的话，暂停瞬间可能出现
-        // "计数已加、缓冲里还没有"，收尾按缓冲落盘后进度反而少算（虽然只
-        // 是偏低，但没有理由留这个窗口）。
-        buf.lock().unwrap().extend_from_slice(&chunk);
-        count.add(chunk.len() as u64);
-    }
-    let got = buf.lock().unwrap().len() as u64;
-    if whole {
-        // 回了整段：按"整段"校验（调用方会丢掉文件里那截续传数据）
-        if let Some(total) = seg.size {
-            if got != total {
-                return Err(HttpError::ShortRead);
+        // 先落数据再计数：反过来会在暂停瞬间出现"计数已加、数据还没落"，
+        // 收尾按实际长度落盘后进度反而偏低。
+        match target {
+            SegTarget::Mem(buf) => {
+                buf.lock().unwrap().extend_from_slice(&chunk);
+                count.add(chunk.len() as u64);
+            }
+            SegTarget::Disk(f) => {
+                f.lock().unwrap().append(&chunk)?;
+                count.add(chunk.len() as u64);
             }
         }
-    } else if let Some(expected) = seg.size.map(|s| s.saturating_sub(resume_from)) {
-        if got != expected {
-            return Err(HttpError::ShortRead);
+    }
+    let (data, on_disk, got) = match target {
+        SegTarget::Mem(buf) => {
+            let data = std::mem::take(&mut *buf.lock().unwrap());
+            let got = data.len() as u64;
+            (data, 0u64, got)
+        }
+        SegTarget::Disk(f) => {
+            let got = f.lock().unwrap().finish()?;
+            (Vec::new(), got, got)
+        }
+    };
+    if let Some(total) = seg.size {
+        match target {
+            // 段文件长度就是"这一段到目前为止的完整长度"（续传那截也在里面）
+            SegTarget::Disk(_) => {
+                if got != total {
+                    return Err(HttpError::ShortRead);
+                }
+            }
+            // 内存里存的要么是整段（服务器无视 Range），要么是续传剩下的部分
+            SegTarget::Mem(_) => {
+                let expected = if whole {
+                    total
+                } else {
+                    total.saturating_sub(resume_from)
+                };
+                if got != expected {
+                    return Err(HttpError::ShortRead);
+                }
+            }
         }
     }
-    Ok(whole)
+    Ok(SegBody {
+        data,
+        whole,
+        on_disk,
+    })
 }
 
-/// 按计划下载分片并顺序拼接写入 `path`。
+/// 拉取单个分片（含重试、限速、解密）。
+///
+/// `Disk` 目标的续传起点**以段文件当前长度为准**（不是入参）：重试时那部分
+/// 已经落盘的数据是有效的，直接接着 `Range` 下即可、不必重下；服务器无视
+/// `Range` 回了整段时，`fetch_body_inner` 会把段文件截回 0 再写，产物不会
+/// 把同一段开头写两遍。
+async fn fetch_segment(
+    ctx: &Ctx<'_>,
+    seg: &Segment,
+    target: &SegTarget,
+    mut resume_from: u64,
+    slot: Option<&AtomicU64>,
+) -> Result<SegBody, HttpError> {
+    let mut attempt = 1u32;
+    loop {
+        if ctx.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
+        match target {
+            SegTarget::Mem(buf) => buf.lock().unwrap().clear(),
+            // 每趟按段文件**当前**长度续（重试不丢已下部分）
+            SegTarget::Disk(f) => resume_from = f.lock().unwrap().written,
+        }
+        let r = async {
+            let _conn = ConnGuard::new(&ctx.stats.connections);
+            let key = match &seg.key {
+                Some(k) => Some(fetch_key(ctx, &k.url).await?),
+                None => None,
+            };
+            let body = fetch_body(ctx, seg, target, resume_from, slot).await?;
+            match (&key, &seg.key) {
+                // 加密段一律走内存目标（调用方保证）：解密要整段，没法边收边写
+                (Some(k), Some(sk)) => decrypt_segment(k, &sk.iv, &body.data).map(|d| SegBody {
+                    data: d,
+                    whole: false,
+                    on_disk: 0,
+                }),
+                _ => Ok(body),
+            }
+        }
+        .await;
+        match r {
+            Ok(body) => return Ok(body),
+            Err(e) => {
+                if e.is_retryable() && attempt < ctx.retries.max(1) {
+                    let backoff = Duration::from_millis(400 * u64::from(attempt));
+                    tokio::select! {
+                        biased;
+                        _ = ctx.cancel.cancelled() => return Err(HttpError::Cancelled),
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    attempt += 1;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// 按计划下载分片并拼成 `path`。
+///
+/// 落盘方式由 [`PlaylistOptions::ordered_write`] 决定：
+/// - `false`（默认）：**乱序落盘**（[`download_playlist_unordered`]）—— 各段先写
+///   自己的段文件、连续前缀一就位就拼进产物；
+/// - `true`：**顺序落盘**（[`download_playlist_ordered`]）—— 边下边按清单顺序
+///   直接写产物，下载中途的产物就是一个能播的完整前缀（想边下边看时选它）。
+///
+/// 两条路径的产物**逐字节相同**，差别只在"字节先落在哪儿"。
+pub async fn download_playlist(
+    client: &reqwest::Client,
+    path: &Path,
+    plan: &PlaylistPlan,
+    opts: &PlaylistOptions,
+    cancel: &CancellationToken,
+    stats: Arc<PlaylistStats>,
+) -> Result<PlaylistDone, HttpError> {
+    // 总长初值（两条路径共用）：大清单不做分片预探测，先用主清单的
+    // `BANDWIDTH × 总时长` 给个像样的值 —— 界面从第一秒起就有总大小与百分比，
+    // 随后被实测外推接管。
+    if plan.total.is_none() && plan.duration_secs > 0.0 {
+        if let Some(bw) = plan.bitrate {
+            let est = (bw as f64 / 8.0 * plan.duration_secs) as u64;
+            if est > 0 {
+                stats.estimated_total.fetch_max(est, Ordering::Relaxed);
+            }
+        }
+    }
+    if opts.ordered_write {
+        download_playlist_ordered(client, path, plan, opts, cancel, stats).await
+    } else {
+        download_playlist_unordered(client, path, plan, opts, cancel, stats).await
+    }
+}
+
+/// **乱序落盘 + 顺序拼接**：每个分片边收边写进自己的段文件（不占内存），连续
+/// 前缀一就位就拼进产物、删掉段文件。
+///
+/// 与 [`download_playlist_ordered`] 的差别只在字节先落在哪儿，却带来三件事：
+/// 1. **吞吐**：不必把"下好但还没轮到写"的分片攒在内存里，也就没有"内存预算
+///    用满 → 停止派发新分片"那道闸门 —— 队头慢时其余连接照常满负荷（顺序模式
+///    下它们会集体空转，总吞吐掉到单路）；
+/// 2. **进度**：落进段文件的字节立刻计入已下载，进度 = 磁盘上的真实字节数，
+///    与 `speed` 同步（顺序模式只能吸附光标那一段，用户看到"速度几 MB、进度
+///    却几 KB 几 KB 地涨"）；
+/// 3. **暂停/退出零损失**：所有已下字节都在段文件里（含半截），恢复时逐段按
+///    文件长度发 `Range` 接着下，一个字节都不重下。
+///
+/// 代价是完成时把段文件拼进产物（本地顺序读写，GB 级约 1~2 秒）；拼一段删一段，
+/// 磁盘峰值 ≈ 产物 + 在飞段，不会翻倍。
+async fn download_playlist_unordered(
+    client: &reqwest::Client,
+    path: &Path,
+    plan: &PlaylistPlan,
+    opts: &PlaylistOptions,
+    cancel: &CancellationToken,
+    stats: Arc<PlaylistStats>,
+) -> Result<PlaylistDone, HttpError> {
+    use xfer_storage::FileSink;
+
+    let all: Vec<Segment> = plan
+        .init
+        .clone()
+        .into_iter()
+        .chain(plan.segments.iter().cloned())
+        .collect();
+    let total_segments = plan.segment_count();
+    if all.is_empty() {
+        return Err(HttpError::Protocol("播放列表中没有可下载的分片".into()));
+    }
+
+    let ctrl_path = xfer_storage::ctrl_path(path);
+    let fp = fingerprint(plan);
+    let dir = seg_dir(path);
+
+    // 续传：只有"本模式 + 清单指纹"都吻合的控制文件才认；否则段目录整个丢掉
+    // （绝不复用来历不明的半截文件）
+    let resumed = load_ctrl(&ctrl_path, plan).filter(is_unordered_ctrl);
+    let (mut written, mut done) = match &resumed {
+        Some(c) => (c.prefix.min(all.len()), mask_from_hex(&c.mask, all.len())),
+        None => {
+            let _ = std::fs::remove_dir_all(&dir);
+            (0usize, vec![false; all.len()])
+        }
+    };
+    // 位图说"完整"、段文件却不在 → 那段得重下（段目录被清 / 文件被手工删）
+    for i in 0..all.len() {
+        if done[i] && !seg_file(path, i).is_file() {
+            done[i] = false;
+        }
+    }
+    // 产物文件长度：磁盘上的可能比控制文件长（上次没 flush 的尾巴），以控制
+    // 文件为准截断；短了说明产物被动过 → 已拼前缀作废，重新拼
+    let disk_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let spliced = match &resumed {
+        Some(c) if disk_len >= c.bytes => c.bytes,
+        _ => 0,
+    };
+    if resumed.is_some() && spliced == 0 {
+        written = 0;
+    }
+    stats.mark_unordered();
+    stats.completed.store(spliced, Ordering::Relaxed);
+    // 段文件里的字节也算已下载（进度 = 磁盘上真实存在的字节总数）
+    let mut spilled0 = 0u64;
+    for i in 0..all.len() {
+        if !done[i] {
+            if let Ok(m) = std::fs::metadata(seg_file(path, i)) {
+                spilled0 = spilled0.saturating_add(m.len());
+            }
+        }
+    }
+    stats.spilled.store(spilled0, Ordering::Relaxed);
+
+    let mut sink = if spliced > 0 {
+        if let Some(p) = path.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_len(spliced))
+            .map_err(|e| HttpError::Io(e.to_string()))?;
+        FileSink::append_at(path, spliced).map_err(|e| HttpError::Io(e.to_string()))?
+    } else {
+        FileSink::create(path).map_err(|e| HttpError::Io(e.to_string()))?
+    };
+
+    let ctx = Ctx {
+        client,
+        cancel,
+        limiter: opts.limiter.as_deref(),
+        headers: &opts.headers,
+        retries: opts.retries.max(1),
+        stats: &stats,
+        keys: Mutex::new(HashMap::new()),
+    };
+    let conn = opts.concurrency.clamp(1, 64);
+    let ctrl_of = |written: usize, bytes: u64, done: &[bool]| PlaylistCtrl {
+        kind: CTRL_KIND.to_string(),
+        v: 1,
+        fp: fp.clone(),
+        url: plan.source.clone(),
+        segs: total_segments,
+        prefix: written,
+        bytes,
+        part: 0,
+        mode: CTRL_MODE_UNORDERED.to_string(),
+        mask: mask_to_hex(done),
+    };
+    // 已完成段的时长合计：乱序下"已覆盖时长"不能用前缀算（段是乱序完成的），
+    // 用已完成段的时长和 —— 段大小/时长的比例在整条流上是稳定的，够用
+    let mut done_dur: f64 = (0..all.len())
+        .filter(|i| done[*i])
+        .map(|i| all[i].duration)
+        .sum();
+    let mut last_save = std::time::Instant::now() - CTRL_SAVE_INTERVAL;
+    let mut in_flight = 0usize;
+    // 派发从"还没拼进产物的第一段"开始：`written` 之前的段已经躺在产物里了，
+    // 再派发一次就是白下（续传时最容易踩到）
+    let mut next_spawn = written;
+    let mut handles: HashMap<usize, Arc<Mutex<SegFile>>> = HashMap::new();
+    let mut futs: FuturesUnordered<BoxFuture<'_, (usize, Result<SegBody, HttpError>)>> =
+        FuturesUnordered::new();
+    let mut failure: Option<HttpError> = None;
+
+    loop {
+        // 1) 把连续前缀拼进产物（拼一段删一段，磁盘不翻倍）
+        while written < all.len() && done[written] {
+            let f = seg_file(path, written);
+            match splice_seg(&f, &mut sink) {
+                Ok(moved) => {
+                    done[written] = false;
+                    written += 1;
+                    // 进度"转移"：先记产物侧、再减段文件侧 —— 中途只会略偏高一点，
+                    // 绝不会回落
+                    stats.completed.store(sink.position(), Ordering::Relaxed);
+                    let _ = stats
+                        .spilled
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(moved))
+                        });
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        if failure.is_some() || written == all.len() {
+            break;
+        }
+        // 2) 补足在飞下载：**没有内存闸门**（字节直接落段文件），连接始终满载
+        while in_flight < conn && next_spawn < all.len() {
+            let i = next_spawn;
+            next_spawn += 1;
+            if done[i] {
+                continue;
+            }
+            let sf = seg_file(path, i);
+            let existing = std::fs::metadata(&sf).map(|m| m.len()).unwrap_or(0);
+            let file = match SegFile::open(&sf, existing == 0) {
+                Ok(f) => f,
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            };
+            in_flight += 1;
+            let target = if all[i].key.is_some() {
+                // 加密段：解密要整段，先收进内存（收完由主循环写段文件）
+                SegTarget::Mem(Arc::new(Mutex::new(Vec::new())))
+            } else {
+                let h = Arc::new(Mutex::new(file));
+                handles.insert(i, h.clone());
+                SegTarget::Disk(h)
+            };
+            let seg = &all[i];
+            let ctx = &ctx;
+            futs.push(Box::pin(async move {
+                let r = fetch_segment(ctx, seg, &target, 0, None).await;
+                (i, r)
+            }));
+        }
+        if failure.is_some() {
+            break;
+        }
+        // 3) 等一个下载结果
+        match futs.next().await {
+            Some((i, Ok(body))) => {
+                in_flight -= 1;
+                handles.remove(&i);
+                if body.on_disk == 0 {
+                    // 加密段：把解出来的明文写进段文件 —— 到这一刻才算落到盘上
+                    let sf = seg_file(path, i);
+                    let w = SegFile::open(&sf, true).and_then(|mut f| {
+                        f.append(&body.data)?;
+                        f.finish()
+                    });
+                    match w {
+                        Ok(n) => {
+                            stats.spilled.fetch_add(n, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            failure = Some(e);
+                            break;
+                        }
+                    }
+                }
+                done[i] = true;
+                done_dur += all[i].duration;
+                // 实测外推总长：已下字节 ÷ 已覆盖时长 × 总时长（只增不减，
+                // 免得进度条往回跳）。初值由分发器按清单码率给。
+                if plan.total.is_none() && done_dur > 0.0 && plan.duration_secs > 0.0 {
+                    let got = stats
+                        .completed
+                        .load(Ordering::Relaxed)
+                        .saturating_add(stats.spilled.load(Ordering::Relaxed));
+                    let est = (got as f64 / done_dur * plan.duration_secs) as u64;
+                    if est > 0 {
+                        stats.estimated_total.fetch_max(est, Ordering::Relaxed);
+                    }
+                }
+                if last_save.elapsed() >= CTRL_SAVE_INTERVAL {
+                    if let Err(e) = sink.flush() {
+                        failure = Some(HttpError::Io(e.to_string()));
+                        break;
+                    }
+                    save_ctrl(&ctrl_path, &ctrl_of(written, sink.position(), &done));
+                    last_save = std::time::Instant::now();
+                }
+            }
+            Some((_, Err(e))) => {
+                failure = Some(e);
+                break;
+            }
+            None => {
+                if failure.is_none() && written < all.len() {
+                    failure = Some(HttpError::Protocol(format!(
+                        "播放列表未下载完整: {written}/{total_segments} 段"
+                    )));
+                }
+                break;
+            }
+        }
+    }
+
+    // 收尾：丢掉在飞请求，并把刚好凑齐的连续前缀补拼完
+    drop(futs);
+    drop(handles);
+    while failure.is_none() && written < all.len() && done[written] {
+        let f = seg_file(path, written);
+        match splice_seg(&f, &mut sink) {
+            Ok(moved) => {
+                done[written] = false;
+                written += 1;
+                stats.completed.store(sink.position(), Ordering::Relaxed);
+                let _ = stats
+                    .spilled
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(moved))
+                    });
+            }
+            Err(e) => failure = Some(e),
+        }
+    }
+    let flush = sink.flush().map_err(|e| HttpError::Io(e.to_string()));
+    if let Err(e) = flush {
+        if failure.is_none() {
+            failure = Some(e);
+        }
+    }
+    match (&failure, written == total_segments) {
+        (Some(_), _) => {
+            save_ctrl(&ctrl_path, &ctrl_of(written, sink.position(), &done));
+            Err(failure.unwrap())
+        }
+        (None, true) => {
+            // 全部拼进去了：段目录是空的，顺手收掉它和控制文件
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_file(&ctrl_path);
+            Ok(PlaylistDone {
+                bytes: sink.position(),
+                segments: written,
+                total_segments,
+            })
+        }
+        (None, false) => {
+            save_ctrl(&ctrl_path, &ctrl_of(written, sink.position(), &done));
+            Err(HttpError::Protocol(format!(
+                "播放列表未下载完整: {written}/{total_segments} 段"
+            )))
+        }
+    }
+}
+
+/// **顺序落盘**：边下边按清单顺序直接写产物文件。
 ///
 /// 取消时返回 [`HttpError::Cancelled`]：已持久化的内容（完整前缀 + 「下一
 /// 待写段」已经收到的开头部分）留在文件与控制文件里，下次调用从该处续传，
 /// 段内那截用 `Range` 接着下，不必整段重来。
-pub async fn download_playlist(
+async fn download_playlist_ordered(
     client: &reqwest::Client,
     path: &Path,
     plan: &PlaylistPlan,
@@ -1353,6 +1986,7 @@ pub async fn download_playlist(
     publish_estimate(&stats, est_done_bytes, est_done_dur, prefix);
     let mut last_save = std::time::Instant::now() - CTRL_SAVE_INTERVAL;
     // `bytes` = 完整前缀的字节数；`part` = 紧跟着的段内续传那截
+    // `mode` 留空 = 顺序落盘（乱序那条路径用 "unordered"），两种模式互不认
     let ctrl_of = |prefix: usize, bytes: u64, part: u64| PlaylistCtrl {
         kind: CTRL_KIND.to_string(),
         v: 1,
@@ -1362,6 +1996,8 @@ pub async fn download_playlist(
         prefix,
         bytes,
         part,
+        mode: String::new(),
+        mask: String::new(),
     };
 
     // 重排窗口：**在飞下载**与**已下好待写**分开计。
@@ -1432,9 +2068,12 @@ pub async fn download_playlist(
             let slot = stats.slot(i);
             let buf = Arc::new(Mutex::new(Vec::new()));
             partials.insert(i, buf.clone());
+            // 顺序落盘：数据先收进内存（"下好但没轮到写"的分片就攒在这里，
+            // 受 `MAX_UNWRITTEN_BYTES` 约束）
+            let target = SegTarget::Mem(buf);
             let ctx = &ctx;
             futs.push(Box::pin(async move {
-                let r = fetch_segment(ctx, seg, &buf, resume_from, &slot).await;
+                let r = fetch_segment(ctx, seg, &target, resume_from, Some(&slot)).await;
                 (i, r)
             }));
         }
@@ -2113,6 +2752,9 @@ mod tests {
         let opts = PlaylistOptions {
             concurrency: 1,
             probe_sizes: false,
+            // 这些用例断言的正是**顺序落盘**的语义（控制文件里前缀 + part、
+            // 进度只认光标那一段），显式选它
+            ordered_write: true,
             ..Default::default()
         };
         let plan = fetch_plan(&client, &srv.url("/m/index.m3u8"), &cancel, &[], &opts)
@@ -2308,7 +2950,7 @@ mod tests {
     fn seg_count_guard_reverts_bytes_on_drop() {
         let slot = AtomicU64::new(0);
         let total = AtomicU64::new(100);
-        let mut c = SegCount::new(&slot, &total);
+        let mut c = SegCount::new(&total, None, Some(&slot), true);
         c.add(64);
         assert_eq!(slot.load(Ordering::Relaxed), 64);
         assert_eq!(total.load(Ordering::Relaxed), 164);
@@ -2317,7 +2959,7 @@ mod tests {
         assert_eq!(total.load(Ordering::Relaxed), 100, "被丢弃的分片不得留在已接收里");
 
         // 整段到手（keep）后不再扣
-        let mut c2 = SegCount::new(&slot, &total);
+        let mut c2 = SegCount::new(&total, None, Some(&slot), true);
         c2.add(32);
         c2.keep();
         drop(c2);
@@ -2391,6 +3033,8 @@ mod tests {
         let opts = PlaylistOptions {
             concurrency: 4,
             probe_sizes: false,
+            // 「重排窗口不空转 + 进度不虚高」是**顺序落盘**的两个特性
+            ordered_write: true,
             ..Default::default()
         };
         let plan = fetch_plan(&client, &srv.url("/m/index.m3u8"), &cancel, &[], &opts)
@@ -2471,6 +3115,9 @@ mod tests {
         let po = PlaylistOptions {
             concurrency: 1,
             probe_sizes: false,
+            // 这些用例断言的正是**顺序落盘**的语义（控制文件里前缀 + part、
+            // 进度只认光标那一段），显式选它
+            ordered_write: true,
             ..Default::default()
         };
         let plan = fetch_plan(&client, &srv.url("/m/index.m3u8"), &cancel, &[], &po)
@@ -2539,6 +3186,9 @@ mod tests {
         let po = PlaylistOptions {
             concurrency: 1,
             probe_sizes: false,
+            // 这些用例断言的正是**顺序落盘**的语义（控制文件里前缀 + part、
+            // 进度只认光标那一段），显式选它
+            ordered_write: true,
             ..Default::default()
         };
         let done = download_playlist(
@@ -2593,6 +3243,9 @@ mod tests {
         let po = PlaylistOptions {
             concurrency: 1,
             probe_sizes: false,
+            // 这些用例断言的正是**顺序落盘**的语义（控制文件里前缀 + part、
+            // 进度只认光标那一段），显式选它
+            ordered_write: true,
             ..Default::default()
         };
         let done = download_playlist(

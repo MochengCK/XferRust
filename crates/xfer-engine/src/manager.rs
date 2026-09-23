@@ -1754,6 +1754,15 @@ impl TaskManager {
             prefer_worst,
             limiter: Some(task.http_task_limiter()),
             headers: headers.clone(),
+            // 落盘方式：`hls-write-mode=ordered` 才走"边下边按序写产物"，
+            // 其余（含未设置）都是**乱序落盘**（各段先落段文件、再按序拼接）——
+            // 后者内存几乎不占、连接不会被队头慢分片拖停、进度与速度同步。
+            ordered_write: get("hls-write-mode")
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    v == "ordered" || v == "sequential" || v == "true"
+                })
+                .unwrap_or(false),
         }
     }
 
@@ -1873,7 +1882,10 @@ impl TaskManager {
                 finish_http_task(task, &path).await
             }
             Err(e) => {
-                let completed = stats.completed.load(Ordering::Relaxed);
+                // 用 `progress()` 而不是 `completed`：乱序落盘时各段文件里的
+                // 字节也算已下载（取消/暂停都不会丢），只看产物长度会让界面
+                // 在暂停的瞬间掉一大截
+                let completed = stats.progress();
                 {
                     let mut sh = task.shared.lock().unwrap();
                     sh.completed = completed;

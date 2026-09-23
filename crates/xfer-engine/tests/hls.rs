@@ -72,6 +72,35 @@ impl HlsServer {
     }
 }
 
+
+/// 段文件目录（乱序落盘：`<产物>.hlseg/`）。
+fn seg_dir_of(out: &std::path::Path) -> std::path::PathBuf {
+    let name = out
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "out".to_string());
+    out.with_file_name(format!("{name}.hlseg"))
+}
+
+/// 第 `i` 段的段文件路径。
+fn seg_file_of(out: &std::path::Path, i: usize) -> std::path::PathBuf {
+    seg_dir_of(out).join(format!("{i:06}"))
+}
+
+/// **磁盘上的真实字节**：产物 + 段目录里还没拼进去的那些段文件。
+///
+/// 乱序落盘下这才是"已经下到磁盘上的量" —— 进度必须等于它（而不是只等于产物
+/// 长度，产物只有连续前缀才长）。
+fn disk_bytes(out: &std::path::Path) -> u64 {
+    let mut total = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+    if let Ok(rd) = std::fs::read_dir(seg_dir_of(out)) {
+        for e in rd.flatten() {
+            total += e.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    total
+}
+
 /// 静态文件服务：支持 Range（分片大小预探测依赖），可对指定路径
 /// 注入 `Content-Type`，并对 `/show/seg` 下的响应加延迟（测暂停续传）。
 async fn start_hls_server(
@@ -432,7 +461,8 @@ async fn hls_progress_advances_while_head_segment_is_slow() {
     loop {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let st = tell(&mgr, &gid).await;
-        let disk = std::fs::metadata(file_of(&st)).map(|m| m.len()).unwrap_or(0);
+        // 乱序落盘下"磁盘"= 产物 + 还没拼进去的段文件
+        let disk = disk_bytes(&file_of(&st));
         let done = st["completedLength"].as_u64().unwrap_or(0);
         assert!(done >= last, "进度倒退了：{last} → {done}");
         last = done;
@@ -450,7 +480,7 @@ async fn hls_progress_advances_while_head_segment_is_slow() {
                 .expect("暂停未生效");
             paused = Some((
                 st["completedLength"].as_u64().unwrap_or(0),
-                std::fs::metadata(file_of(&st)).map(|m| m.len()).unwrap_or(0),
+                disk_bytes(&file_of(&st)),
             ));
             break;
         }
@@ -477,10 +507,15 @@ async fn hls_progress_advances_while_head_segment_is_slow() {
          段内续传没把光标那段的半截落盘"
     );
     assert!(
-        worst_ahead <= seg_bytes as i64 + SINK_BUF,
-        "进度比磁盘超前 {worst_ahead} 字节（上限 {} = 一个分片 + 写回缓冲）——\
-         把后面那些「取消即丢」的在飞分片算成已下载了",
-        seg_bytes as i64 + SINK_BUF
+        worst_ahead <= SINK_BUF,
+        "进度比磁盘超前 {worst_ahead} 字节（上限 {SINK_BUF} = 产物的写回缓冲）——\
+         乱序落盘下进度就该等于磁盘上的字节，多出来说明算了还没落盘的数据"
+    );
+    assert!(
+        paused_done + SINK_BUF as u64 >= paused_disk,
+        "暂停后进度（{paused_done}）比磁盘（{paused_disk}）少了一大截 —— \
+         乱序落盘必须把段文件里的字节也算进已下载（用户报的「速度几 MB、\
+         进度只涨几 KB」就是这个）"
     );
 }
 
@@ -674,27 +709,33 @@ async fn hls_pause_resume_continues_within_segment() {
         .await
         .expect("暂停未生效");
     let file = file_of(&st);
-    let paused_len = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    // 乱序落盘：第 2 段下到一半就暂停，那半截留在**它自己的段文件**里
+    let part = std::fs::metadata(seg_file_of(&file, 1))
+        .map(|m| m.len())
+        .unwrap_or(0);
     assert!(
-        paused_len > seg_len as u64 && paused_len < (seg_len * 2) as u64,
-        "暂停时应留住第 2 段的半截（实际 {paused_len} 字节）"
+        part > 0 && part < seg_len as u64,
+        "暂停时段文件里应留住第 2 段的半截（实际 {part} 字节）"
     );
     assert_eq!(
         st["completedLength"].as_u64().unwrap_or(0),
-        paused_len,
-        "暂停后的进度必须等于磁盘上的真实字节"
+        disk_bytes(&file),
+        "暂停后的进度必须等于磁盘上的真实字节（产物 + 段文件）"
     );
-    let part = paused_len - seg_len as u64;
 
     mgr.unpause(&gid).expect("unpause 应成功");
     let st = wait_status(&mgr, &gid, "complete", 40_000)
         .await
         .expect("恢复后 40s 内未完成");
     let expected: Vec<u8> = segs.iter().flatten().copied().collect();
-    assert_eq!(
-        std::fs::read(file_of(&st)).unwrap(),
-        expected,
-        "段内续传产物必须严丝合缝（多写一遍开头就会错位）"
+    let got = std::fs::read(file_of(&st)).unwrap();
+    assert!(
+        got == expected,
+        "段内续传产物必须严丝合缝（多写一遍开头就会错位）：产物 {} 字节 / 期望 {} 字节，\
+         首个不一致位置 {:?}",
+        got.len(),
+        expected.len(),
+        got.iter().zip(expected.iter()).position(|(a, b)| a != b)
     );
     let rs = srv.ranges("/show/seg2.ts");
     assert_eq!(rs.len(), 2, "seg2 只应被请求两次：首次 + 续传，不该整段重下");
