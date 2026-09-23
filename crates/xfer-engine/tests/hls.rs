@@ -379,23 +379,27 @@ async fn hls_pause_resume_keeps_prefix() {
     assert!(!ctrl_path(&file_of(&st)).exists());
 }
 
-/// 进度 = **已交给文件的字节**，且**绝不倒退**（暂停也不倒退）。
+/// 进度必须**一路往前走**，同时不虚报超过一个分片。
 ///
-/// 现场：分片按清单顺序整段拼接，队头慢时后面的分片会先下完等在内存里。
-/// 旧实现把这些字节按"已接收"上报，界面能显示 40MB、一暂停回落成磁盘上的
-/// 1.4MB（那些字节还在内存，取消即丢弃）。这条用例钉两件事：
-///   1. 进度不得超前文件（含 `FileSink` 那 512KB 写回缓冲）；
-///   2. 暂停后读到的进度不得小于暂停前看到的峰值。
+/// 现场（真实站点）：单连接被限速到几十 KB/s，一个 1.5MB 的分片要 20 秒才
+/// 下完 —— 只按「分片整段落盘」跳的口径下，界面 20 秒不动一格，用户看到的
+/// 就是「进度不是实时的」（磁盘与网络其实一直在走）。现在把**光标所在那一个
+/// 分片**的在飞字节算进进度（它取消时会被段内续传落盘，所以不会白算）。
+/// 这条用例钉三件事：
+///   1. 队头分片下载期间进度**连续变化**（不是长时间静止）；
+///   2. 进度**绝不倒退**（暂停也不倒退）；
+///   3. 最多只领先磁盘「一个分片 + 写回缓冲」—— 后面那些在飞分片取消即丢，
+///      不能算进进度。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hls_progress_is_committed_bytes_and_never_regresses() {
+async fn hls_progress_advances_while_head_segment_is_slow() {
+    use std::collections::BTreeSet;
     use std::time::Instant;
 
-    let dir = tmpdir("progress");
-    // 分片要足够大：`FileSink` 自带 512KB 写回缓冲（进度含它，取消时会被
-    // flush 落盘，不算虚报），分片太小就全被缓冲吃掉、磁盘恒为 0
+    const SINK_BUF: i64 = 512 * 1024;
+
+    let dir = tmpdir("progress-advance");
     let seg_bytes = 512 * 1024usize;
     let count = 6usize;
-    const SINK_BUF: i64 = 512 * 1024;
     let names: Vec<String> = (1..=count).map(|i| format!("seg{i}.ts")).collect();
     let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let mut files = HashMap::new();
@@ -406,10 +410,10 @@ async fn hls_progress_is_committed_bytes_and_never_regresses() {
     for (i, n) in names.iter().enumerate() {
         files.insert(format!("/show/{n}"), sample(i as u8 + 1, seg_bytes));
     }
-    // 队头（首片）慢 2.5s，其余分片正常：这段时间里后面的分片会先下完等内存
-    let mut slow = HashMap::new();
-    slow.insert("/show/seg1.ts".to_string(), 2_500u64);
-    let srv = start_hls_server_slow(files, HashMap::new(), 0, slow).await;
+    // 队头片慢发：16KB / 120ms → 512KB 要约 4 秒（模拟「单连接被限速」）
+    let mut trickle = Trickle::new();
+    trickle.insert("/show/seg1.ts".to_string(), (16 * 1024usize, 120u64));
+    let srv = start_hls_server_trickle(files, HashMap::new(), 0, HashMap::new(), trickle).await;
     let mgr = TaskManager::start(dir.clone(), 2);
     let gid = mgr
         .add_uri(
@@ -420,26 +424,33 @@ async fn hls_progress_is_committed_bytes_and_never_regresses() {
         .expect("addUri 应成功");
 
     let started = Instant::now();
-    let mut worst: i64 = 0;
-    let mut peak: i64 = 0;
-    let mut paused: Option<(i64, i64)> = None;
+    let mut seen: BTreeSet<u64> = BTreeSet::new();
+    let mut last: u64 = 0;
+    let mut worst_ahead: i64 = 0;
+    let mut peak: u64 = 0;
+    let mut paused: Option<(u64, u64)> = None;
     loop {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let st = tell(&mgr, &gid).await;
-        let disk = std::fs::metadata(file_of(&st)).map(|m| m.len()).unwrap_or(0) as i64;
-        let done = st["completedLength"].as_u64().unwrap_or(0) as i64;
-        worst = worst.max(done - disk);
+        let disk = std::fs::metadata(file_of(&st)).map(|m| m.len()).unwrap_or(0);
+        let done = st["completedLength"].as_u64().unwrap_or(0);
+        assert!(done >= last, "进度倒退了：{last} → {done}");
+        last = done;
+        if done > 0 {
+            seen.insert(done);
+        }
         peak = peak.max(done);
+        worst_ahead = worst_ahead.max(done as i64 - disk as i64);
 
-        // 队头还在下的时候就暂停：验证"暂停不倒退"
-        if paused.is_none() && started.elapsed() >= Duration::from_millis(700) {
+        // 队头还在下的时候暂停：验证「暂停不倒退」
+        if started.elapsed() >= Duration::from_millis(1_600) {
             mgr.pause(&gid).expect("pause 应成功");
             let st = wait_status(&mgr, &gid, "paused", 15_000)
                 .await
                 .expect("暂停未生效");
             paused = Some((
-                st["completedLength"].as_u64().unwrap_or(0) as i64,
-                std::fs::metadata(file_of(&st)).map(|m| m.len()).unwrap_or(0) as i64,
+                st["completedLength"].as_u64().unwrap_or(0),
+                std::fs::metadata(file_of(&st)).map(|m| m.len()).unwrap_or(0),
             ));
             break;
         }
@@ -449,19 +460,27 @@ async fn hls_progress_is_committed_bytes_and_never_regresses() {
         }
     }
 
-    let (paused_done, paused_disk) = paused.expect("用例没走到暂停点（下载比预期快？）");
+    assert!(
+        seen.len() >= 5,
+        "队头分片下载期间进度只出现过 {} 个不同值（{seen:?}）—— \
+         说明进度在等整段落盘、没跟着在飞字节走",
+        seen.len()
+    );
+    let (paused_done, paused_disk) = paused.expect("用例没走到暂停点");
     assert!(
         paused_done >= peak,
         "暂停后进度倒退了：暂停前峰值 {peak} → 暂停后 {paused_done}"
     );
     assert!(
         paused_done <= paused_disk,
-        "暂停后的进度（{paused_done}）比磁盘上的字节（{paused_disk}）还多——虚报"
+        "暂停后进度（{paused_done}）比磁盘（{paused_disk}）还多——\
+         段内续传没把光标那段的半截落盘"
     );
     assert!(
-        worst <= SINK_BUF,
-        "进度比磁盘超前 {worst} 字节（上限 {SINK_BUF} = 写回缓冲）——\
-         在飞/待写的分片被当成已下载了（那些字节暂停即丢弃）"
+        worst_ahead <= seg_bytes as i64 + SINK_BUF,
+        "进度比磁盘超前 {worst_ahead} 字节（上限 {} = 一个分片 + 写回缓冲）——\
+         把后面那些「取消即丢」的在飞分片算成已下载了",
+        seg_bytes as i64 + SINK_BUF
     );
 }
 

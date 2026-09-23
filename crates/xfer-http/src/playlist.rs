@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -123,6 +123,12 @@ pub struct PlaylistPlan {
     pub total: Option<u64>,
     /// 媒体时长合计（`#EXTINF` 之和，秒）。总长估算的分母。
     pub duration_secs: f64,
+    /// 选中变体的声明码率（`#EXT-X-STREAM-INF:BANDWIDTH`，bit/s）。
+    ///
+    /// 单层清单（没有主清单）时为 `None`。有它就能在**下载开始之前**给出
+    /// 一个像样的总长（`bitrate / 8 × duration_secs`）—— 否则进度条要等到
+    /// 第一个分片落盘才有总长，而单连接被限速的站点上一个分片要几十秒。
+    pub bitrate: Option<u64>,
 }
 
 impl PlaylistPlan {
@@ -164,7 +170,7 @@ impl Default for PlaylistOptions {
     }
 }
 
-/// 引擎轮询的进度句柄（无锁原子）。
+/// 引擎轮询的进度句柄（无锁原子 + 一组分片计数槽位）。
 pub struct PlaylistStats {
     /// 已交给文件的字节数（含 `FileSink` 那 512KB 写回缓冲——取消/失败收尾
     /// 会 `flush()` 把它落盘，所以这些字节**不会被丢弃**），含续传基线。
@@ -176,12 +182,22 @@ pub struct PlaylistStats {
     pub received: AtomicU64,
     /// 当前在飞分片数。
     pub connections: AtomicUsize,
+    /// 下一个待写分片的绝对序号（`#EXT-X-MAP` 初始化段算 0）。
+    pub cursor: AtomicUsize,
+    /// `cursor` 那一分片的已收字节**是否计入进度**：由"取消时这截会不会被
+    /// 段内续传保住"决定 —— 未加密 = 会（计入），`AES-128` 加密 = 不会。
+    pub cursor_counted: AtomicBool,
     /// 总字节数的**实时估算**（0 = 还没法估）。
     ///
-    /// 大清单不做预探测，改用「已下字节 ÷ 已覆盖时长 × 总时长」外推：
-    /// 一开始只有粗估值，随着分片落地越来越准；`plan.total` 已知时
-    /// （小清单探测过）这里始终为 0，由调用方优先用精确值。
+    /// 两个来源，按可用性递进：① 主清单的 `BANDWIDTH × 总时长`（下载一开始
+    /// 就有值，误差 ±10% 量级）；② 实测「已下字节 ÷ 已覆盖时长 × 总时长」
+    /// 外推（写完第一段后接管，越来越准）。`plan.total` 已知时（小清单探测
+    /// 过）这里始终为 0，由调用方优先用精确值。
     pub estimated_total: AtomicU64,
+    /// 每个分片各自的已接收字节（按绝对序号，按需增长）。
+    ///
+    /// 进度只取 [`Self::cursor`] 处那一个：见 [`Self::progress`]。
+    slots: Mutex<Vec<Arc<AtomicU64>>>,
 }
 
 impl PlaylistStats {
@@ -190,27 +206,57 @@ impl PlaylistStats {
             completed: AtomicU64::new(baseline),
             received: AtomicU64::new(baseline),
             connections: AtomicUsize::new(0),
+            cursor: AtomicUsize::new(0),
+            cursor_counted: AtomicBool::new(true),
             estimated_total: AtomicU64::new(0),
+            slots: Mutex::new(Vec::new()),
         })
     }
 
-    /// 进度 = **已交给文件、且取消时不会被丢弃的字节数**（即 `completed`）。
+    /// 某个分片的计数槽位（不存在就按需建，槽位只增不删）。
+    pub fn slot(&self, index: usize) -> Arc<AtomicU64> {
+        let mut slots = self.slots.lock().unwrap();
+        if index >= slots.len() {
+            slots.resize_with(index + 1, || Arc::new(AtomicU64::new(0)));
+        }
+        slots[index].clone()
+    }
+
+    /// 推进待写光标（写完第 `written` 段之后调用）。
     ///
-    /// 这个口径只有一个要求：**绝不倒退**。界面上的数字一旦回落，用户第一
-    /// 反应就是"进度虚报"。
+    /// **必须在更新 `completed` 之前调用**：顺序反过来会有一个窗口，此刻
+    /// `completed` 已含刚写完的整段、而光标还指着它（槽位里也是整段字节），
+    /// 进度会凭空多出一段。
+    pub fn set_cursor(&self, written: usize, counted: bool) {
+        self.cursor_counted.store(counted, Ordering::Relaxed);
+        self.cursor.store(written, Ordering::Relaxed);
+    }
+
+    /// 进度 = **已交给文件的字节 + 当前待写分片已经收到的字节**。
     ///
-    /// 所以不能算「在飞分片的已收字节」：
-    /// - 分片是整段下完、按清单顺序追加的，队头慢时后面的分片会先下完等在
-    ///   内存里。把这些字节算进进度，界面能显示 40MB，一暂停回落成磁盘上的
-    ///   1.4MB（那些字节**确实**被丢弃了 —— 进度不能为它们背书）。
-    /// - 反过来，`completed` 里含 `FileSink` 的写回缓冲：取消/失败收尾会
-    ///   `flush()`，它们一定落到磁盘上，留着不算虚报。
+    /// 为什么是这两项：分片整段下完才按顺序追加，所以
     ///
-    /// 代价是进度只能在**分片落盘的时刻**跳一下（并发 16~32 路时通常是
-    /// 每秒数次），而不是字节级平滑。**速度**不走这里：由 `received` 驱动
-    /// （见 `spawn_playlist_sampler`），所以"速度显示 0"的老问题不会回来。
+    /// - **已落盘部分**（`completed`，含写回缓冲）取消时一定在文件里，算它没有风险；
+    /// - **当前待写分片**（光标处）的已收字节取消时会被**段内续传**追加进文件
+    ///   （未加密时），同样不会白算。没有它，进度就只能按"分片落盘"跳 —— 单连接
+    ///   被限速的站点上，一个 1.5MB 的分片要 20 秒才下完，界面 20 秒才动一格，
+    ///   看着就是"进度不动"，而磁盘/网络其实一直在走。
+    ///
+    /// 为什么**只**算光标那一个：排在它后面的分片虽然也下好了，但它们的字节
+    /// 停在内存里、取消即丢弃（写盘严格按序，轮不到它们）。把这些算进去就是
+    /// 曾经的"界面显示 40MB、一暂停回落成磁盘上的 1.4MB"。加密分片（`AES-128`）
+    /// 不做段内续传，光标处也不计入，退化成"按分片跳"。
     pub fn progress(&self) -> u64 {
-        self.completed.load(Ordering::Relaxed)
+        let done = self.completed.load(Ordering::Relaxed);
+        if !self.cursor_counted.load(Ordering::Relaxed) {
+            return done;
+        }
+        let cursor = self.cursor.load(Ordering::Relaxed);
+        let slots = self.slots.lock().unwrap();
+        match slots.get(cursor) {
+            Some(n) => done.saturating_add(n.load(Ordering::Relaxed)),
+            None => done,
+        }
     }
 }
 
@@ -586,6 +632,8 @@ pub async fn fetch_plan(
 ) -> Result<PlaylistPlan, HttpError> {
     let mut cur = url.to_string();
     let mut chain: Vec<String> = Vec::new();
+    // 选中变体的声明码率（主清单才有）：用于"下载一开始就有总长"
+    let mut bitrate: Option<u64> = None;
     for _ in 0..MAX_VARIANT_HOPS {
         let (text, final_url) = fetch_manifest(client, &cur, cancel, headers).await?;
         if !looks_like_manifest(&text) {
@@ -605,6 +653,7 @@ pub async fn fetch_plan(
                 .expect("变体列表非空")
                 .clone();
             tracing::debug!(variant = %chosen.url, bandwidth = chosen.bandwidth, "主清单选流");
+            bitrate = Some(chosen.bandwidth).filter(|b| *b > 0);
             chain.push(cur.clone());
             cur = chosen.url;
             continue;
@@ -625,6 +674,7 @@ pub async fn fetch_plan(
             live: media.live,
             total: None,
             duration_secs,
+            bitrate,
         };
         if plan.segment_count() == 0 {
             return Err(HttpError::Protocol("播放列表中没有可下载的分片".into()));
@@ -996,6 +1046,7 @@ async fn fetch_segment(
     seg: &Segment,
     buf: &Mutex<Vec<u8>>,
     resume_from: u64,
+    slot: &AtomicU64,
 ) -> Result<SegBody, HttpError> {
     let mut attempt = 1u32;
     loop {
@@ -1009,7 +1060,7 @@ async fn fetch_segment(
                 Some(k) => Some(fetch_key(ctx, &k.url).await?),
                 None => None,
             };
-            let whole = fetch_body(ctx, seg, buf, resume_from).await?;
+            let whole = fetch_body(ctx, seg, buf, resume_from, slot).await?;
             let data = std::mem::take(&mut *buf.lock().unwrap());
             match (&key, &seg.key) {
                 (Some(k), Some(sk)) => decrypt_segment(k, &sk.iv, &data).map(|d| SegBody {
@@ -1039,22 +1090,24 @@ async fn fetch_segment(
     }
 }
 
-/// 分片字节计数守卫：每读到一个 chunk 就累加到全局 `received`；
-/// **没走到"成功拿到整段"就 Drop**（失败重试、取消、future 被直接丢弃）时
-/// 把这一趟的字节扣回去。
+/// 分片字节计数守卫：每读到一个 chunk 就累加到**该分片的槽位**与全局
+/// `received`；**没走到"成功拿到整段"就 Drop**（失败重试、取消、
+/// future 被直接丢弃）时把这一趟的字节扣回去。
 ///
 /// 只在 `Err` 分支扣数的写法漏掉了 future 被 drop 的路径 —— 暂停、
 /// 任务提前收尾、`futures` 队列被丢弃时走不到那段清理代码，计数会
-/// 永久虚高（速度/`received` 就再也对不上真实网速）。
+/// 永久虚高（进度/速度就再也对不上真实值）。
 struct SegCount<'a> {
+    slot: &'a AtomicU64,
     total: &'a AtomicU64,
     counted: u64,
     keep: bool,
 }
 
 impl<'a> SegCount<'a> {
-    fn new(total: &'a AtomicU64) -> Self {
+    fn new(slot: &'a AtomicU64, total: &'a AtomicU64) -> Self {
         Self {
+            slot,
             total,
             counted: 0,
             keep: false,
@@ -1063,6 +1116,7 @@ impl<'a> SegCount<'a> {
 
     fn add(&mut self, n: u64) {
         self.counted += n;
+        self.slot.fetch_add(n, Ordering::Relaxed);
         self.total.fetch_add(n, Ordering::Relaxed);
     }
 
@@ -1075,6 +1129,7 @@ impl<'a> SegCount<'a> {
 impl Drop for SegCount<'_> {
     fn drop(&mut self) {
         if !self.keep && self.counted > 0 {
+            self.slot.fetch_sub(self.counted, Ordering::Relaxed);
             self.total.fetch_sub(self.counted, Ordering::Relaxed);
         }
     }
@@ -1094,9 +1149,10 @@ async fn fetch_body(
     seg: &Segment,
     buf: &Mutex<Vec<u8>>,
     resume_from: u64,
+    slot: &AtomicU64,
 ) -> Result<bool, HttpError> {
-    // 失败/取消/被丢弃时守卫会把这一趟的字节从"已接收"里扣回去，不会虚高
-    let mut count = SegCount::new(&ctx.stats.received);
+    // 失败/取消/被丢弃时守卫会把这一趟的字节从槽位与"已接收"里扣回去，不会虚高
+    let mut count = SegCount::new(slot, &ctx.stats.received);
     let r = fetch_body_inner(ctx, seg, buf, resume_from, &mut count).await;
     if r.is_ok() {
         count.keep();
@@ -1162,9 +1218,11 @@ async fn fetch_body_inner(
         if let Some(l) = ctx.limiter {
             l.acquire(chunk.len()).await;
         }
-        // 读到就计数：进度不算它，但**速度**要（见 `PlaylistStats::progress`）
-        count.add(chunk.len() as u64);
+        // 先把数据放进共享缓冲，再计数：反过来的话，暂停瞬间可能出现
+        // "计数已加、缓冲里还没有"，收尾按缓冲落盘后进度反而少算（虽然只
+        // 是偏低，但没有理由留这个窗口）。
         buf.lock().unwrap().extend_from_slice(&chunk);
+        count.add(chunk.len() as u64);
     }
     let got = buf.lock().unwrap().len() as u64;
     if whole {
@@ -1261,6 +1319,20 @@ pub async fn download_playlist(
     //   done_bytes/done_dur/done_segs 都从续传基线起步，
     //   估算 = max(按字节密度外推, 已下字节 + 平均分片大小 × 剩余分片数)
     let need_estimate = plan.total.is_none();
+    // 总长先给一个"清单里就有"的粗估：`BANDWIDTH × 总时长 / 8`。大清单不做分片
+    // 预探测，实测外推又要等第一个分片落盘 —— 单连接被限速的站点上一个 1.5MB
+    // 分片要几十秒，那段时间里界面连"总大小"都显示不出来。有了它，进度条从
+    // 下载第一秒起就有分母（误差 ±10% 量级），随后被实测外推接管。
+    if need_estimate && plan.duration_secs > 0.0 {
+        if let Some(bw) = plan.bitrate {
+            let est = (bw as f64 / 8.0 * plan.duration_secs) as u64;
+            if est > 0 {
+                stats
+                    .estimated_total
+                    .store(est.max(have_bytes), Ordering::Relaxed);
+            }
+        }
+    }
     let mut est_done_bytes: u64 = have_bytes;
     let mut est_done_dur: f64 = all[..prefix].iter().map(|s| s.duration).sum();
     let publish_estimate = |stats: &PlaylistStats,
@@ -1308,6 +1380,9 @@ pub async fn download_playlist(
         FuturesUnordered::new();
 
     let mut failure: Option<HttpError> = None;
+    // 待写光标：进度里唯一允许算进"在飞字节"的那一段（见 `PlaylistStats::progress`）。
+    // 续传起步时它就是 `prefix`（接下来要写的那一段）。
+    stats.set_cursor(prefix, all.get(prefix).is_none_or(|s| s.key.is_none()));
     loop {
         // 1) 连续前缀能写多少写多少（写完即释放"待写"内存预算）
         while written < all.len() {
@@ -1324,6 +1399,10 @@ pub async fn download_playlist(
             est_done_bytes = sink.position();
             complete_bytes = est_done_bytes; // 刚写完的是一整段，文件里没有半截尾巴
             est_done_dur += seg_dur;
+            // 光标前移**必须早于** `completed` 更新：顺序反了会有一个窗口，
+            // 此刻 `completed` 已含刚写完的整段、而光标还指着它（槽位里也是
+            // 整段字节），进度会凭空多出一段。
+            stats.set_cursor(written, all.get(written).is_none_or(|s| s.key.is_none()));
             stats.completed.store(est_done_bytes, Ordering::Relaxed);
             publish_estimate(&stats, est_done_bytes, est_done_dur, written);
             if last_save.elapsed() >= CTRL_SAVE_INTERVAL {
@@ -1350,11 +1429,12 @@ pub async fn download_playlist(
             // 上一次没收完的"下一待写段"：这一段要按段内续传的偏移接着下
             let resume_from = if i == written { std::mem::take(&mut pending_resume) } else { 0 };
             let seg = &all[i];
+            let slot = stats.slot(i);
             let buf = Arc::new(Mutex::new(Vec::new()));
             partials.insert(i, buf.clone());
             let ctx = &ctx;
             futs.push(Box::pin(async move {
-                let r = fetch_segment(ctx, seg, &buf, resume_from).await;
+                let r = fetch_segment(ctx, seg, &buf, resume_from, &slot).await;
                 (i, r)
             }));
         }
@@ -1363,6 +1443,9 @@ pub async fn download_playlist(
             Some((i, Ok(body))) => {
                 in_flight -= 1;
                 partials.remove(&i);
+                // 这一段的槽位"转正"：整段已收完、排在 `ready` 里等写盘，
+                // 落盘之前它没有资格算进进度（进度只认光标那一个）——清零即可。
+                stats.slot(i).store(0, Ordering::Relaxed);
                 let data = body.data;
                 if body.whole && sink.position() > complete_bytes {
                     // 服务器无视 Range 回了整段：把文件里那截续传数据丢掉再写，
@@ -1417,6 +1500,9 @@ pub async fn download_playlist(
             .unwrap_or_default();
         if !encrypted && !tail.is_empty() && sink.write(&tail).is_ok() {
             est_done_bytes = sink.position();
+            // 这截已经转正落进文件、算进 `completed` 了：槽位清零，否则
+            // `progress()` 会把它再加一遍（差一截 `part`）。
+            stats.slot(written).store(0, Ordering::Relaxed);
             stats.completed.store(est_done_bytes, Ordering::Relaxed);
         }
     }
@@ -1611,6 +1697,7 @@ mod tests {
         let mk = |u: &str| PlaylistPlan {
             source: "https://x/i.m3u8".into(),
             chain: vec![],
+            bitrate: None,
             init: None,
             segments: vec![Segment {
                 url: u.into(),
@@ -2216,22 +2303,60 @@ mod tests {
     /// 分片字节计数的 Drop 兜底：没走到"整段到手"就必须扣回去。
     ///
     /// 只清 `Err` 分支的写法漏掉 future 被 drop 的路径（暂停、提前收尾），
-    /// "已接收"会永久虚高（速度再也对不上真实网速）。
+    /// 槽位与"已接收"会永久虚高（进度/速度再也对不上真实值）。
     #[test]
     fn seg_count_guard_reverts_bytes_on_drop() {
+        let slot = AtomicU64::new(0);
         let total = AtomicU64::new(100);
-        let mut c = SegCount::new(&total);
+        let mut c = SegCount::new(&slot, &total);
         c.add(64);
+        assert_eq!(slot.load(Ordering::Relaxed), 64);
         assert_eq!(total.load(Ordering::Relaxed), 164);
         drop(c);
+        assert_eq!(slot.load(Ordering::Relaxed), 0, "被丢弃的分片槽位必须归零");
         assert_eq!(total.load(Ordering::Relaxed), 100, "被丢弃的分片不得留在已接收里");
 
         // 整段到手（keep）后不再扣
-        let mut c2 = SegCount::new(&total);
+        let mut c2 = SegCount::new(&slot, &total);
         c2.add(32);
         c2.keep();
         drop(c2);
+        assert_eq!(slot.load(Ordering::Relaxed), 32);
         assert_eq!(total.load(Ordering::Relaxed), 132);
+    }
+
+    /// 进度 = 已落盘 + **当前待写段**的在飞字节；其它在飞段一律不算。
+    ///
+    /// 这条口径是三个现场问题的共同解：① 单连接被限速的站点上一个分片要
+    /// 几十秒，只按"分片落盘"跳会让界面几十秒不动；② 只算落盘字节时数字
+    /// 会落后于网络实际进展；③ 把**所有**在飞字节算进去又是虚报（暂停即丢）。
+    #[test]
+    fn progress_counts_only_the_pending_segment() {
+        let stats = PlaylistStats::new(1000);
+        // cursor 处（第 0 段）收了 512，其它段收得再多也不算
+        stats.slot(0).store(512, Ordering::Relaxed);
+        stats.slot(1).store(4096, Ordering::Relaxed);
+        stats.slot(2).store(4096, Ordering::Relaxed);
+        assert_eq!(stats.progress(), 1512, "只该算 `completed` + 光标那一段");
+        assert_eq!(
+            stats.received.load(Ordering::Relaxed),
+            1000,
+            "received 不受槽位影响"
+        );
+
+        // 写完第 0 段：completed 前移 + 光标前移（槽位清零），进度只前进
+        stats.set_cursor(1, true);
+        stats.slot(0).store(0, Ordering::Relaxed);
+        stats.completed.store(1000 + 8192, Ordering::Relaxed);
+        assert_eq!(stats.progress(), 1000 + 8192 + 4096);
+
+        // 加密段（不做段内续传）：光标处的字节不算，退化成"按分片跳"
+        stats.set_cursor(2, false);
+        assert_eq!(
+            stats.progress(),
+            1000 + 8192,
+            "加密分片取消时会整段丢弃，不能算进进度"
+        );
     }
 
     /// 队头慢分片：**后续分片必须继续下载**（连接不得空转），
@@ -2491,5 +2616,77 @@ mod tests {
             srv.ranges("/m/s2.ts").len() >= 2,
             "续传仍应发出带 Range 的请求（被服务器无视）"
         );
+    }
+    /// **下载一开始就有总长**：主清单的 `BANDWIDTH × 总时长`。
+    ///
+    /// 大清单不做分片预探测，实测外推又要等第一个分片落盘 —— 单连接被限速的
+    /// 站点上一个 1.5MB 的分片要几十秒，那段时间里界面连「总大小」都显示不
+    /// 出来（用户现场：已经在下、左下角却既没有大小也没有百分比）。这条用例
+    /// 钉住：`estimated_total` 在**第一个分片落盘之前**就已经是像样的值。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn master_bandwidth_yields_total_before_first_segment() {
+        let dir = tmpdir("hls-bitrate");
+        // 40 > SIZE_PROBE_SAMPLE(32) → 不预探测，总长只能靠估算
+        let count = 40usize;
+        let seg_size = 16 * 1024usize;
+        let names: Vec<String> = (1..=count).map(|i| format!("s{i}.ts")).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let mut files = HashMap::new();
+        files.insert(
+            "/m/master.m3u8".to_string(),
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=1280x720\nv1.m3u8\n"
+                .as_bytes()
+                .to_vec(),
+        );
+        files.insert("/m/v1.m3u8".to_string(), media_playlist(&refs).into_bytes());
+        for (i, n) in names.iter().enumerate() {
+            files.insert(format!("/m/{n}"), sample(i as u8 + 1, seg_size));
+        }
+        // 首片慢发，保证观察时它还没落盘
+        let mut sopts = ServerOpts::default();
+        sopts.trickle.insert("/m/s1.ts".to_string(), (4 * 1024, 150));
+        let srv = start_server_opts(files, sopts).await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        let po = PlaylistOptions {
+            concurrency: 2,
+            ..Default::default()
+        };
+        let plan = fetch_plan(&client, &srv.url("/m/master.m3u8"), &cancel, &[], &po)
+            .await
+            .expect("取清单");
+        assert_eq!(plan.bitrate, Some(800_000), "应记下选中变体的码率");
+        let expect_est = 800_000u64 / 8 * (count as u64) * 4; // 每段 4 秒
+
+        let path = dir.join("out.ts");
+        let stats = PlaylistStats::new(0);
+        let dl = tokio::spawn({
+            let client = client.clone();
+            let path = path.clone();
+            let plan = plan.clone();
+            let po = po.clone();
+            let cancel = cancel.clone();
+            let stats = stats.clone();
+            async move { download_playlist(&client, &path, &plan, &po, &cancel, stats).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            stats.completed.load(Ordering::Relaxed),
+            0,
+            "此刻首片应还没落盘（否则这条用例没测到「一开始就有总长」）"
+        );
+        let est = stats.estimated_total.load(Ordering::Relaxed);
+        assert!(
+            est > 0,
+            "下载刚开始就该有个总长给界面（BANDWIDTH × 时长），实际 {est}"
+        );
+        let diff = (est as i64 - expect_est as i64).abs();
+        assert!(
+            diff * 100 <= expect_est as i64 * 20,
+            "码率估算 {est} 偏离 {expect_est} 超过 20%"
+        );
+        cancel.cancel();
+        let _ = dl.await;
     }
 }

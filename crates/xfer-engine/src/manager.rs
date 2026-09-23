@@ -49,12 +49,18 @@ const MAX_BT_MAX_PEERS: usize = 200;
 
 /// HLS 分片并发上限。
 ///
-/// 分片下载的并发单位是"整个分片"（通常 1~6MiB），不像 HTTP 分片
-/// 那样可以细到几十 KB 一段；16 路已足以跑满常见带宽，再高只会给
-/// CDN 制造 429 与连接中断——而一个分片失败就要整段重下。
-/// 用户显式调高连接数时才放宽到 32（同时在飞的分片各自占着整段内存，
-/// 上限也是内存闸门）。
-const MAX_HLS_CONNECTIONS: usize = 32;
+/// 分片下载的并发单位是"整个分片"（通常 1~6MiB），不像 HTTP 分片那样可以
+/// 细到几十 KB 一段，所以默认只开 16 路。用户显式调高（"每服务器最大连接
+/// 数" / `split` / `hls-concurrency`）时就照着来，而不是被内部默认值吃掉 ——
+/// 之前一律取 `min(split, max-connection-per-server)`，两个键都没设置时各取
+/// 默认 16，于是把它调到 128 实际仍只跑 16 路。
+///
+/// 但**不跟着无上限**：实测国内视频站（单连接被限速到几十 KB/s）上，32 / 64 /
+/// 128 路的总吞吐基本相当（2~3MB/s，瓶颈在站点或代理的总带宽），而路数越高
+/// 每个分片分到的带宽越少 —— 顺序拼接意味着"第一个分片落盘"要等更久，内存
+/// 占用也线性上涨（每路都在攒整个分片）。64 是这两者之间的平衡点：显式调高
+/// 有实质效果，又不会出现"128 路把首段拖到半分钟、吃掉几百 MB 内存"。
+const MAX_HLS_CONNECTIONS: usize = 64;
 
 /// HLS 分片并发的默认值（用户没有显式设置任何连接数选项时）。
 const DEFAULT_HLS_CONNECTIONS: usize = 16;
@@ -5163,6 +5169,10 @@ mod tests {
         mgr.change_global_option(&serde_json::json!({"max-connection-per-server": "128"}))
             .unwrap();
         assert_eq!(conn(), MAX_HLS_CONNECTIONS);
+        assert_eq!(
+            MAX_HLS_CONNECTIONS, 64,
+            "上限口径：显式调高要有实质效果，但不能无上限（路数越高单段越慢、内存越吃）"
+        );
 
         // 显式把 split 调小（"别太猛"）→ 以小的为准
         mgr.change_global_option(&serde_json::json!({"split": "4"}))
