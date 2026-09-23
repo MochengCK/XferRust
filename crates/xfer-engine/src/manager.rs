@@ -1967,10 +1967,19 @@ impl TaskManager {
         if let Some(p) = task.shared.lock().unwrap().path.clone() {
             return p;
         }
-        let base_name = task
-            .out
-            .clone()
-            .unwrap_or_else(|| xfer_http::playlist_default_filename(uri, plan.fmp4));
+        let base_name = match task.out.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(out) => {
+                let normalized = normalize_playlist_out(out, plan.fmp4);
+                if normalized != out {
+                    tracing::info!(
+                        gid = %task.gid, from = out, to = %normalized,
+                        "HLS 任务产物名按实际容器纠正扩展名"
+                    );
+                }
+                normalized
+            }
+            None => xfer_http::playlist_default_filename(uri, plan.fmp4),
+        };
         let continue_enabled = self.continue_enabled();
         self.claim_path(task, base_name, |existing, candidate| {
             continue_enabled
@@ -4755,6 +4764,47 @@ fn delete_task_ctrl(task: &Task) {
     }
 }
 
+/// 播放列表（HLS）任务产物名的扩展名归一。
+///
+/// `.m3u8` / `.m3u` 是**清单文本**，不是媒体文件：调用方（浏览器扩展、
+/// 安卓端、命令行）很容易把"建议文件名"直接塞进 `out`，带着清单扩展名
+/// 落盘就会得到一个内容与名字不符的产物。引擎比调用方更清楚实际容器
+/// （`#EXT-X-MAP` 决定 fMP4 `.mp4` 还是 MPEG-TS `.ts`），因此在这里纠正：
+///
+/// - `.m3u8` / `.m3u` → 换成实际容器扩展名；
+/// - `.ts` 但清单是 fMP4 → 换成 `.mp4`（fMP4 分片拼出来的不是 TS 流）；
+/// - 无扩展名 → 追加容器扩展名（`out=我的影片` → `我的影片.ts`）；
+/// - 其它扩展名（用户点名要 `.mp4` / `.mkv` 之类）→ 原样保留，不越权改。
+///
+/// 只作用于播放列表任务；普通 HTTP 任务的 `out` 语义不受影响。
+fn normalize_playlist_out(out: &str, fmp4: bool) -> String {
+    let container = if fmp4 { "mp4" } else { "ts" };
+    let lower = out.to_ascii_lowercase();
+    for manifest_ext in [".m3u8", ".m3u"] {
+        if lower.ends_with(manifest_ext) {
+            let stem = out[..out.len() - manifest_ext.len()].trim_end();
+            if !stem.is_empty() {
+                return format!("{stem}.{container}");
+            }
+        }
+    }
+    if fmp4 && lower.ends_with(".ts") {
+        let stem = out[..out.len() - 3].trim_end();
+        if !stem.is_empty() {
+            return format!("{stem}.mp4");
+        }
+    }
+    // 无扩展名判定只看文件名部分（`out` 允许带目录，如 `videos/我的影片`）
+    let file = out.rsplit(['/', '\\']).next().unwrap_or(out);
+    if !file.contains('.') || file.ends_with('.') {
+        let trimmed = out.trim_end_matches('.').trim_end();
+        if !trimmed.is_empty() {
+            return format!("{trimmed}.{container}");
+        }
+    }
+    out.to_string()
+}
+
 fn rename_with_counter(name: &str, n: usize) -> String {
     match name.rsplit_once('.') {
         Some((stem, ext)) if !stem.is_empty() => format!("{stem}.{n}.{ext}"),
@@ -4792,6 +4842,46 @@ mod tests {
     fn normalize_dir_resolves_relative_to_cwd() {
         let expected = std::env::current_dir().unwrap().join("rel/dir");
         assert_eq!(normalize_dir("rel/dir"), expected);
+    }
+
+    /// HLS 产物名归一：清单扩展名绝不留在产物名上。
+    #[test]
+    fn playlist_out_drops_manifest_extension() {
+        // .m3u8 / .m3u 是清单文本 → 换成实际容器
+        assert_eq!(normalize_playlist_out("我的影片.m3u8", false), "我的影片.ts");
+        assert_eq!(normalize_playlist_out("我的影片.M3U8", false), "我的影片.ts");
+        assert_eq!(normalize_playlist_out("playlist.m3u", false), "playlist.ts");
+        // fMP4 清单 → .mp4（分片拼出来的是 fMP4，不是 TS 流）
+        assert_eq!(normalize_playlist_out("我的影片.m3u8", true), "我的影片.mp4");
+        assert_eq!(normalize_playlist_out("我的影片.m3u", true), "我的影片.mp4");
+        // 带目录的 out（aria2 允许）只动文件名部分
+        assert_eq!(
+            normalize_playlist_out("videos/2024/我的影片.m3u8", false),
+            "videos/2024/我的影片.ts"
+        );
+    }
+
+    #[test]
+    fn playlist_out_fixes_container_and_extensionless() {
+        // .ts 但清单是 fMP4 → 纠正为 .mp4；TS 清单则保持 .ts 原样
+        assert_eq!(normalize_playlist_out("影片.ts", true), "影片.mp4");
+        assert_eq!(normalize_playlist_out("影片.ts", false), "影片.ts");
+        // 无扩展名 → 追加容器扩展名
+        assert_eq!(normalize_playlist_out("我的影片", false), "我的影片.ts");
+        assert_eq!(normalize_playlist_out("我的影片", true), "我的影片.mp4");
+        assert_eq!(normalize_playlist_out("videos/我的影片", false), "videos/我的影片.ts");
+        assert_eq!(normalize_playlist_out("我的影片.", true), "我的影片.mp4");
+        // 点开头的隐藏名不算"无扩展名"，保持原样
+        assert_eq!(normalize_playlist_out(".hidden", false), ".hidden");
+    }
+
+    #[test]
+    fn playlist_out_respects_explicit_container() {
+        // 用户点名要的容器不越权改（只纠正"清单扩展名"与"无扩展名"）
+        for out in ["影片.mp4", "影片.mkv", "影片.webm", "影片.aac"] {
+            assert_eq!(normalize_playlist_out(out, true), out);
+            assert_eq!(normalize_playlist_out(out, false), out);
+        }
     }
 
     #[tokio::test]
