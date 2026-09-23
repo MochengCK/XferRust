@@ -1988,10 +1988,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         // 控制文件目录隔离：同进程所有测试共用一个（路径哈希互不冲突），
-        // 且不污染真实 ~/.xfer/ctrl。
-        let ctrl = std::env::temp_dir().join(format!("xfer-split-ctrl-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&ctrl);
-        std::env::set_var("XFER_CTRL_DIR", &ctrl);
+        // 且不污染真实 ~/.xfer/ctrl。**必须走全进程一次的初始化**——
+        // 每个用例各自 set_var 成不同目录时，并行执行的用例会互相改写，
+        // 详见 `crate::testutil`。
+        crate::testutil::init_ctrl_dir();
         d
     }
 
@@ -2229,11 +2229,24 @@ mod tests {
         let data = Arc::new(sample(len));
         let expect = data.clone();
         let stall_flag = Arc::new(AtomicBool::new(false));
+        // 服务端观测点：僵死开始时刻、以及**僵死 1s 之后**到达的首个请求
+        // （= 客户端读空闲超时后从水位重连的那一次）。
+        //
+        // 断言这两个时刻的间隔，而不是整个下载的耗时：总耗时里还叠着
+        // 同进程并行用例争抢 CPU 的时间（本机串行 7.4s、并行跑满时
+        // 8.9s+），与"尾声该用 3s 还是 10s 读空闲"无关，却是把原断言
+        // 顶破的元凶。间隔只含"客户端发现连接静默所花的时间"。
+        let stall_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let reconnect_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let stall_at_h = stall_at.clone();
+        let reconnect_at_h = reconnect_at.clone();
         let app = axum::Router::new().route(
             "/file.bin",
             axum::routing::get(move |headers: axum::http::HeaderMap| {
                 let data = data.clone();
                 let stall_flag = stall_flag.clone();
+                let stall_at = stall_at_h.clone();
+                let reconnect_at = reconnect_at_h.clone();
                 async move {
                     let range = headers
                         .get(header::RANGE)
@@ -2253,6 +2266,22 @@ mod tests {
                     let to = (to + 1).min(total).max(from);
                     // 仅首个请求注入 12s 静默停摆（远大于尾声的 3s 读空闲）
                     let stall = !stall_flag.swap(true, Ordering::SeqCst);
+                    let arrived = Instant::now();
+                    if stall {
+                        *stall_at.lock().unwrap() = Some(arrived);
+                    } else {
+                        // 起始那一批并发请求几乎同时到达，只有 1s 之后才来的
+                        // 才可能是重连（读空闲 3s + 重连开销）
+                        let stalled = *stall_at.lock().unwrap();
+                        if let Some(t) = stalled {
+                            if arrived.duration_since(t) > Duration::from_secs(1) {
+                                let mut r = reconnect_at.lock().unwrap();
+                                if r.is_none() {
+                                    *r = Some(arrived);
+                                }
+                            }
+                        }
+                    }
                     let mut head: Vec<Result<Bytes, std::io::Error>> = Vec::new();
                     let mut rest: Vec<Result<Bytes, std::io::Error>> = Vec::new();
                     let mut off = from;
@@ -2315,14 +2344,21 @@ mod tests {
         .expect("分片下载失败");
         let elapsed = t0.elapsed();
         assert_file(&path, &expect);
+        let stalled = stall_at.lock().unwrap().expect("未观测到注入的僵死请求");
+        let reconnected = reconnect_at.lock().unwrap().expect("未观测到读空闲后的重连请求");
+        let gap = reconnected.duration_since(stalled);
         // 4MiB 总量全程落在尾声门槛（8MiB）内，应走 3s 读空闲。
-        // 上限取 9.5s：既证明没等满常规 10s（常规路径还要叠加重连与
-        // 从水位续传的开销，实测 ≥11s），又给 CI 抖动留足余量——
-        // 原先的 8s 在并发跑测试的机器上会被连接/退避开销顶破（实测
-        // 8.5~8.9s 反复闪断），而它并没有证明任何额外的行为差异。
+        // 上限取 6s：既证明没等满常规 10s，又给 CI 抖动留足余量；
+        // 而"僵死 → 重连"的间隔不含并行用例的 CPU 争抢，不会像
+        // 总耗时那样在机器繁忙时被顶破。
         assert!(
-            elapsed < Duration::from_millis(9500),
-            "尾声读空闲恢复耗时 {elapsed:?}，疑似仍按常规 10s 超时等待"
+            gap < Duration::from_secs(6),
+            "僵死到重连间隔 {gap:?}，疑似仍按常规 10s 读空闲等待"
+        );
+        // 总耗时只作粗粒度兜底（防"整条任务挂死"），阈值给得足够松
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "下载总耗时 {elapsed:?}，疑似卡在 30s read_timeout"
         );
     }
 
@@ -2609,13 +2645,7 @@ mod tests {
     #[test]
     fn ctrl_path_is_hashed_in_ctrl_dir() {
         // 控制文件不再与下载文件同目录：位于隔离目录内，以路径哈希命名
-        std::env::set_var(
-            "XFER_CTRL_DIR",
-            std::env::temp_dir()
-                .join(format!("xfer-split-ctrl-unit-{}", std::process::id()))
-                .to_string_lossy()
-                .to_string(),
-        );
+        crate::testutil::init_ctrl_dir();
         let p = ctrl_path(Path::new("/tmp/a/b.zip"));
         let dir = xfer_storage::ctrl_dir();
         assert!(p.starts_with(&dir), "控制文件应位于数据目录: {p:?}");

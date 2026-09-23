@@ -1260,10 +1260,9 @@ mod tests {
         let d = std::env::temp_dir().join(format!("xfer-hls-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        // 控制文件目录隔离，避免污染真实 ~/.xfer/ctrl
-        let ctrl = std::env::temp_dir().join(format!("xfer-hls-ctrl-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&ctrl);
-        std::env::set_var("XFER_CTRL_DIR", &ctrl);
+        // 控制文件目录隔离：走全进程一次的初始化，避免与并行执行的
+        // 其它用例（分片下载）互相改写环境变量，详见 `crate::testutil`
+        crate::testutil::init_ctrl_dir();
         d
     }
 

@@ -6,6 +6,8 @@ mod adaptive;
 mod playlist;
 mod rate;
 mod split;
+#[cfg(test)]
+mod testutil;
 
 pub use adaptive::{AdaptiveConfig, AdaptiveScheduler, ConnPerf, ScheduleAction};
 pub use playlist::{
