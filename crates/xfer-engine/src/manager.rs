@@ -1794,7 +1794,7 @@ impl TaskManager {
         task.connections_atomic.store(0, Ordering::Relaxed);
 
         let stats = xfer_http::PlaylistStats::new(resume_bytes);
-        let sampler = spawn_playlist_sampler(task, &stats);
+        let sampler = spawn_playlist_sampler(task, &stats, plan.total.is_none());
         let r = xfer_http::download_playlist(client, &path, &plan, &opts, cancel, stats.clone()).await;
         sampler.abort();
         match r {
@@ -4669,9 +4669,15 @@ fn spawn_split_sampler(
 }
 
 /// HLS 播放列表进度采样：与 [`spawn_split_sampler`] 同构（无锁原子）。
+///
+/// `allow_estimate`：清单总长未知（大清单不预探测）时，用
+/// [`xfer_http::PlaylistStats::estimated_total`]（已下字节 ÷ 已覆盖时长外推）
+/// 驱动进度条与剩余时间。**只增不减**且不低于已下字节 —— 估算值抖动会让
+/// 进度条往回跳，比偏保守更难看；精确值（`plan.total` 已知）永远优先。
 fn spawn_playlist_sampler(
     task: &Arc<Task>,
     stats: &Arc<xfer_http::PlaylistStats>,
+    allow_estimate: bool,
 ) -> tokio::task::JoinHandle<()> {
     let task = task.clone();
     let stats = stats.clone();
@@ -4680,12 +4686,27 @@ fn spawn_playlist_sampler(
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             iv.tick().await;
-            task.completed_atomic
-                .store(stats.completed.load(Ordering::Relaxed), Ordering::Relaxed);
+            let completed = stats.completed.load(Ordering::Relaxed);
+            // 进度按**已接收**上报：分片整段写盘，只报落盘字节会让界面在
+            // 两条分片之间长时间不动（用户看到的就是"下一会停一会"）。
+            let received = stats.received.load(Ordering::Relaxed);
+            let progress = received.max(completed);
+            task.completed_atomic.store(progress, Ordering::Relaxed);
             task.connections_atomic.store(
                 stats.connections.load(Ordering::Relaxed) as u64,
                 Ordering::Relaxed,
             );
+            if allow_estimate {
+                let est = stats.estimated_total.load(Ordering::Relaxed);
+                if est > 0 {
+                    let mut sh = task.shared.lock().unwrap();
+                    let next = est.max(progress).max(sh.total_len.unwrap_or(0));
+                    if sh.total_len != Some(next) {
+                        sh.total_len = Some(next);
+                        sh.file_len = next;
+                    }
+                }
+            }
         }
     })
 }

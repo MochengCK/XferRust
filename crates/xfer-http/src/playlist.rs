@@ -40,13 +40,26 @@ const MANIFEST_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// 主清单 → 变体清单的最大跳转层数。
 const MAX_VARIANT_HOPS: usize = 3;
 /// 分片大小预探测的分片数上限：超过则跳过（观测单条清单没这么多分片）。
-const SIZE_PROBE_MAX_SEGMENTS: usize = 5000;
+/// 预探测的**唯一**用途是给小清单一个精确总长：分片数不超过它才逐个探测。
+/// 超过就完全不探测（756 个分片 = 756 个额外请求 + 几十秒到几分钟的"没反应"），
+/// 改由 [`PlaylistStats::estimated_total`] 按已下字节实时外推。
+const SIZE_PROBE_SAMPLE: usize = 32;
 /// 预探测并发上限：探测是轻量请求，不需要跟着下载并发走。
 const SIZE_PROBE_CONCURRENCY: usize = 8;
 /// 控制文件落盘节流（与分片下载一致：1s 一次 fsync + 原子写）。
 const CTRL_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 /// 单个分片的瞬时失败重试默认次数。
 pub const DEFAULT_SEGMENT_RETRIES: u32 = 3;
+
+/// 分片读空闲超时：**连续这么久没读到任何数据**就断开重连（重试）。
+///
+/// 与 `split.rs` 的读空闲同级（那套是 10s / 尾声 3s），比客户端全局
+/// `read_timeout`（30s）灵敏得多 —— 分片是有序落盘的，一条僵死连接会顶住
+/// 后面所有已下好的分片，30s × 重试足够把"走走停停"拉成"停几分钟"。
+const SEGMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 分片等响应头的上限（连上但不给响应，同样是假死）。
+const SEGMENT_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// `#EXT-X-KEY` 描述的分片密钥（AES-128 整段加密）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +81,12 @@ pub struct Segment {
     pub key: Option<SegmentKey>,
     /// 已知字节数（BYTERANGE 直接给出，其余由预探测补齐）。
     pub size: Option<u64>,
+    /// `#EXTINF` 声明的时长（秒）。初始化段为 0。
+    ///
+    /// **用途是把"已下多少字节"换算成"大概下了多少比例"**：大清单绝不
+    /// 为了精确总长去逐个探测（756 个分片要打 756 个请求，用户看到的就是
+    /// "半天没反应"），改成用「已下字节 ÷ 已覆盖时长」实时外推总长。
+    pub duration: f64,
 }
 
 /// 已解析的下载计划（引擎据此决定文件名、总长与分片位图粒度）。
@@ -85,8 +104,11 @@ pub struct PlaylistPlan {
     pub live: bool,
     /// 是否为 fMP4（决定默认扩展名 `.mp4` / `.ts`）。
     pub fmp4: bool,
-    /// 全部分片大小已知时的总字节数。
+    /// 全部分片大小已知时的总字节数（精确）。大清单通常为 `None`，
+    /// 由 [`PlaylistStats::estimated_total`] 提供实时估算。
     pub total: Option<u64>,
+    /// 媒体时长合计（`#EXTINF` 之和，秒）。总长估算的分母。
+    pub duration_secs: f64,
 }
 
 impl PlaylistPlan {
@@ -132,15 +154,30 @@ impl Default for PlaylistOptions {
 pub struct PlaylistStats {
     /// 已落盘（fsync）字节数，含续传基线。
     pub completed: AtomicU64,
+    /// 已从网络读到的字节数（含**还没轮到写盘**的在飞分片），含续传基线。
+    ///
+    /// 分片是"整段下完、按序追加"的，只报落盘字节会让界面在两条分片之间
+    /// 长时间停在原地（786 个分片的清单里，进度会一格一格地跳、速度频繁
+    /// 显示 0，看着就是"下一会停一会"）。上报已接收字节则连续走字；
+    /// 丢弃的分片会在重试前从计数里扣掉，不会虚高。
+    pub received: AtomicU64,
     /// 当前在飞分片数。
     pub connections: AtomicUsize,
+    /// 总字节数的**实时估算**（0 = 还没法估）。
+    ///
+    /// 大清单不做预探测，改用「已下字节 ÷ 已覆盖时长 × 总时长」外推：
+    /// 一开始只有粗估值，随着分片落地越来越准；`plan.total` 已知时
+    /// （小清单探测过）这里始终为 0，由调用方优先用精确值。
+    pub estimated_total: AtomicU64,
 }
 
 impl PlaylistStats {
     pub fn new(baseline: u64) -> Arc<Self> {
         Arc::new(Self {
             completed: AtomicU64::new(baseline),
+            received: AtomicU64::new(baseline),
             connections: AtomicUsize::new(0),
+            estimated_total: AtomicU64::new(0),
         })
     }
 }
@@ -350,6 +387,8 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
     let mut key: Option<PendingKey> = None;
     let mut sequence: u64 = 0;
     let mut next_range: Option<(u64, u64)> = None;
+    // 最近一条 `#EXTINF` 的时长，跟随下一个 URI 行（初始化段不吃它）
+    let mut next_duration: f64 = 0.0;
     // BYTERANGE 省略 offset 时接续同地址的上一段末尾
     let mut last_range_end: Option<(String, u64)> = None;
     let mut endlist = false;
@@ -405,7 +444,15 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
                 range,
                 key: None,
                 size: range.map(|(_, len)| len),
+                duration: 0.0,
             });
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#EXTINF:") {
+            // `#EXTINF:<时长>,<标题>` —— 时长取逗号前那段（解析不出就是 0，
+            // 只会让总长估算更保守，不影响下载）
+            let secs = rest.split(',').next().unwrap_or("").trim();
+            next_duration = secs.parse::<f64>().unwrap_or(0.0).max(0.0);
             continue;
         }
         if let Some(rest) = line.strip_prefix("#EXT-X-BYTERANGE:") {
@@ -425,6 +472,7 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
         let Some(url) = resolve_url(base, line) else {
             return Err(format!("分片地址无法解析: {line}"));
         };
+        let duration = std::mem::take(&mut next_duration);
         let range = next_range.take().map(|(len, off)| {
             let start = if off == u64::MAX {
                 match &last_range_end {
@@ -445,6 +493,7 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
                 iv: k.iv.unwrap_or_else(|| iv_from_sequence(sequence)),
             }),
             size: range.map(|(_, len)| len),
+            duration,
         });
         sequence += 1;
     }
@@ -530,6 +579,7 @@ pub async fn fetch_plan(
         }
 
         let media = parse_media(&text, &base).map_err(HttpError::Protocol)?;
+        let duration_secs: f64 = media.segments.iter().map(|s| s.duration).sum();
         let mut plan = PlaylistPlan {
             source: final_url,
             chain,
@@ -542,6 +592,7 @@ pub async fn fetch_plan(
             segments: media.segments,
             live: media.live,
             total: None,
+            duration_secs,
         };
         if plan.segment_count() == 0 {
             return Err(HttpError::Protocol("播放列表中没有可下载的分片".into()));
@@ -572,7 +623,14 @@ fn sum_sizes(plan: &PlaylistPlan) -> Option<u64> {
     Some(total)
 }
 
-/// 分片大小预探测：全部命中才能给出精确总长。
+/// 分片大小预探测：**只对小清单做**，命中全部才给出精确总长。
+///
+/// 大清单（一部电影动辄 700+ 个分片）**不探测**：每个分片一个
+/// `Range: bytes=0-0` 请求，756 个分片就是 756 个额外请求（实测单次 ~600ms、
+/// 8 并发约 10 次/秒 → 75 秒起步，服务器一被压就变成几分钟），而这期间
+/// 一个字节都还没下、进度条纹丝不动 —— 用户看到的就是"卡住了"，紧接着
+/// 下载因为刚被打过一轮而变慢、走走停停。大清单改用
+/// [`PlaylistStats::estimated_total`]（已下字节 ÷ 已覆盖时长外推），零额外请求。
 ///
 /// 服务器对 `Range` 不配合（返回 200）时立即停止探测——继续探测等于
 /// 把每个分片整段多下一次，代价远大于"总长未知"。
@@ -583,6 +641,18 @@ async fn probe_segment_sizes(
     headers: &[(String, String)],
     concurrency: usize,
 ) {
+    // 初始化段通常很小，单独探测一次就够（它必须进产物，值得确知大小）
+    if plan.init.as_ref().map(|i| i.size.is_none()).unwrap_or(false) {
+        if let Some(i) = plan.init.as_mut() {
+            if let Ok(p) = crate::probe_with(client, &i.url, cancel, headers).await {
+                if !p.accepts_ranges {
+                    plan.total = sum_sizes(plan);
+                    return;
+                }
+                i.size = p.total_len;
+            }
+        }
+    }
     let unknown: Vec<usize> = plan
         .segments
         .iter()
@@ -590,40 +660,41 @@ async fn probe_segment_sizes(
         .filter(|(_, s)| s.size.is_none())
         .map(|(i, _)| i)
         .collect();
-    let init_unknown = plan.init.as_ref().map(|i| i.size.is_none()).unwrap_or(false);
-    if plan.init.is_some() && init_unknown {
-        // 初始化段通常很小，单独探测保证它一定进产物
-        if let Some(i) = plan.init.as_mut() {
-            if let Ok(p) = crate::probe_with(client, &i.url, cancel, headers).await {
-                if !p.accepts_ranges {
-                    return; // 服务器不支持 Range，放弃全部探测
-                }
-                i.size = p.total_len;
-            }
-        }
-    }
-    if unknown.is_empty() || unknown.len() > SIZE_PROBE_MAX_SEGMENTS {
+    if unknown.is_empty() || unknown.len() > SIZE_PROBE_SAMPLE {
         plan.total = sum_sizes(plan);
         return;
     }
     let conn = concurrency.clamp(1, SIZE_PROBE_CONCURRENCY);
     let urls: Vec<String> = unknown.iter().map(|i| plan.segments[*i].url.clone()).collect();
     let mut results: Vec<Option<u64>> = Vec::with_capacity(urls.len());
+    let mut range_unsupported = false;
     {
         let mut stream = futures_util::stream::iter(urls.into_iter())
             .map(|url| {
                 let url = url.clone();
                 async move {
                     match crate::probe_with(client, &url, cancel, headers).await {
-                        Ok(p) => p.total_len.filter(|n| *n > 0),
-                        Err(_) => None,
+                        Ok(p) if !p.accepts_ranges => {
+                            // 整段回 200：后续探测都会变成"多下一次整片"
+                            (None, true)
+                        }
+                        Ok(p) => (p.total_len.filter(|n| *n > 0), false),
+                        Err(_) => (None, false),
                     }
                 }
             })
             .buffered(conn);
-        while let Some(size) = stream.next().await {
+        while let Some((size, bad)) = stream.next().await {
+            if bad {
+                range_unsupported = true;
+                break;
+            }
             results.push(size);
         }
+    }
+    if range_unsupported {
+        plan.total = sum_sizes(plan);
+        return;
     }
     for (slot, size) in unknown.iter().zip(results.iter()) {
         plan.segments[*slot].size = *size;
@@ -850,7 +921,28 @@ async fn fetch_segment(ctx: &Ctx<'_>, seg: &Segment) -> Result<Vec<u8>, HttpErro
 }
 
 /// 单次分片请求（区间请求 + 流式读取 + 限速 + 长度校验）。
+///
+/// 两个**空闲**超时（不是总时长超时，大分片正常下多久都行）：等响应头
+/// [`SEGMENT_HEADER_TIMEOUT`]、读到两段数据之间 [`SEGMENT_IDLE_TIMEOUT`]。
+/// 服务器"接受连接后不吭声"是线上最常见的假死形态，靠客户端全局的
+/// read_timeout（30s）兜底太钝：一条僵死连接会顶住整条按序写盘的水位，
+/// 表现为"下一会儿停几分钟"；这里超时即断开重连（错误可重试），恢复快得多。
 async fn fetch_body(ctx: &Ctx<'_>, seg: &Segment) -> Result<Vec<u8>, HttpError> {
+    let mut counted: u64 = 0;
+    let r = fetch_body_inner(ctx, seg, &mut counted).await;
+    if r.is_err() {
+        // 失败的分片会被重试、字节重新拉一遍：把这一趟的数从"已接收"里扣掉，
+        // 否则进度会随着每次重试虚高（并让进度条冲到 100% 之后还在下）。
+        ctx.stats.received.fetch_sub(counted, Ordering::Relaxed);
+    }
+    r
+}
+
+async fn fetch_body_inner(
+    ctx: &Ctx<'_>,
+    seg: &Segment,
+    counted: &mut u64,
+) -> Result<Vec<u8>, HttpError> {
     let mut req = apply_headers(ctx.client.get(&seg.url), ctx.headers);
     if let Some((off, len)) = seg.range {
         req = req.header("Range", format!("bytes={}-{}", off, off + len.saturating_sub(1)));
@@ -858,7 +950,11 @@ async fn fetch_body(ctx: &Ctx<'_>, seg: &Segment) -> Result<Vec<u8>, HttpError> 
     let resp = tokio::select! {
         biased;
         _ = ctx.cancel.cancelled() => return Err(HttpError::Cancelled),
-        r = req.send() => r.map_err(|e| HttpError::from_reqwest(&e))?,
+        r = tokio::time::timeout(SEGMENT_HEADER_TIMEOUT, req.send()) => match r {
+            Ok(sent) => sent.map_err(|e| HttpError::from_reqwest(&e))?,
+            // 连上了但迟迟不给响应头：当作瞬时故障重试
+            Err(_) => return Err(HttpError::Timeout),
+        },
     };
     let status = resp.status();
     if !status.is_success() {
@@ -870,10 +966,14 @@ async fn fetch_body(ctx: &Ctx<'_>, seg: &Segment) -> Result<Vec<u8>, HttpError> 
         let chunk = tokio::select! {
             biased;
             _ = ctx.cancel.cancelled() => return Err(HttpError::Cancelled),
-            c = stream.next() => match c {
-                Some(Ok(c)) => c,
-                Some(Err(e)) => return Err(HttpError::from_reqwest(&e)),
-                None => break,
+            c = tokio::time::timeout(SEGMENT_IDLE_TIMEOUT, stream.next()) => match c {
+                Ok(next) => match next {
+                    Some(Ok(c)) => c,
+                    Some(Err(e)) => return Err(HttpError::from_reqwest(&e)),
+                    None => break,
+                },
+                // 期间一个字节都没到：断开重连（重试从本分片开头重新下）
+                Err(_) => return Err(HttpError::Timeout),
             },
         };
         if chunk.is_empty() {
@@ -882,6 +982,9 @@ async fn fetch_body(ctx: &Ctx<'_>, seg: &Segment) -> Result<Vec<u8>, HttpError> 
         if let Some(l) = ctx.limiter {
             l.acquire(chunk.len()).await;
         }
+        // 读到就报，不等写盘（进度/速度才会连续走字）
+        *counted += chunk.len() as u64;
+        ctx.stats.received.fetch_add(chunk.len() as u64, Ordering::Relaxed);
         buf.extend_from_slice(&chunk);
     }
     if let Some(expected) = seg.size {
@@ -954,6 +1057,29 @@ pub async fn download_playlist(
     let pending: Vec<Segment> = all[prefix..].to_vec();
     let conn = opts.concurrency.clamp(1, 64);
     let mut written = prefix;
+
+    // 总长实时估算的记账（估算只在 plan.total 未知时需要）：
+    //   done_bytes/done_dur/done_segs 都从续传基线起步，
+    //   估算 = max(按字节密度外推, 已下字节 + 平均分片大小 × 剩余分片数)
+    let need_estimate = plan.total.is_none();
+    let mut est_done_bytes: u64 = bytes;
+    let mut est_done_dur: f64 = all[..prefix].iter().map(|s| s.duration).sum();
+    let publish_estimate = |stats: &PlaylistStats,
+                            est_done_bytes: u64,
+                            est_done_dur: f64,
+                            done_segs: usize| {
+        if !need_estimate || done_segs == 0 || est_done_dur <= 0.0 || plan.duration_secs <= 0.0 {
+            return;
+        }
+        let avg = est_done_bytes as f64 / done_segs as f64;
+        let rest = all.len().saturating_sub(done_segs) as f64;
+        let density = est_done_bytes as f64 / est_done_dur * plan.duration_secs;
+        let est = density.max(est_done_bytes as f64 + avg * rest);
+        if est.is_finite() && est > 0.0 {
+            stats.estimated_total.store(est as u64, Ordering::Relaxed);
+        }
+    };
+    publish_estimate(&stats, est_done_bytes, est_done_dur, prefix);
     let mut last_save = std::time::Instant::now() - CTRL_SAVE_INTERVAL;
     let ctrl_of = |prefix: usize, bytes: u64| PlaylistCtrl {
         kind: CTRL_KIND.to_string(),
@@ -981,14 +1107,19 @@ pub async fn download_playlist(
                 break;
             }
         };
+        // 写盘严格按序，所以这一条就是计划里的第 `written` 条
+        let seg_dur = all.get(written).map(|s| s.duration).unwrap_or(0.0);
         if let Err(e) = sink.write(&data) {
             failure = Some(HttpError::Io(e.to_string()));
             break;
         }
         written += 1;
+        est_done_bytes = sink.position();
+        est_done_dur += seg_dur;
         stats
             .completed
-            .store(sink.position(), Ordering::Relaxed);
+            .store(est_done_bytes, Ordering::Relaxed);
+        publish_estimate(&stats, est_done_bytes, est_done_dur, written);
         if last_save.elapsed() >= CTRL_SAVE_INTERVAL {
             // 先 fsync 再记水位：控制文件绝不领先磁盘（同上层的续传不变式）
             if let Err(e) = sink.flush() {
@@ -1196,10 +1327,12 @@ mod tests {
                 range: None,
                 key: None,
                 size: None,
+                duration: 4.0,
             }],
             live: true,
             fmp4: false,
             total: None,
+            duration_secs: 4.0,
         };
         assert_eq!(fingerprint(&mk("a.ts")), fingerprint(&mk("a.ts")));
         assert_ne!(fingerprint(&mk("a.ts")), fingerprint(&mk("b.ts")));
@@ -1371,6 +1504,73 @@ mod tests {
         s
     }
 
+    /// 大清单**一个探测请求都不许发**，总长改用实时估算。
+    ///
+    /// 这是"下载前卡几分钟 + 走走停停"的根因回归测试：756 个分片的清单要是
+    /// 逐个 `Range: bytes=0-0` 探测，就是 756 个额外请求（实测 75 秒起步），
+    /// 这期间一个字节都没下、界面上什么都不会动。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn large_playlist_skips_probe_and_estimates_total() {
+        let dir = tmpdir("hls-big");
+        // 40 > SIZE_PROBE_SAMPLE(32) → 走"不探测"分支
+        let count = 40usize;
+        let names: Vec<String> = (1..=count).map(|i| format!("s{i}.ts")).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let seg_size = 16 * 1024usize;
+        let mut files = HashMap::new();
+        files.insert("/m/index.m3u8".to_string(), media_playlist(&refs).into_bytes());
+        for (i, n) in names.iter().enumerate() {
+            files.insert(format!("/m/{n}"), sample(i as u8 + 1, seg_size));
+        }
+        let srv = start_server(files, HashMap::new()).await;
+        let expected_bytes = (count * seg_size) as u64;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        let opts = PlaylistOptions {
+            concurrency: 4,
+            ..Default::default()
+        };
+        let plan = fetch_plan(&client, &srv.url("/m/index.m3u8"), &cancel, &[], &opts)
+            .await
+            .expect("取清单");
+
+        // 不探测：总长保持未知，界面由估算值驱动
+        assert_eq!(plan.total, None, "大清单不应为了精确总长去逐个探测");
+        assert_eq!(plan.segment_count(), count);
+        assert!(
+            (plan.duration_secs - (count as f64) * 4.0).abs() < 0.01,
+            "应累计 #EXTINF 时长（估算的分母），实际 {}",
+            plan.duration_secs
+        );
+        // 一个分片请求都不该发生
+        for n in &names {
+            assert_eq!(srv.hits(&format!("/m/{n}")), 0, "探测阶段不得请求分片 {n}");
+        }
+
+        let path = dir.join("out.ts");
+        let stats = PlaylistStats::new(0);
+        let done = download_playlist(&client, &path, &plan, &opts, &cancel, stats.clone())
+            .await
+            .expect("下载");
+        assert_eq!(done.bytes, expected_bytes);
+
+        // 下载完成后估算应收敛到真实总长（相等分片 → 误差极小）
+        let est = stats.estimated_total.load(Ordering::Relaxed);
+        let diff = (est as i64 - expected_bytes as i64).abs();
+        assert!(
+            diff * 100 <= (expected_bytes as i64) * 10,
+            "估算总长 {est} 与真实 {expected_bytes} 相差超过 10%"
+        );
+        // 没有重试时"已接收"必须正好等于产物大小：多一个字节就是把丢弃的
+        // 分片算进了进度（界面会虚高），少一个则是漏记（界面会停住）
+        assert_eq!(
+            stats.received.load(Ordering::Relaxed),
+            expected_bytes,
+            "已接收字节数应与产物大小一致"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn downloads_segments_in_order_with_known_total() {
         let dir = tmpdir("order");
@@ -1488,7 +1688,7 @@ mod tests {
         let plan_b = PlaylistPlan {
             segments: vec![
                 plan_a.segments[0].clone(),
-                Segment { url: srv.url("/m/b.ts"), range: None, key: None, size: None },
+                Segment { url: srv.url("/m/b.ts"), range: None, key: None, size: None, duration: 4.0 },
             ],
             ..plan_a.clone()
         };

@@ -2,7 +2,9 @@
 
 - New HLS (M3U8) support: `.m3u8` URLs are downloaded as playlists, with segments fetched concurrently and concatenated into a **single** file in playlist order — no post-processing merge step
 - Master playlists pick a stream automatically; fMP4 init segments (`#EXT-X-MAP`), byte-range segments (`#EXT-X-BYTERANGE`) and AES-128 segment encryption are all supported
-- Segment sizes are probed up front, so the total length — and therefore progress and ETA — is known
+- Segment-size probing now only runs for small playlists (≤ 32 segments, giving an exact total); a large playlist fires **no probe requests at all** and derives the total live from "bytes downloaded ÷ duration covered" — a 756-segment movie playlist used to fire 756 probe requests and show a frozen progress bar for up to minutes
+- Progress is reported from **bytes received** (including segments still queued for writing), so the speed and byte counters move continuously instead of jumping a segment at a time
+- A segment that stops delivering data for 10s is dropped and reconnected (instead of waiting out the global 30s read timeout), so a silent server no longer stalls the whole in-order write pipeline
 - Resume continues from the last durable contiguous prefix; if the playlist changes, the download restarts from scratch instead of gluing two different playlists together
 - Per-task request headers (`header` / `referer` / `user-agent`) now apply to the playlist, the key and every segment as well
 - `.m3u8` URLs are now downloaded as playlists by default (see Behavior Changes)
@@ -22,7 +24,7 @@
 ### HLS options (`hls-variant` / `hls-probe-size` / `hls-segment-retries`)
 
 - `hls-variant=worst` selects the lowest bitrate variant instead of the highest (the default).
-- `hls-probe-size=false` disables the segment size probe: saves one round of requests, at the cost of an unknown total length and indeterminate progress.
+- `hls-probe-size=false` disables the segment size probe: saves that round of requests, and the total length comes from the live estimate instead. Note that **large playlists are no longer probed anyway** (see above), so this switch only affects playlists with ≤ 32 segments.
 - `hls-segment-retries` sets the transient-failure retry count for a single segment (3 by default).
 - Segment concurrency reuses `split` and `max-connection-per-server` (capped at 32); the per-task `max-download-limit` applies as well.
 - `hls=false` forces plain HTTP downloading for a URL whose extension looks like a playlist.
