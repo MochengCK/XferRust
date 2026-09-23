@@ -1803,12 +1803,26 @@ impl TaskManager {
         // 续传基线：控制文件记录的"已 fsync 连续前缀"
         let (resume_bytes, _) = xfer_http::playlist_resume_point(&path, &plan);
         let min_split = self.split_options(task).min_split_size;
-        if let Some(total) = plan.total.filter(|t| *t > 0) {
-            let pieces = xfer_http::PieceTrack::new(total, min_split);
+        // 分片位图：界面上的"分片格子"。总长取第一个可信来源 ——
+        //   ① `plan.total`（小清单逐个探测过，精确）；
+        //   ② 主清单的 `BANDWIDTH × 总时长`（大清单不预探测，但清单自带码率，
+        //      下载第一秒就能画格子）。
+        // 都没有（单层清单 + 时长未知）时留空，等采样器拿到实测估算再补建
+        // （见 `spawn_playlist_sampler`）—— HLS 任务此前**一律**留空，用户
+        // 看到的就是"M3U8 没有分片显示"。
+        let total_hint = plan.total.filter(|t| *t > 0).or_else(|| {
+            plan.bitrate
+                .filter(|_| plan.duration_secs > 0.0)
+                .map(|bw| ((bw as f64 / 8.0 * plan.duration_secs) as u64).max(1))
+        });
+        let mut pieces: Option<Arc<xfer_http::PieceTrack>> = None;
+        if let Some(total) = total_hint {
+            let p = xfer_http::PieceTrack::new(total.max(resume_bytes), min_split);
             if resume_bytes > 0 {
-                pieces.add_range(0, resume_bytes);
+                p.add_range(0, resume_bytes);
             }
-            *task.http_pieces.write().unwrap() = Some(pieces);
+            *task.http_pieces.write().unwrap() = Some(p.clone());
+            pieces = Some(p);
         } else {
             *task.http_pieces.write().unwrap() = None;
         }
@@ -1821,7 +1835,13 @@ impl TaskManager {
         task.connections_atomic.store(0, Ordering::Relaxed);
 
         let stats = xfer_http::PlaylistStats::new(resume_bytes);
-        let sampler = spawn_playlist_sampler(task, &stats, plan.total.is_none());
+        let sampler = spawn_playlist_sampler(
+            task,
+            &stats,
+            plan.total.is_none(),
+            pieces,
+            min_split,
+        );
         let r = xfer_http::download_playlist(client, &path, &plan, &opts, cancel, stats.clone()).await;
         sampler.abort();
         match r {
@@ -1836,6 +1856,13 @@ impl TaskManager {
                         // 完成后按实际字节数定格，进度不留在不确定态
                         sh.total_len = Some(done.bytes);
                     }
+                }
+                // 位图定格为真实总长：估算/码率推算出来的总长可能偏大，那会
+                // 剩下几个永远点不亮的格子（进度 100%、分片图却不满）
+                if plan.total.is_none() {
+                    let p = xfer_http::PieceTrack::new(done.bytes.max(1), min_split);
+                    p.add_range(0, done.bytes);
+                    *task.http_pieces.write().unwrap() = Some(p);
                 }
                 task.completed_atomic.store(done.bytes, Ordering::Relaxed);
                 task.connections_atomic.store(0, Ordering::Relaxed);
@@ -4705,12 +4732,18 @@ fn spawn_playlist_sampler(
     task: &Arc<Task>,
     stats: &Arc<xfer_http::PlaylistStats>,
     allow_estimate: bool,
+    pieces: Option<Arc<xfer_http::PieceTrack>>,
+    piece_len: u64,
 ) -> tokio::task::JoinHandle<()> {
     let task = task.clone();
     let stats = stats.clone();
     tokio::spawn(async move {
         let mut iv = tokio::time::interval(Duration::from_millis(200));
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // 分片位图：只按**已落盘**字节推进（"在飞字节"还没写进文件，不该点亮
+        // 格子）。`marked` 是已标记到的字节数，保证每次只补新区间。
+        let mut pieces = pieces;
+        let mut marked: u64 = 0;
         loop {
             iv.tick().await;
             // 进度：**只认已经交给文件、取消时不会被丢弃的字节**
@@ -4738,6 +4771,24 @@ fn spawn_playlist_sampler(
                         sh.total_len = Some(next);
                         sh.file_len = next;
                     }
+                }
+            }
+            // 分片位图：① 一开始没有（单层清单 + 时长未知）时，等实测估算一
+            // 出现就补建 —— HLS 的总长是逐步收敛的，分片图不该等到下载结束
+            // 都还是空的；② 已建好的按已落盘字节增量点亮。
+            let done = stats.completed.load(Ordering::Relaxed);
+            if pieces.is_none() {
+                let est = stats.estimated_total.load(Ordering::Relaxed);
+                if est > 0 {
+                    let p = xfer_http::PieceTrack::new(est.max(done).max(1), piece_len);
+                    *task.http_pieces.write().unwrap() = Some(p.clone());
+                    pieces = Some(p);
+                }
+            }
+            if let Some(p) = &pieces {
+                if done > marked {
+                    p.add_range(marked, done - marked);
+                    marked = done;
                 }
             }
         }

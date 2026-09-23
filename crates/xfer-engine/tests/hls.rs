@@ -704,3 +704,81 @@ async fn hls_pause_resume_continues_within_segment() {
         "续传请求必须从段内续传位置接着下"
     );
 }
+
+/// HLS 任务也要有**分片位图**（任务列表里的那排分片格子）。
+///
+/// 大清单不做分片预探测（`plan.total = None`），此前直接把 `http_pieces` 置空，
+/// 用户看到的就是「M3U8 任务没有分片显示」。现在总长先取主清单的
+/// `BANDWIDTH × 时长`（下载第一秒位图就建好），再按**已落盘**字节增量点亮；
+/// 单层清单那种连码率都没有的情况，等实测估算一出现也补建。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hls_exposes_piece_bitfield_for_unknown_total() {
+    let dir = tmpdir("pieces");
+    // 40 段 > SIZE_PROBE_SAMPLE(32) → 不预探测，`plan.total` 为 None
+    let count = 40usize;
+    let seg_bytes = 64 * 1024usize;
+    let names: Vec<String> = (1..=count).map(|i| format!("s{i}.ts")).collect();
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let mut files = HashMap::new();
+    files.insert(
+        "/m/master.m3u8".to_string(),
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nv1.m3u8\n"
+            .as_bytes()
+            .to_vec(),
+    );
+    files.insert("/m/v1.m3u8".to_string(), media_playlist(&refs, true).into_bytes());
+    for (i, n) in names.iter().enumerate() {
+        files.insert(format!("/m/{n}"), sample(i as u8 + 1, seg_bytes));
+    }
+    // 首片慢发：好观察「一个字节都还没落盘时位图就已经在了」
+    let mut trickle = Trickle::new();
+    trickle.insert("/m/s1.ts".to_string(), (8 * 1024usize, 120u64));
+    let srv = start_hls_server_trickle(files, HashMap::new(), 0, HashMap::new(), trickle).await;
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = mgr
+        .add_uri(
+            vec![srv.url("/m/master.m3u8")],
+            // 片长调小（默认 4MB）才看得出「一格一格点亮」
+            &serde_json::json!({"dir": dir, "split": "4", "min-split-size": "65536"}),
+            None,
+        )
+        .expect("addUri 应成功");
+
+    let mut before_progress = false;
+    let mut lit = false;
+    let mut max_pieces = 0usize;
+    let st = loop {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let st = tell(&mgr, &gid).await;
+        let bf = st["bitfield"].as_str().unwrap_or("").to_string();
+        let done = st["completedLength"].as_u64().unwrap_or(0);
+        let n = st["numPieces"].as_u64().unwrap_or(0) as usize;
+        if !bf.is_empty() && n > 0 {
+            max_pieces = max_pieces.max(n);
+            if done == 0 {
+                before_progress = true;
+            }
+            if bf.chars().any(|c| c != '0') {
+                lit = true;
+            }
+        }
+        match st["status"].as_str().unwrap_or_default() {
+            "complete" | "error" => break st,
+            _ => {}
+        }
+    };
+    assert_eq!(st["status"], "complete", "任务应下载完成：{st}");
+    assert!(
+        before_progress,
+        "一个字节都还没落盘时就要有位图（HLS 的总长靠主清单码率推算），\
+         否则界面就是「没有分片显示」"
+    );
+    assert!(lit, "下载过程中位图应随落盘字节一格一格点亮");
+    assert!(max_pieces > 1, "64KB 片长 / 2.5MB 产物应有多个分片格");
+    let bf = st["bitfield"].as_str().unwrap_or("");
+    assert!(
+        bf.starts_with("ff"),
+        "完成后位图应全亮（并定格为真实总长），实际 {bf:?}"
+    );
+}
