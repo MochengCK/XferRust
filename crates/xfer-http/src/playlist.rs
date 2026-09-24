@@ -75,6 +75,17 @@ const SEGMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 分片等响应头的上限（连上但不给响应，同样是假死）。
 const SEGMENT_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// 一次"拼接轮次"搬运的字节上限（乱序落盘的收尾阶段）。
+///
+/// 拼接（读段文件 → 写产物）是同步的，中间没有 `.await`：不分批的话，末段
+/// 常常一次搬走上百 MB，这段时间在飞请求无人推进（分片并发空转），用户看到
+/// 的就是"下载完了但合并很久"。每轮最多搬这么多，然后回到调度循环补派发 /
+/// 收结果，吞吐在收尾阶段也不掉。
+///
+/// 取 32MB 的另一个原因是与产物写缓冲（512KB）配合：一次拼接轮次约刷 64 次
+/// 缓冲，既不让缓冲长到一次刷出几百 MB（写放大），也不至于每写几 KB 就刷。
+const SPLICE_BATCH_BYTES: u64 = 32 * 1024 * 1024;
+
 /// `#EXT-X-KEY` 描述的分片密钥（AES-128 整段加密）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentKey {
@@ -1046,6 +1057,43 @@ fn resume_state(path: &Path, plan: &PlaylistPlan) -> ResumeState {
     ResumeState::NONE
 }
 
+/// 乱序落盘的续传现场：`(产物里已拼好的字节, 已拼段数, 段完成位图)`。
+///
+/// **必须**与 [`download_playlist_unordered`] 的初始化逐字一致：引擎用
+/// [`resume_point`] 的结果做**进度基线**（恢复后第一帧就显示这个数），下载器
+/// 又用它做**续传起点**。两处算法一旦分叉，恢复的第一帧进度就会从基线掉到
+/// [`PlaylistStats::progress`] —— 用户报的"暂停再开始进度倒退"。
+fn unordered_resume(path: &Path, all_len: usize, c: &PlaylistCtrl) -> (u64, usize, Vec<bool>) {
+    let mut done = mask_from_hex(&c.mask, all_len);
+    // 位图说"完整"、段文件却不在 → 那段得重下（段目录被清 / 文件被手工删）
+    for i in 0..all_len {
+        if done[i] && !seg_file(path, i).is_file() {
+            done[i] = false;
+        }
+    }
+    // 产物文件长度：磁盘上的可能比控制文件长（上次没 flush 的尾巴），以控制
+    // 文件为准截断；短了说明产物被动过 → 已拼前缀作废，重新拼
+    let disk_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let spliced = if disk_len >= c.bytes { c.bytes } else { 0 };
+    let written = if spliced == 0 {
+        0
+    } else {
+        c.prefix.min(all_len)
+    };
+    (spliced, written, done)
+}
+
+/// 段目录里所有段文件的字节合计（= 已下到磁盘、还没拼进产物的字节）。
+fn spilled_bytes(path: &Path, all_len: usize) -> u64 {
+    let mut total = 0u64;
+    for i in 0..all_len {
+        if let Ok(m) = std::fs::metadata(seg_file(path, i)) {
+            total = total.saturating_add(m.len());
+        }
+    }
+    total
+}
+
 /// 续传水位：`(已持久化字节数, 已持久化段数)`。
 ///
 /// 引擎在启动下载前用它回填进度与分片位图基线；`download_playlist`
@@ -1057,13 +1105,9 @@ pub fn resume_point(path: &Path, plan: &PlaylistPlan) -> (u64, usize) {
         if is_unordered_ctrl(&c) {
             // 乱序落盘：已下载字节 = 产物里已拼好的 + 各段文件里还没拼的。
             // 引擎拿它当进度基线（从这儿接着显示，不从头开始数）。
-            let mut total = c.bytes;
-            for i in 0..plan.segment_count() {
-                if let Ok(m) = std::fs::metadata(seg_file(path, i)) {
-                    total = total.saturating_add(m.len());
-                }
-            }
-            return (total, c.prefix.min(plan.segment_count()));
+            let n = plan.segment_count();
+            let (spliced, written, _) = unordered_resume(path, n, &c);
+            return (spliced.saturating_add(spilled_bytes(path, n)), written);
         }
     }
     let st = resume_state(path, plan);
@@ -1613,43 +1657,38 @@ async fn download_playlist_unordered(
     let dir = seg_dir(path);
 
     // 续传：只有"本模式 + 清单指纹"都吻合的控制文件才认；否则段目录整个丢掉
-    // （绝不复用来历不明的半截文件）
+    // （绝不复用来历不明的半截文件）。
+    // 起点的计算与 [`resume_point`] **共用同一个函数** —— 引擎侧进度基线与这里
+    // 的续传起点必须逐字节一致，否则恢复第一帧就会倒退。
     let resumed = load_ctrl(&ctrl_path, plan).filter(is_unordered_ctrl);
-    let (mut written, mut done) = match &resumed {
-        Some(c) => (c.prefix.min(all.len()), mask_from_hex(&c.mask, all.len())),
+    let (spliced, mut written, mut done) = match &resumed {
+        Some(c) => unordered_resume(path, all.len(), c),
         None => {
             let _ = std::fs::remove_dir_all(&dir);
-            (0usize, vec![false; all.len()])
+            (0u64, 0usize, vec![false; all.len()])
         }
     };
-    // 位图说"完整"、段文件却不在 → 那段得重下（段目录被清 / 文件被手工删）
-    for i in 0..all.len() {
-        if done[i] && !seg_file(path, i).is_file() {
-            done[i] = false;
-        }
-    }
-    // 产物文件长度：磁盘上的可能比控制文件长（上次没 flush 的尾巴），以控制
-    // 文件为准截断；短了说明产物被动过 → 已拼前缀作废，重新拼
-    let disk_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let spliced = match &resumed {
-        Some(c) if disk_len >= c.bytes => c.bytes,
-        _ => 0,
-    };
-    if resumed.is_some() && spliced == 0 {
-        written = 0;
-    }
     stats.mark_unordered();
     stats.completed.store(spliced, Ordering::Relaxed);
-    // 段文件里的字节也算已下载（进度 = 磁盘上真实存在的字节总数）
-    let mut spilled0 = 0u64;
+    // `spilled` 的语义是"**段文件里、还没拼进产物**的字节"，与运行中由
+    // `SegCount` 累加出来的口径必须一致：那里面**包含已下完但还没轮到拼的整段**
+    // （段文件在、产物里还没有）。初始化时若只算"未完成的段"，已完成的段就会
+    // 既不在 `completed`（产物里没有）也不在 `spilled` 里 —— 引擎侧
+    // `resume_point()` 是"产物 + 全部段文件"，于是恢复的第一帧进度立刻从基线
+    // 掉到 `progress()`，就是用户看到的"暂停再开始进度倒退"。
+    // 已拼进产物的段文件已被删除，所以"所有存在的段文件"恰好就是这一集合。
+    stats.spilled.store(spilled_bytes(path, all.len()), Ordering::Relaxed);
+    // "**整段已完成**的字节数"，只给总长外推当分子：`spilled` 含在飞分片的
+    // 半截（`SegCount` 按写入即计），拿它当分子会让总长估算随并发数虚高 ——
+    // 实测 64 路并发下界面显示 8GB、实际产物 2GB。
+    let mut done_bytes0 = spliced;
     for i in 0..all.len() {
-        if !done[i] {
+        if done[i] {
             if let Ok(m) = std::fs::metadata(seg_file(path, i)) {
-                spilled0 = spilled0.saturating_add(m.len());
+                done_bytes0 = done_bytes0.saturating_add(m.len());
             }
         }
     }
-    stats.spilled.store(spilled0, Ordering::Relaxed);
 
     let mut sink = if spliced > 0 {
         if let Some(p) = path.parent() {
@@ -1693,6 +1732,26 @@ async fn download_playlist_unordered(
         .filter(|i| done[*i])
         .map(|i| all[i].duration)
         .sum();
+    // 已完成段的**字节数**（与 `done_dur` 严格配套）。总长外推的分子必须是
+    // "整段已下完的字节"，不能用 `spilled` —— 那里面有在飞分片的半截字节，
+    // 而半截的时长却**没有**记进 `done_dur`：分子虚高、分母不涨，估算随并发
+    // 数放大（实测界面 8GB / 实际 2GB）。
+    let mut done_bytes = done_bytes0;
+    // 已完成段数（含续传时位图里已标好的那些）
+    let mut done_segs = (0..all.len()).filter(|i| done[*i]).count();
+    // 实测外推：`已下字节 ÷ 已覆盖时长 × 总时长`，写成一次调用避免两处漂移
+    let publish_estimate = |stats: &PlaylistStats, bytes: u64, dur: f64, segs: usize| {
+        if plan.total.is_some() || segs == 0 || dur <= 0.0 || plan.duration_secs <= 0.0 {
+            return;
+        }
+        let est = (bytes as f64 / dur * plan.duration_secs) as u64;
+        if est > 0 {
+            stats.estimated_total.fetch_max(est, Ordering::Relaxed);
+        }
+    };
+    // 续传时先把已有的"整段已完成"字节喂一遍：否则恢复的头几秒里外推用的是
+    // 0 字节起步的分子，估算会先掉到很低再爬回来（进度条闪一下）。
+    publish_estimate(&stats, done_bytes, done_dur, done_segs);
     let mut last_save = std::time::Instant::now() - CTRL_SAVE_INTERVAL;
     let mut in_flight = 0usize;
     // 派发从"还没拼进产物的第一段"开始：`written` 之前的段已经躺在产物里了，
@@ -1705,12 +1764,19 @@ async fn download_playlist_unordered(
 
     loop {
         // 1) 把连续前缀拼进产物（拼一段删一段，磁盘不翻倍）
-        while written < all.len() && done[written] {
+        //
+        // 分批：拼接是**同步**的（读段文件 + 写产物），中间没有 `.await`。一次把
+        // 几百段全拼完（末段常见上百 MB）意味着"从最后一笔网络读取到收尾"之间
+        // 没有任何调度点 —— 分片并发在收尾阶段空转，用户看到的就是"合并慢"。
+        // 分批后每轮回到步骤 2/3，在飞请求照常推进。
+        let mut spliced_now = 0u64;
+        while written < all.len() && done[written] && spliced_now < SPLICE_BATCH_BYTES {
             let f = seg_file(path, written);
             match splice_seg(&f, &mut sink) {
                 Ok(moved) => {
                     done[written] = false;
                     written += 1;
+                    spliced_now = spliced_now.saturating_add(moved);
                     // 进度"转移"：先记产物侧、再减段文件侧 —— 中途只会略偏高一点，
                     // 绝不会回落
                     stats.completed.store(sink.position(), Ordering::Relaxed);
@@ -1728,6 +1794,30 @@ async fn download_playlist_unordered(
         }
         if failure.is_some() || written == all.len() {
             break;
+        }
+        // 预算用满就回到本轮开头继续拼：此刻可能"分片全派发完了、在飞却是空的"
+        // （剩下的只是还没拼的段），走到步骤 3 会等到 `None` 并误报"未下载完整"。
+        if spliced_now >= SPLICE_BATCH_BYTES {
+            if last_save.elapsed() >= CTRL_SAVE_INTERVAL {
+                if let Err(e) = sink.flush_buf() {
+                    failure = Some(HttpError::Io(e.to_string()));
+                    break;
+                }
+                save_ctrl(&ctrl_path, &ctrl_of(written, sink.position(), &done));
+                last_save = std::time::Instant::now();
+            }
+            continue;
+        }
+        if spliced_now > 0 && last_save.elapsed() >= CTRL_SAVE_INTERVAL {
+            // 只把缓冲交给内核、不 fsync：产物此时可能已有数 GB，`sync_all`
+            // 要等全部脏页写回（秒级），每秒来一次会把拼接拖垮。安全性与
+            // 终局 fsync 的分工见 `FileSink::flush_buf`。
+            if let Err(e) = sink.flush_buf() {
+                failure = Some(HttpError::Io(e.to_string()));
+                break;
+            }
+            save_ctrl(&ctrl_path, &ctrl_of(written, sink.position(), &done));
+            last_save = std::time::Instant::now();
         }
         // 2) 补足在飞下载：**没有内存闸门**（字节直接落段文件），连接始终满载
         while in_flight < conn && next_spawn < all.len() {
@@ -1788,18 +1878,13 @@ async fn download_playlist_unordered(
                 }
                 done[i] = true;
                 done_dur += all[i].duration;
-                // 实测外推总长：已下字节 ÷ 已覆盖时长 × 总时长（只增不减，
-                // 免得进度条往回跳）。初值由分发器按清单码率给。
-                if plan.total.is_none() && done_dur > 0.0 && plan.duration_secs > 0.0 {
-                    let got = stats
-                        .completed
-                        .load(Ordering::Relaxed)
-                        .saturating_add(stats.spilled.load(Ordering::Relaxed));
-                    let est = (got as f64 / done_dur * plan.duration_secs) as u64;
-                    if est > 0 {
-                        stats.estimated_total.fetch_max(est, Ordering::Relaxed);
-                    }
-                }
+                done_segs += 1;
+                // 整段已完成 → 它的字节可以从段文件长度取（含续传时已有的部分）
+                done_bytes = done_bytes
+                    .saturating_add(std::fs::metadata(seg_file(path, i)).map(|m| m.len()).unwrap_or(0));
+                // 实测外推总长（只增不减，免得进度条往回跳）。初值由分发器按
+                // 清单码率给；分子只用"整段已完成"的字节，绝不把在飞半截算进去。
+                publish_estimate(&stats, done_bytes, done_dur, done_segs);
                 if last_save.elapsed() >= CTRL_SAVE_INTERVAL {
                     if let Err(e) = sink.flush() {
                         failure = Some(HttpError::Io(e.to_string()));
@@ -1824,15 +1909,20 @@ async fn download_playlist_unordered(
         }
     }
 
-    // 收尾：丢掉在飞请求，并把刚好凑齐的连续前缀补拼完
+    // 收尾：丢掉在飞请求，并把刚好凑齐的连续前缀补拼完。
+    //
+    // 这里同样分批：末段往往一次能拼上百 MB，分两轮之间刷一次缓冲，避免把
+    // 一大坨脏页留到终局 `sync_all` 一起等（那是"合并慢"的主要来源之一）。
     drop(futs);
     drop(handles);
+    let mut spliced_now = 0u64;
     while failure.is_none() && written < all.len() && done[written] {
         let f = seg_file(path, written);
         match splice_seg(&f, &mut sink) {
             Ok(moved) => {
                 done[written] = false;
                 written += 1;
+                spliced_now = spliced_now.saturating_add(moved);
                 stats.completed.store(sink.position(), Ordering::Relaxed);
                 let _ = stats
                     .spilled
@@ -1841,6 +1931,12 @@ async fn download_playlist_unordered(
                     });
             }
             Err(e) => failure = Some(e),
+        }
+        if spliced_now >= SPLICE_BATCH_BYTES && failure.is_none() {
+            if let Err(e) = sink.flush_buf() {
+                failure = Some(HttpError::Io(e.to_string()));
+            }
+            spliced_now = 0;
         }
     }
     let flush = sink.flush().map_err(|e| HttpError::Io(e.to_string()));
@@ -3341,5 +3437,83 @@ mod tests {
         );
         cancel.cancel();
         let _ = dl.await;
+    }
+
+    /// **总长估算不得随并发数虚高**（现场：界面显示总大小 8GB，实际产物 2GB）。
+    ///
+    /// 根因：外推的分子用了 `completed + spilled`，而 `spilled` 里有**在飞分片的
+    /// 半截字节**（`SegCount` 按写入即计）—— 那些字节对应的时长却**没有**记进
+    /// 分母 `done_dur`。并发越高，同时存在的半截越多，估算被放大得越离谱；
+    /// `fetch_max` 又会把中途出现的尖峰**永久锁死**，于是"下载中 8GB、完成后 2GB"。
+    ///
+    /// 这条用例：所有分片等大（每段 4 秒），观察整个下载过程中 `estimated_total`
+    /// 相对真实总长的**峰值**偏差 —— 正确口径下分子只数"整段已完成"的字节，
+    /// 偏差应始终很小（只受"完成段数与字节数同比例"这一点影响）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn estimated_total_does_not_inflate_with_concurrency() {
+        use std::time::Instant;
+
+        let dir = tmpdir("hls-est-inflate");
+        // 40 > SIZE_PROBE_SAMPLE → 不预探测，总长只能靠外推（正是现场的路径）
+        let count = 40usize;
+        let seg_size = 256 * 1024usize;
+        let names: Vec<String> = (1..=count).map(|i| format!("s{i}.ts")).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let mut files = HashMap::new();
+        files.insert("/m/index.m3u8".to_string(), media_playlist(&refs).into_bytes());
+        for (i, n) in names.iter().enumerate() {
+            files.insert(format!("/m/{n}"), sample(i as u8 + 1, seg_size));
+        }
+        // 每片都慢发：让"在飞半截"在观察窗口里长期存在（并发越高越多）
+        let mut sopts = ServerOpts::default();
+        for n in &names {
+            sopts.trickle.insert(format!("/m/{n}"), (32 * 1024, 25));
+        }
+        let srv = start_server_opts(files, sopts).await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        // 高并发：旧口径下同时存在的半截最多
+        let po = PlaylistOptions {
+            concurrency: 16,
+            ..Default::default()
+        };
+        let plan = fetch_plan(&client, &srv.url("/m/index.m3u8"), &cancel, &[], &po)
+            .await
+            .expect("取清单");
+        assert_eq!(plan.total, None, "这条用例要的是外推路径");
+        let real_total = (count * seg_size) as u64;
+
+        let path = dir.join("out.ts");
+        let stats = PlaylistStats::new(0);
+        let dl = tokio::spawn({
+            let client = client.clone();
+            let path = path.clone();
+            let plan = plan.clone();
+            let po = po.clone();
+            let cancel = cancel.clone();
+            let stats = stats.clone();
+            async move { download_playlist(&client, &path, &plan, &po, &cancel, stats).await }
+        });
+        // 全程盯峰值：`fetch_max` 一旦被尖峰抬高就再也降不回去，所以峰值就是
+        // 用户界面上看到的那个"总大小"
+        let mut peak_est = 0u64;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(20) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            peak_est = peak_est.max(stats.estimated_total.load(Ordering::Relaxed));
+            if dl.is_finished() {
+                break;
+            }
+        }
+        let done = dl.await.expect("下载任务不应 panic").expect("下载应成功");
+        assert_eq!(done.bytes, real_total);
+        peak_est = peak_est.max(stats.estimated_total.load(Ordering::Relaxed));
+        assert!(
+            peak_est * 100 <= real_total * 130,
+            "总长估算峰值 {peak_est} 比真实总长 {real_total} 高出 30% 以上 —— \
+             外推的分子把在飞分片的半截字节也算进去了（并发越高虚高越多，\
+             用户看到的就是「下载中 8GB、完成后 2GB」）"
+        );
     }
 }

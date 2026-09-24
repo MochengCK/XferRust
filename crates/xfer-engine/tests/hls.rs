@@ -823,3 +823,105 @@ async fn hls_exposes_piece_bitfield_for_unknown_total() {
         "完成后位图应全亮（并定格为真实总长），实际 {bf:?}"
     );
 }
+
+/// **暂停 → 恢复，进度不得倒退**（用户报："暂停再开始进度还是会倒退"）。
+///
+/// 两个数必须对齐：
+/// - 引擎在启动下载前用 `playlist_resume_point()` 回填进度基线（恢复后第一帧
+///   就显示它）= **产物长度 + 段目录里全部段文件的字节**；
+/// - 下载器内部再用 `PlaylistStats::progress()` 接管 = **产物已拼字节 + `spilled`**。
+///
+/// 一旦下载器初始化 `spilled` 时漏掉"**已下完但还没轮到拼**"的整段（它们既不在
+/// 产物里、又不算进 `spilled`），第一帧就会从基线掉下来 —— 那就是"倒退"。
+/// 这条用例在高并发下暂停（此时必然有一批段已完成却还没拼），逐帧钉住进度
+/// **单调不减**，并要求恢复的第一帧不低于暂停时的水位。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hls_resume_does_not_rewind_progress() {
+    let dir = tmpdir("no-rewind");
+    let seg_len = 96 * 1024usize;
+    let count = 12usize;
+    let names: Vec<String> = (1..=count).map(|i| format!("seg{i}.ts")).collect();
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let mut files = HashMap::new();
+    files.insert("/show/index.m3u8".to_string(), media_playlist(&refs, true).into_bytes());
+    for (i, n) in names.iter().enumerate() {
+        files.insert(format!("/show/{n}"), sample(i as u8 + 1, seg_len));
+    }
+    // 首片慢发把队头顶住：后面若干片会"先下完、等在段目录里"（正是漏算的那批）
+    let mut trickle = Trickle::new();
+    trickle.insert("/show/seg1.ts".to_string(), (8 * 1024usize, 90u64));
+    let srv = start_hls_server_trickle(files, HashMap::new(), 0, HashMap::new(), trickle).await;
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    // 高并发 + 关预探测：段大小未知、多个段同时在飞
+    let gid = mgr
+        .add_uri(
+            vec![srv.url("/show/index.m3u8")],
+            &serde_json::json!({"dir": dir, "split": "8", "hls-probe-size": "false"}),
+            None,
+        )
+        .expect("addUri 应成功");
+
+    // 等队头之外的段攒起来（磁盘字节明显超过产物长度）
+    let mut waited = 0u64;
+    loop {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        waited += 30;
+        let st = tell(&mgr, &gid).await;
+        let out_len = std::fs::metadata(file_of(&st)).map(|m| m.len()).unwrap_or(0);
+        if disk_bytes(&file_of(&st)) > out_len + seg_len as u64 || waited >= 8_000 {
+            break;
+        }
+    }
+    mgr.pause(&gid).expect("pause 应成功");
+    let st = wait_status(&mgr, &gid, "paused", 15_000)
+        .await
+        .expect("暂停未生效");
+    let paused_done = st["completedLength"].as_u64().unwrap_or(0);
+    let paused_disk = disk_bytes(&file_of(&st));
+    assert!(
+        paused_done >= paused_disk.saturating_sub(512 * 1024),
+        "暂停后进度（{paused_done}）不该比磁盘（{paused_disk}）少一大截"
+    );
+
+    mgr.unpause(&gid).expect("unpause 应成功");
+    // 恢复后逐帧盯进度：允许不涨，但**绝不许低于暂停时的水位**
+    let mut last = paused_done;
+    let mut first: Option<u64> = None;
+    let mut floor_violation: Option<(u64, u64)> = None;
+    let started = std::time::Instant::now();
+    while started.elapsed() < Duration::from_millis(2_000) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let st = tell(&mgr, &gid).await;
+        let done = st["completedLength"].as_u64().unwrap_or(0);
+        if first.is_none() {
+            first = Some(done);
+        }
+        if done < last {
+            floor_violation = Some((last, done));
+            break;
+        }
+        last = done;
+        if st["status"].as_str() == Some("complete") {
+            break;
+        }
+    }
+    assert!(
+        floor_violation.is_none(),
+        "恢复后进度倒退了：{:?}（暂停时水位 {paused_done}）——\
+         引擎的续传基线是「产物 + 全部段文件」，下载器初始化 `spilled` 时\
+         必须用同一个口径，否则第一帧就掉下来",
+        floor_violation
+    );
+    let st = wait_status(&mgr, &gid, "complete", 40_000)
+        .await
+        .expect("恢复后 40s 内未完成");
+    let expected: Vec<u8> = (1..=count)
+        .flat_map(|i| sample(i as u8, seg_len))
+        .collect();
+    assert_eq!(
+        std::fs::read(file_of(&st)).unwrap(),
+        expected,
+        "续传后产物必须完整且顺序正确"
+    );
+}
