@@ -925,3 +925,124 @@ async fn hls_resume_does_not_rewind_progress() {
         "续传后产物必须完整且顺序正确"
     );
 }
+
+/// **界面上的总大小必须准确，不得虚高**（用户报："文件总大小还是不准确，还是
+/// 虚高"）。
+///
+/// 根因有两层，缺一条都修不掉：
+/// 1. 初值来自主清单的码率乘时长，而清单常只写 `BANDWIDTH` —— RFC 8216 定义它
+///    是**峰值**码率 → 系统性偏高（所以现在优先取 `AVERAGE-BANDWIDTH`，本用例
+///    的清单**故意不写**它，把"只有峰值码率"这条最坏路径钉住）；
+/// 2. 旧实现用 `fetch_max` + 引擎侧 `.max(旧值)` 两层"只增不减"把那个偏高值
+///    **永久锁死** —— 后面再准的实测外推也压不下来，用户看到的就是"下载中
+///    总大小虚高、完成后才变正常"。
+///
+/// 修法：① 优先用 `AVERAGE-BANDWIDTH`（没有则退回峰值并接受偏高）；② 估算用
+/// `store`（允许下调）；③ 拿**真值**——响应头 + 后台 1 字节 `Range` 探测，
+/// 全部段长度确知后 `exact_total` 就是产物最终字节数。
+///
+/// 这条用例构造的清单里 `BANDWIDTH` 比实际码率**虚报 4 倍**（正是用户现场
+/// 「下载中显示 8GB、产物只有 2GB」的比例），然后盯两件事：
+///
+/// 1. 总长必须在**下载途中**就收敛到真实值（不能拖到完成才变正常）；
+/// 2. 它必须能**往下走**（旧实现被 `fetch_max` 锁死在初值上，一步都不降）。
+///
+/// 注意**不**断言"初值不许偏高"：从下载第一秒就显示一个码率推算的总大小是
+/// 刻意的设计（用户明确要求"哪怕没拿到完整大小，也要先显示已知的总大小"），
+/// 它偏高是预期行为。问题从来不是"偏高"，而是"偏高之后再也不降"。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hls_total_length_converges_and_can_decrease() {
+    let dir = tmpdir("total-accurate");
+    // 40 段 > SIZE_PROBE_SAMPLE(32) → 不预探测，总长初始只能靠码率推算
+    let count = 40usize;
+    let seg_bytes = 32 * 1024usize;
+    let real_total = (count * seg_bytes) as u64; // 1.25MB
+    // 真实码率：32KB / 4s = 65536 bit/s。清单虚报成 4 倍（262144）→ 初值 5MB
+    let names: Vec<String> = (1..=count).map(|i| format!("s{i}.ts")).collect();
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let mut files = HashMap::new();
+    files.insert(
+        "/m/master.m3u8".to_string(),
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=262144\nv1.m3u8\n"
+            .as_bytes()
+            .to_vec(),
+    );
+    files.insert("/m/v1.m3u8".to_string(), media_playlist(&refs, true).into_bytes());
+    for (i, n) in names.iter().enumerate() {
+        files.insert(format!("/m/{n}"), sample(i as u8 + 1, seg_bytes));
+    }
+    let srv = start_hls_server(files, HashMap::new(), 0).await;
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = mgr
+        .add_uri(
+            vec![srv.url("/m/master.m3u8")],
+            &serde_json::json!({"dir": dir}),
+            None,
+        )
+        .expect("addUri 应成功");
+
+    // 逐帧采样：记下初值、是否观察到**下调**、以及四分之一进度时的值
+    let mut first_total = 0u64;
+    let mut at_quarter: Option<u64> = None;
+    let mut prev_total = 0u64;
+    // 有没有任何一帧的总长**比上一帧小**（这正是"估算可被修正下调"的直接证据；
+    // 旧实现两层 `max` 会让它永远为 false）
+    let mut saw_decrease = false;
+    let st = loop {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let st = tell(&mgr, &gid).await;
+        let total = st["totalLength"].as_u64().unwrap_or(0);
+        let done = st["completedLength"].as_u64().unwrap_or(0);
+        if first_total == 0 && total > 0 {
+            first_total = total;
+        }
+        if at_quarter.is_none() && done >= real_total / 4 {
+            at_quarter = Some(total);
+        }
+        if prev_total > 0 && total > 0 && total < prev_total {
+            saw_decrease = true;
+        }
+        if total > 0 {
+            prev_total = total;
+        }
+        match st["status"].as_str().unwrap_or_default() {
+            "complete" | "error" => break st,
+            _ => {}
+        }
+    };
+    assert_eq!(st["status"], "complete", "任务应下载完成：{st}");
+
+    // 产物真实字节数
+    let out_len = std::fs::metadata(file_of(&st)).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(out_len, real_total, "产物长度应为 {real_total}");
+
+    // 1) 结束时总长必须等于产物（精确，不是估算）
+    let final_total = st["totalLength"].as_u64().unwrap_or(0);
+    assert_eq!(
+        final_total, real_total,
+        "完成时总大小应定格为产物真实字节数 {real_total}，实际 {final_total}"
+    );
+
+    // 2) 初值确实是那个偏高的码率推算（否则这条用例没测到"能否降下来"）
+    assert!(
+        first_total > real_total,
+        "初值应由码率推算得到（偏高），实际 {first_total}，真实 {real_total}"
+    );
+
+    // 3) **必须能降**：旧实现两层"只增不减"会把初值锁死，一帧下调都观察不到
+    assert!(
+        saw_decrease,
+        "全程没观察到总大小被下调过（初值 {first_total}）—— 估算被锁死了，\
+         这正是用户看到的「下载中总大小虚高、完成后才正常」"
+    );
+
+    // 4) **下载途中就收敛**：走到 1/4 进度时，显示的已应是接近真值的数
+    let q = at_quarter.expect("应能在 1/4 进度时采到总长");
+    let diff = (q as i64 - real_total as i64).abs();
+    assert!(
+        diff * 100 <= (real_total as i64) * 30,
+        "下载到 1/4 时总大小仍为 {q}，与真实 {real_total} 相差超过 30% —— \
+         实测外推没有及时接管码率初值"
+    );
+}

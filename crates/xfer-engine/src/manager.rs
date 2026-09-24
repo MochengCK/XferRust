@@ -1824,6 +1824,9 @@ impl TaskManager {
                 .filter(|_| plan.duration_secs > 0.0)
                 .map(|bw| ((bw as f64 / 8.0 * plan.duration_secs) as u64).max(1))
         });
+        // 位图是不是拿"估算总长"建的（`plan.total` 缺失 → 只能是码率推算）：
+        // 精确总长一到就得重建，否则格子数与最终产物对不上
+        let pieces_from_estimate = plan.total.filter(|t| *t > 0).is_none();
         let mut pieces: Option<Arc<xfer_http::PieceTrack>> = None;
         if let Some(total) = total_hint {
             let p = xfer_http::PieceTrack::new(total.max(resume_bytes), min_split);
@@ -1849,26 +1852,45 @@ impl TaskManager {
             &stats,
             plan.total.is_none(),
             pieces,
+            pieces_from_estimate,
             min_split,
         );
         let r = xfer_http::download_playlist(client, &path, &plan, &opts, cancel, stats.clone()).await;
         sampler.abort();
         match r {
             Ok(done) => {
+                // 精确总长：① 清单自带的 `plan.total`；② 下载期间由响应头 +
+                // 后台探测攒出来的 `stats.exact_total`（全部段长度确知）。两者
+                // 都没有才是"真的不知道"，退回实际字节数。
+                //
+                // 注意 `exact_total` 只是**分片字节和**（清单里那些段），而
+                // `done.bytes` 是产物实际长度 —— 产物 = 各段拼接，两者应当相等；
+                // 万一对不上（如段被服务器改写、清单含 BYTERANGE 重叠），以**产物
+                // 实际长度**为准，因为它是磁盘上的事实。
+                let exact = plan.total.filter(|t| *t > 0).or_else(|| {
+                    let e = stats.exact_total.load(Ordering::Relaxed);
+                    (e > 0).then_some(e)
+                });
                 {
                     let mut sh = task.shared.lock().unwrap();
                     sh.completed = done.bytes;
                     sh.connections = 0;
                     sh.file_len = done.bytes;
-                    if plan.total.is_none() {
-                        // 总长未知（未预探测/服务器不支持 Range）：
-                        // 完成后按实际字节数定格，进度不留在不确定态
-                        sh.total_len = Some(done.bytes);
-                    }
+                    // 总长定格：优先精确值，但绝不小于产物真实长度（否则百分比
+                    // 会超过 100%）。`plan.total` 已知时启动前就填过，这里再写
+                    // 一次是幂等的。
+                    sh.total_len = Some(exact.map_or(done.bytes, |t| t.max(done.bytes)));
                 }
-                // 位图定格为真实总长：估算/码率推算出来的总长可能偏大，那会
-                // 剩下几个永远点不亮的格子（进度 100%、分片图却不满）
-                if plan.total.is_none() {
+                // 位图**无条件**定格为产物真实长度。产物长度是磁盘上的事实，
+                // 用它重建能同时消掉两类偏差：估算偏大时剩下的"永远点不亮的
+                // 格子"（进度 100%、分片图却不满），以及估算偏小时"格子不够"。
+                //
+                // 为什么必须无条件：采样器是**每 200ms 一跳**的后台任务，下载一
+                // 结束就被 `abort()`；最后一帧可能落在末段拼接之前。若把"定格"
+                // 交给采样器（只在有精确值时重建），位图就会停在"格数对、但最后
+                // 几格没点亮"的中间态 —— 表现为间歇性的"完成后分片图不满"。
+                // 这里重建一次是 O(1) 的内存操作（任务已在收尾），代价可忽略。
+                {
                     let p = xfer_http::PieceTrack::new(done.bytes.max(1), min_split);
                     p.add_range(0, done.bytes);
                     *task.http_pieces.write().unwrap() = Some(p);
@@ -4736,15 +4758,27 @@ fn spawn_split_sampler(
 
 /// HLS 播放列表进度采样：与 [`spawn_split_sampler`] 同构（无锁原子）。
 ///
-/// `allow_estimate`：清单总长未知（大清单不预探测）时，用
-/// [`xfer_http::PlaylistStats::estimated_total`]（已下字节 ÷ 已覆盖时长外推）
-/// 驱动进度条与剩余时间。**只增不减**且不低于已下字节 —— 估算值抖动会让
-/// 进度条往回跳，比偏保守更难看；精确值（`plan.total` 已知）永远优先。
+/// 总长的取值优先级（**精确值永远优先，估算可被修正下调**）：
+///
+/// 1. `plan.total` —— 清单自带或小清单预探测得到的精确总长（调用方在启动前
+///    就已回填，`allow_estimate=false`，本函数不再碰）；
+/// 2. [`xfer_http::PlaylistStats::exact_total`] —— **后台探测/响应头攒出来的
+///    精确总长**（大清单的常态：下载中途某刻全部段长度确知，总长从此定格）；
+/// 3. [`xfer_http::PlaylistStats::estimated_total`] —— 外推估算，**允许下调**。
+///
+/// 曾经这里写的是 `est.max(progress).max(旧值)`，两层"只增不减"叠加，把开头的
+/// 偏高值**永久锁死**：初值来自主清单 `BANDWIDTH`（RFC 8216 定义为峰值码率，
+/// 系统性偏高），第一秒写进去后就再也降不下来 —— 用户看到的就是"下载中总大小
+/// 虚高、完成后才正常"。现在精确值直接覆盖，估算也跟着最新样本走。
 fn spawn_playlist_sampler(
     task: &Arc<Task>,
     stats: &Arc<xfer_http::PlaylistStats>,
     allow_estimate: bool,
     pieces: Option<Arc<xfer_http::PieceTrack>>,
+    // 传进来的位图是不是**拿估算总长建的**（`BANDWIDTH × 时长`）。是的话
+    // 精确值一到就要重建 —— 否则格子数对不上最终产物（估算偏大 → 剩下永远
+    // 点不亮的格子；偏小 → 不够格）。
+    pieces_from_estimate: bool,
     piece_len: u64,
 ) -> tokio::task::JoinHandle<()> {
     let task = task.clone();
@@ -4756,6 +4790,11 @@ fn spawn_playlist_sampler(
         // 格子）。`marked` 是已标记到的字节数，保证每次只补新区间。
         let mut pieces = pieces;
         let mut marked: u64 = 0;
+        // 已经"定格"过精确总长：此后总长不再变化，免得每次 tick 都写锁
+        let mut exact_done = false;
+        // 位图是否由**估算**总长建出来的（估算可能偏大，精确值一到就要重建，
+        // 否则格子数对不上最终产物、会剩下永远点不亮的格子）
+        let mut pieces_from_estimate = pieces_from_estimate;
         loop {
             iv.tick().await;
             // 进度：**只认已经交给文件、取消时不会被丢弃的字节**
@@ -4773,28 +4812,52 @@ fn spawn_playlist_sampler(
                 stats.connections.load(Ordering::Relaxed) as u64,
                 Ordering::Relaxed,
             );
-            if allow_estimate {
-                let est = stats.estimated_total.load(Ordering::Relaxed);
-                if est > 0 {
-                    let progress = stats.progress();
+            if allow_estimate && !exact_done {
+                // 精确总长（全部段长度已确知）优先，它一到就定格
+                let exact = stats.exact_total.load(Ordering::Relaxed);
+                let total = if exact > 0 {
+                    exact_done = true;
+                    Some(exact)
+                } else {
+                    let est = stats.estimated_total.load(Ordering::Relaxed);
+                    // 估算可能为 0（还没法估）；一旦有值就采用，**不跟旧值取 max**
+                    // —— 允许它随样本修正下调（见函数文档）
+                    (est > 0).then_some(est)
+                };
+                if let Some(t) = total {
+                    // 总长不能小于"已下字节"，否则百分比会超过 100%
+                    let t = t.max(stats.progress()).max(1);
                     let mut sh = task.shared.lock().unwrap();
-                    let next = est.max(progress).max(sh.total_len.unwrap_or(0));
-                    if sh.total_len != Some(next) {
-                        sh.total_len = Some(next);
-                        sh.file_len = next;
+                    if sh.total_len != Some(t) {
+                        sh.total_len = Some(t);
+                        sh.file_len = t;
                     }
                 }
             }
-            // 分片位图：① 一开始没有（单层清单 + 时长未知）时，等实测估算一
-            // 出现就补建 —— HLS 的总长是逐步收敛的，分片图不该等到下载结束
-            // 都还是空的；② 已建好的按已落盘字节增量点亮。
+            // 分片位图：① 一开始没有（单层清单 + 时长未知）时，等总长一出现就
+            // 补建 —— HLS 的总长是逐步收敛的，分片图不该等到下载结束都还是空的；
+            // ② 已建好的按已落盘字节增量点亮。
             let done = stats.completed.load(Ordering::Relaxed);
+            let exact = stats.exact_total.load(Ordering::Relaxed);
+            // 精确总长到了、而现有位图是拿估算建的 → 按精确值重建（估算偏大时
+            // 会剩下永远点不亮的格子；偏小时又会不够格）
+            if exact > 0 && pieces.is_some() && pieces_from_estimate {
+                let p = xfer_http::PieceTrack::new(exact.max(done).max(1), piece_len);
+                p.add_range(0, done);
+                *task.http_pieces.write().unwrap() = Some(p.clone());
+                pieces = Some(p);
+                marked = done;
+                pieces_from_estimate = false;
+            }
             if pieces.is_none() {
-                let est = stats.estimated_total.load(Ordering::Relaxed);
-                if est > 0 {
-                    let p = xfer_http::PieceTrack::new(est.max(done).max(1), piece_len);
+                // 优先用精确总长建图（格子数与最终产物严格对应）；没有精确值
+                // 才用估算，并记下"这是估算建的"，等精确值来了重建
+                let hint = if exact > 0 { exact } else { stats.estimated_total.load(Ordering::Relaxed) };
+                if hint > 0 {
+                    let p = xfer_http::PieceTrack::new(hint.max(done).max(1), piece_len);
                     *task.http_pieces.write().unwrap() = Some(p.clone());
                     pieces = Some(p);
+                    pieces_from_estimate = exact == 0;
                 }
             }
             if let Some(p) = &pieces {

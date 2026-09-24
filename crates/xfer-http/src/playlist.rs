@@ -48,6 +48,12 @@ const MAX_VARIANT_HOPS: usize = 3;
 const SIZE_PROBE_SAMPLE: usize = 32;
 /// 预探测并发上限：探测是轻量请求，不需要跟着下载并发走。
 const SIZE_PROBE_CONCURRENCY: usize = 8;
+
+/// **后台**大小探测的并发：与下载同时跑。
+///
+/// 1 字节的 `Range` 请求几乎不占带宽（响应体只有 1 字节），所以可以比阻塞式
+/// 预探测激进一些 —— 它直接决定"总长多久从估算收敛到精确值"。
+const SIZE_PROBE_BG_CONCURRENCY: usize = 16;
 /// 控制文件落盘节流（与分片下载一致：1s 一次 fsync + 原子写）。
 const CTRL_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 /// 单个分片的瞬时失败重试默认次数。
@@ -134,11 +140,17 @@ pub struct PlaylistPlan {
     pub total: Option<u64>,
     /// 媒体时长合计（`#EXTINF` 之和，秒）。总长估算的分母。
     pub duration_secs: f64,
-    /// 选中变体的声明码率（`#EXT-X-STREAM-INF:BANDWIDTH`，bit/s）。
+    /// 选中变体的**平均**码率（bit/s）：优先 `#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH`，
+    /// 清单没写时退回 `BANDWIDTH`。
     ///
-    /// 单层清单（没有主清单）时为 `None`。有它就能在**下载开始之前**给出
-    /// 一个像样的总长（`bitrate / 8 × duration_secs`）—— 否则进度条要等到
-    /// 第一个分片落盘才有总长，而单连接被限速的站点上一个分片要几十秒。
+    /// 单层清单（没有主清单）时为 `None`。有它就能在**下载开始之前**给出一个
+    /// 像样的总长（`bitrate / 8 × duration_secs`）—— 否则进度条要等到第一个
+    /// 分片落盘才有总长，而单连接被限速的站点上一个分片要几十秒。
+    ///
+    /// 为什么优先用平均值：RFC 8216 规定 `BANDWIDTH` 是**峰值**码率，按它乘时长
+    /// 会系统性偏高（实测某些站点高 30%+），而 `AVERAGE-BANDWIDTH` 是整条流的
+    /// 平均码率，与「总字节 ÷ 总时长」同义。注意这只是**初值**：后台探测
+    /// （[`PlaylistStats::exact_total`]）会把它替换成精确值。
     pub bitrate: Option<u64>,
 }
 
@@ -214,11 +226,43 @@ pub struct PlaylistStats {
     pub cursor_counted: AtomicBool,
     /// 总字节数的**实时估算**（0 = 还没法估）。
     ///
-    /// 两个来源，按可用性递进：① 主清单的 `BANDWIDTH × 总时长`（下载一开始
-    /// 就有值，误差 ±10% 量级）；② 实测「已下字节 ÷ 已覆盖时长 × 总时长」
-    /// 外推（写完第一段后接管，越来越准）。`plan.total` 已知时（小清单探测
-    /// 过）这里始终为 0，由调用方优先用精确值。
+    /// 两个来源，按可用性递进：① 主清单的 `AVERAGE-BANDWIDTH × 总时长`
+    /// （下载一开始就有值）；② 实测「已下字节 ÷ 已覆盖时长 × 总时长」外推
+    /// （写完第一段后接管，越来越准）。`plan.total` 已知时（小清单探测过）
+    /// 这里始终为 0，由调用方优先用精确值。
+    ///
+    /// **可以被修正下调**（不再只增不减）：初值来自 `AVERAGE-BANDWIDTH`
+    /// （清单没写时退回峰值 `BANDWIDTH`）、外推也会随样本修正，只增不减会把
+    /// 开头的偏高值**永久锁死**（用户报的"总大小虚高"正是这个）。
+    /// 调用方应优先用 [`Self::exact_total`]。
     pub estimated_total: AtomicU64,
+    /// **精确总长**（0 = 还没算出来）。
+    ///
+    /// 与 `estimated_total` 的本质区别：这是**事实**不是估算 —— 全部分片的
+    /// 真实字节数都已确知时才算得出。来源有两条，都不额外花流量：
+    ///
+    /// 1. **下载响应自带的长度**：每个分片的 `Content-Length` /
+    ///    `Content-Range: bytes a-b/total` 本来就是真值，收分片时顺手记下；
+    /// 2. **后台补齐**：与下载**并发**跑一轮 1 字节的 `Range: bytes=0-0` 探测，
+    ///    只探还没确知的分片（1 字节响应体几乎不占带宽）。
+    ///
+    /// 一旦全部已知，`exact_total` 就是产物**最终**的字节数（`progress` 走到
+    /// 它即 100%），不再有任何偏差。
+    ///
+    /// **加密分片记的是解密后的明文长度**，不是服务器声明的密文长度 —— 密文多
+    /// 1~16 字节的 PKCS7 填充，而产物里存的是明文，沿用密文长度会让精确值系统性
+    /// 偏大、进度永远差一点到 100%。相应地后台探测**跳过加密段**（探测只能得到
+    /// 密文长度），加密段的真值由下载路径自己给。
+    pub exact_total: AtomicU64,
+    /// 各分片已确知的真实字节数（`None` = 还没确知）。
+    ///
+    /// 与 `exact_total` 配合：每确知一个就检查是否已全部确知，是则把总和发布到
+    /// `exact_total`。用 `Mutex` 而不是原子数组是因为写入频率极低（每分片一次）。
+    sizes: Mutex<Vec<Option<u64>>>,
+    /// 期望的分片总数（0 = 未知）。**只有它已知**才能判定"全部确知" ——
+    /// 否则按需增长的 `sizes` 会在只确知前几个时就被 `all(is_some)` 判成齐了，
+    /// 于是把一个**部分和**当成精确总长发布出去（比估算还离谱）。
+    seg_total: AtomicUsize,
     /// **乱序落盘**模式下，已经写进各段文件、但还没拼进产物的字节总数。
     ///
     /// 这些字节躺在磁盘上（取消也不会丢），进度直接算作已下载 —— 所以乱序
@@ -242,10 +286,60 @@ impl PlaylistStats {
             cursor: AtomicUsize::new(0),
             cursor_counted: AtomicBool::new(true),
             estimated_total: AtomicU64::new(0),
+            exact_total: AtomicU64::new(0),
+            sizes: Mutex::new(Vec::new()),
+            seg_total: AtomicUsize::new(0),
             spilled: AtomicU64::new(0),
             unordered: AtomicBool::new(false),
             slots: Mutex::new(Vec::new()),
         })
+    }
+
+    /// 预置分片总数（段数已知时调用，让"全部确知"的判定能提前成立）。
+    pub fn reserve_segments(&self, n: usize) {
+        self.seg_total.store(n, Ordering::Relaxed);
+        let mut sizes = self.sizes.lock().unwrap();
+        if sizes.len() < n {
+            sizes.resize(n, None);
+        }
+    }
+
+    /// 记下一个分片**确知**的真实字节数（下载响应的 `Content-Length`，或后台
+    /// 探测的结果）。同一个分片重复上报取首次（长度不会变）。
+    ///
+    /// 全部段都确知时，把总和发布到 [`Self::exact_total`] —— 那一刻起总长就是
+    /// **精确值**，不再随下载漂移。
+    pub fn note_segment_size(&self, index: usize, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let total_known = {
+            let mut sizes = self.sizes.lock().unwrap();
+            if index >= sizes.len() {
+                sizes.resize(index + 1, None);
+            }
+            if sizes[index].is_some() {
+                return; // 已确知，不重复计
+            }
+            sizes[index] = Some(bytes);
+            // **必须**先知道段总数，否则按需增长的 `sizes` 会在只确知前几个时
+            // 就被判成"齐了"，把一个部分和当成精确总长发布出去
+            let expect = self.seg_total.load(Ordering::Relaxed);
+            if expect > 0 && sizes.len() >= expect && sizes.iter().all(|s| s.is_some()) {
+                Some(sizes.iter().map(|s| s.unwrap()).sum::<u64>())
+            } else {
+                None
+            }
+        };
+        if let Some(total) = total_known {
+            // `store` 而非 `fetch_max`：这是事实，可以被更完整的信息覆盖
+            self.exact_total.store(total, Ordering::Relaxed);
+        }
+    }
+
+    /// 全部段的大小是否都已确知。
+    pub fn total_is_exact(&self) -> bool {
+        self.exact_total.load(Ordering::Relaxed) > 0
     }
 
     /// 切到**乱序落盘**口径（进度 = 产物已拼字节 + 各段文件字节）。
@@ -327,7 +421,12 @@ pub struct PlaylistDone {
 #[derive(Debug, Clone)]
 struct Variant {
     url: String,
+    /// `BANDWIDTH`（bit/s）—— RFC 8216 定义为**峰值**码率（peak segment bit
+    /// rate），拿它乘时长会**系统性偏高**，只作选流排序用。
     bandwidth: u64,
+    /// `AVERAGE-BANDWIDTH`（bit/s）—— 整条流的**平均**码率，才是总长的正确
+    /// 换算依据。清单没写时为 0（此时退回 `bandwidth` 并接受偏高）。
+    avg_bandwidth: u64,
     area: u64,
 }
 
@@ -396,7 +495,7 @@ fn is_master(text: &str) -> bool {
 fn parse_variants(text: &str, base: &Url) -> Vec<Variant> {
     let text = clean_text(text);
     let mut out = Vec::new();
-    let mut pending: Option<(u64, u64)> = None;
+    let mut pending: Option<(u64, u64, u64)> = None;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() {
@@ -407,23 +506,29 @@ fn parse_variants(text: &str, base: &Url) -> Vec<Variant> {
             let bandwidth = attr(&attrs, "BANDWIDTH")
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .unwrap_or(0);
+            // 平均码率：总长换算用它。清单没写就留 0，由调用方退回峰值码率
+            // （明知偏高，但总比"没有总长"好；且后台探测随后会给精确值）
+            let avg_bandwidth = attr(&attrs, "AVERAGE-BANDWIDTH")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0);
             let area = attr(&attrs, "RESOLUTION")
                 .and_then(|v| {
                     let (w, h) = v.split_once('x')?;
                     Some(w.trim().parse::<u64>().ok()? * h.trim().parse::<u64>().ok()?)
                 })
                 .unwrap_or(0);
-            pending = Some((bandwidth, area));
+            pending = Some((bandwidth, avg_bandwidth, area));
             continue;
         }
         if line.starts_with('#') {
             continue;
         }
-        if let Some((bandwidth, area)) = pending.take() {
+        if let Some((bandwidth, avg_bandwidth, area)) = pending.take() {
             if let Some(url) = resolve_url(base, line) {
                 out.push(Variant {
                     url,
                     bandwidth,
+                    avg_bandwidth,
                     area,
                 });
             }
@@ -700,8 +805,17 @@ pub async fn fetch_plan(
             let chosen = choose_variant(&variants, opts.prefer_worst)
                 .expect("变体列表非空")
                 .clone();
-            tracing::debug!(variant = %chosen.url, bandwidth = chosen.bandwidth, "主清单选流");
-            bitrate = Some(chosen.bandwidth).filter(|b| *b > 0);
+            tracing::debug!(
+                variant = %chosen.url, bandwidth = chosen.bandwidth,
+                avg_bandwidth = chosen.avg_bandwidth, "主清单选流"
+            );
+            // 总长换算优先用平均码率（BANDWIDTH 是峰值，会偏高）
+            bitrate = Some(if chosen.avg_bandwidth > 0 {
+                chosen.avg_bandwidth
+            } else {
+                chosen.bandwidth
+            })
+            .filter(|b| *b > 0);
             chain.push(cur.clone());
             cur = chosen.url;
             continue;
@@ -830,6 +944,94 @@ async fn probe_segment_sizes(
         plan.segments[*slot].size = *size;
     }
     plan.total = sum_sizes(plan);
+}
+
+/// **后台**补齐分片大小：与下载**并发**跑，只为把总长从估算收敛到**精确值**。
+///
+/// 为什么要有它：大清单不做阻塞式预探测（那会让"下载前卡几分钟"），于是总长
+/// 只能靠 `BANDWIDTH × 时长` 与外推 —— 两者都是**估算**，永远不可能准确
+/// （`BANDWIDTH` 按 RFC 8216 还是峰值码率，系统性偏高）。用户要的是"准确"，
+/// 那就得拿到**真值**。真值有两个来源，这个函数负责第二条：
+///
+/// 1. 下载响应自带的 `Content-Length`（`SegBody::declared`，免费，边下边攒）；
+/// 2. **本函数**：对"还没确知"的分片发 1 字节的 `Range: bytes=0-0`。
+///
+/// 它不阻塞下载：spawn 出去，拿到一个就 `note_segment_size` 一个；全部确知时
+/// `PlaylistStats::exact_total` 自动变成精确总长，界面随即从估算切到精确值。
+///
+/// 顺序上**先探尾部**：分片是从头开始下的，尾部那些正是"下载期间一直没人告诉
+/// 我们长度"的，先探它们能让总长尽早收敛。响应体只有 1 字节，带宽代价可忽略。
+///
+/// 服务器不支持 `Range`（回 200）时**立即整体放弃**：再探下去每个请求都会把整
+/// 段下载一遍，代价远大于"总长停在估算"。
+pub fn spawn_size_prober(
+    client: reqwest::Client,
+    plan: PlaylistPlan,
+    headers: RequestHeaders,
+    cancel: CancellationToken,
+    stats: Arc<PlaylistStats>,
+    concurrency: usize,
+) -> tokio::task::JoinHandle<()> {
+    let all: Vec<Segment> = plan
+        .init
+        .clone()
+        .into_iter()
+        .chain(plan.segments.iter().cloned())
+        .collect();
+    let n = all.len();
+    stats.reserve_segments(n);
+    // 已知大小的（`#EXT-X-BYTERANGE` 或小清单探测过）直接记账，不必再探
+    for (i, s) in all.iter().enumerate() {
+        if let Some(sz) = s.size {
+            stats.note_segment_size(i, sz);
+        }
+    }
+    tokio::spawn(async move {
+        if stats.total_is_exact() {
+            return; // 清单本身就带齐了全部长度
+        }
+        let conn = concurrency.clamp(1, SIZE_PROBE_BG_CONCURRENCY);
+        // 尾部优先：头部长度下载过程中自然会从响应里拿到，尾部只能靠探测。
+        //
+        // **加密段不探**：探测只能得到**密文**长度，而产物存的是解密后的明文
+        // （密文多 1~16 字节的 PKCS7 填充）。拿密文长度记账会让 `exact_total`
+        // 系统性偏大，进度条永远差一点点走不到 100%。加密段的真值由下载路径
+        // 自己给（解密后 `d.len()`），所以这里跳过即可 —— 代价是"全站 AES-128
+        // 加密"的清单收敛不到精确值、停在估算上，这比给个偏大的"精确值"诚实。
+        let mut todo: Vec<usize> = (0..n)
+            .filter(|i| all[*i].size.is_none() && all[*i].key.is_none())
+            .collect();
+        todo.reverse();
+        let mut stream = futures_util::stream::iter(todo)
+            .map(|i| {
+                let url = all[i].url.clone();
+                let client = &client;
+                let headers = &headers;
+                let cancel = &cancel;
+                async move {
+                    if cancel.is_cancelled() {
+                        return (i, None, true);
+                    }
+                    match crate::probe_with(client, &url, cancel, headers).await {
+                        Ok(p) if !p.accepts_ranges => (i, None, true), // 不支持 Range，整体放弃
+                        Ok(p) => (i, p.total_len.filter(|v| *v > 0), false),
+                        Err(_) => (i, None, false), // 单个失败不影响其余
+                    }
+                }
+            })
+            .buffer_unordered(conn);
+        while let Some((i, size, abort)) = stream.next().await {
+            if abort {
+                break;
+            }
+            if let Some(sz) = size {
+                stats.note_segment_size(i, sz);
+                if stats.total_is_exact() {
+                    break; // 已收敛到精确值，剩下的不用探了
+                }
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,6 +1422,12 @@ struct SegBody {
     whole: bool,
     /// `Disk` 目标：这一趟写进段文件的字节数（进度统计用）。
     on_disk: u64,
+    /// 服务器声明的**这一段的总字节数**（`Content-Range` 的 `/total`，或
+    /// `Content-Length`）。
+    ///
+    /// 这是**免费的真值**：不用任何额外请求，收分片时顺手就有。攒齐所有分片
+    /// 就能得到精确总长（[`PlaylistStats::note_segment_size`]）。
+    declared: Option<u64>,
 }
 
 /// 分片数据的落点。
@@ -1431,6 +1639,32 @@ async fn fetch_body_inner(
     if !status.is_success() {
         return Err(HttpError::Http(status.as_u16()));
     }
+    // 服务器声明的**这一段的总字节数**：206 取 `Content-Range` 的 `/total`，
+    // 200 取 `Content-Length`。免费的真值，用于把总长收敛到精确（见
+    // `PlaylistStats::note_segment_size`）。
+    //
+    // 注意 200（整段）时 `Content-Length` 就是整段长度，可直接用；206（区间）
+    // 时 `Content-Length` 只是本次区间长度，**必须**从 `Content-Range` 取总长。
+    //
+    // **`#EXT-X-BYTERANGE` 段例外，一律不报**：那几个段同属**一个**文件，
+    // `Content-Range` 的 `/total` 是**整个文件**的长度，而这一段对产物的贡献
+    // 只是清单里写的那个区间长度。照搬会把同一个文件算进去好几遍（实测
+    // `BYTERANGE:8192@0 / 12288 / 6144` 三个段会各自报 48000）。
+    // 这些段的真值清单本来就给了（`seg.size`），由 `reserve_segments` 那条
+    // 路径记账，这里返回 `None` 即"没有新信息"。
+    let declared = if seg.range.is_some() {
+        None
+    } else if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::total_from_content_range)
+    } else {
+        resp.headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    };
     // 要了区间却回整段（200 而非 206）：段内续传被无视，数据是从段首开始的
     let whole = resume_from > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT;
     if whole {
@@ -1518,6 +1752,7 @@ async fn fetch_body_inner(
         data,
         whole,
         on_disk,
+        declared,
     })
 }
 
@@ -1553,10 +1788,13 @@ async fn fetch_segment(
             let body = fetch_body(ctx, seg, target, resume_from, slot).await?;
             match (&key, &seg.key) {
                 // 加密段一律走内存目标（调用方保证）：解密要整段，没法边收边写
-                (Some(k), Some(sk)) => decrypt_segment(k, &sk.iv, &body.data).map(|d| SegBody {
-                    data: d,
-                    whole: false,
-                    on_disk: 0,
+                (Some(k), Some(sk)) => decrypt_segment(k, &sk.iv, &body.data).map(|d| {
+                    // 真值取**解密后的明文长度**，不是服务器声明的密文长度：
+                    // 产物里存的是明文，密文比它多 1~16 字节的 PKCS7 填充。
+                    // 沿用密文长度会让 `exact_total` 系统性偏大（每片多算一截），
+                    // 进度条永远差一点点走不到 100%。
+                    let n = d.len() as u64;
+                    SegBody { data: d, whole: false, on_disk: 0, declared: Some(n) }
                 }),
                 _ => Ok(body),
             }
@@ -1599,8 +1837,8 @@ pub async fn download_playlist(
     stats: Arc<PlaylistStats>,
 ) -> Result<PlaylistDone, HttpError> {
     // 总长初值（两条路径共用）：大清单不做分片预探测，先用主清单的
-    // `BANDWIDTH × 总时长` 给个像样的值 —— 界面从第一秒起就有总大小与百分比，
-    // 随后被实测外推接管。
+    // `平均码率 × 总时长` 给个像样的值 —— 界面从第一秒起就有总大小与百分比，
+    // 随后被实测外推接管，最终由后台探测收敛到**精确值**。
     if plan.total.is_none() && plan.duration_secs > 0.0 {
         if let Some(bw) = plan.bitrate {
             let est = (bw as f64 / 8.0 * plan.duration_secs) as u64;
@@ -1609,11 +1847,36 @@ pub async fn download_playlist(
             }
         }
     }
-    if opts.ordered_write {
+    // **后台补齐分片大小** → 总长收敛到精确值（零额外流量的响应头 + 1 字节
+    // 探测两条来源，见 `spawn_size_prober`）。两个前提，缺一不可：
+    //
+    // 1. `plan.total.is_none()` —— 清单本身没给全长度时才需要探；
+    // 2. `opts.probe_sizes` —— **必须尊重这个开关**。它的语义是"不要为了
+    //    拿分片大小额外发请求"（引擎把它映射到 `hls-probe-size`）。忽略它会让
+    //    "关掉预探测"的用户仍然收到一串探测请求 —— 既违背选项语义，也会在
+    //    受限站点上白白多花配额（更别提它会替下载先消耗掉服务器注入的失败
+    //    次数，把重试预算提前烧掉）。
+    let prober = if plan.total.is_none() && opts.probe_sizes {
+        Some(spawn_size_prober(
+            client.clone(),
+            plan.clone(),
+            opts.headers.clone(),
+            cancel.clone(),
+            stats.clone(),
+            opts.concurrency,
+        ))
+    } else {
+        None
+    };
+    let r = if opts.ordered_write {
         download_playlist_ordered(client, path, plan, opts, cancel, stats).await
     } else {
         download_playlist_unordered(client, path, plan, opts, cancel, stats).await
+    };
+    if let Some(p) = prober {
+        p.abort();
     }
+    r
 }
 
 /// **乱序落盘 + 顺序拼接**：每个分片边收边写进自己的段文件（不占内存），连续
@@ -1670,6 +1933,9 @@ async fn download_playlist_unordered(
     };
     stats.mark_unordered();
     stats.completed.store(spliced, Ordering::Relaxed);
+    // 段总数先告诉 stats：`note_segment_size` 据此判定"是否全部确知"
+    // （没有它会把部分和当精确总长发出去）
+    stats.reserve_segments(all.len());
     // `spilled` 的语义是"**段文件里、还没拼进产物**的字节"，与运行中由
     // `SegCount` 累加出来的口径必须一致：那里面**包含已下完但还没轮到拼的整段**
     // （段文件在、产物里还没有）。初始化时若只算"未完成的段"，已完成的段就会
@@ -1739,14 +2005,24 @@ async fn download_playlist_unordered(
     let mut done_bytes = done_bytes0;
     // 已完成段数（含续传时位图里已标好的那些）
     let mut done_segs = (0..all.len()).filter(|i| done[*i]).count();
-    // 实测外推：`已下字节 ÷ 已覆盖时长 × 总时长`，写成一次调用避免两处漂移
+    // 实测外推：`已下字节 ÷ 已覆盖时长 × 总时长`，写成一次调用避免两处漂移。
+    //
+    // 发布策略：**允许下调**（不再 `fetch_max` 只增不减）。只增不减会把开头
+    // 那个偏高值**永久锁死** —— 初值来自主清单码率（`BANDWIDTH` 按 RFC 8216
+    // 是峰值码率，系统性偏高），一旦它在第一秒被写进去，后面再准的外推也压不
+    // 下来，用户看到的就是"下载中总大小虚高、完成后才变正常"。
+    // 精度优先：样本越多越准，就该让界面跟着降。
     let publish_estimate = |stats: &PlaylistStats, bytes: u64, dur: f64, segs: usize| {
         if plan.total.is_some() || segs == 0 || dur <= 0.0 || plan.duration_secs <= 0.0 {
             return;
         }
         let est = (bytes as f64 / dur * plan.duration_secs) as u64;
         if est > 0 {
-            stats.estimated_total.fetch_max(est, Ordering::Relaxed);
+            // 精确值已经出来了就别再动（那是事实）
+            if stats.total_is_exact() {
+                return;
+            }
+            stats.estimated_total.store(est, Ordering::Relaxed);
         }
     };
     // 续传时先把已有的"整段已完成"字节喂一遍：否则恢复的头几秒里外推用的是
@@ -1859,6 +2135,10 @@ async fn download_playlist_unordered(
             Some((i, Ok(body))) => {
                 in_flight -= 1;
                 handles.remove(&i);
+                // 免费的真值：服务器在响应里声明的这一段长度 → 攒齐即为精确总长
+                if let Some(n) = body.declared {
+                    stats.note_segment_size(i, n);
+                }
                 if body.on_disk == 0 {
                     // 加密段：把解出来的明文写进段文件 —— 到这一刻才算落到盘上
                     let sf = seg_file(path, i);
@@ -2028,6 +2308,8 @@ async fn download_playlist_ordered(
         FileSink::create(path).map_err(|e| HttpError::Io(e.to_string()))?
     };
     stats.completed.store(have_bytes, Ordering::Relaxed);
+    // 段总数先告诉 stats：`note_segment_size` 据此判定"是否全部确知"
+    stats.reserve_segments(all.len());
     // 文件当前长度（终局保存水位时用；`complete_bytes` 只到最后一个完整段）
     let mut file_bytes = have_bytes;
 
@@ -2071,10 +2353,22 @@ async fn download_playlist_ordered(
         if !need_estimate || done_segs == 0 || est_done_dur <= 0.0 || plan.duration_secs <= 0.0 {
             return;
         }
+        // 精确值已经出来了就别再动（那是事实，比任何外推都准）
+        if stats.total_is_exact() {
+            return;
+        }
         let avg = est_done_bytes as f64 / done_segs as f64;
         let rest = all.len().saturating_sub(done_segs) as f64;
+        // 按"字节密度"外推（已下字节 ÷ 已覆盖时长 × 总时长）：样本越多越准。
+        // 另一个候选 `已下 + 平均段长 × 剩余段数` 只在段长均匀时才准，且**系统性
+        // 偏高**（平均段长受已完成段影响，而"已完成"在顺序模式下就是前几段），
+        // 所以只在密度外推不可用时兜底 —— 不再取两者的 max（那会把偏高值带上来）。
         let density = est_done_bytes as f64 / est_done_dur * plan.duration_secs;
-        let est = density.max(est_done_bytes as f64 + avg * rest);
+        let est = if density.is_finite() && density > 0.0 {
+            density
+        } else {
+            est_done_bytes as f64 + avg * rest
+        };
         if est.is_finite() && est > 0.0 {
             stats.estimated_total.store(est as u64, Ordering::Relaxed);
         }
@@ -2178,6 +2472,10 @@ async fn download_playlist_ordered(
             Some((i, Ok(body))) => {
                 in_flight -= 1;
                 partials.remove(&i);
+                // 免费的真值：服务器在响应里声明的这一段长度 → 攒齐即为精确总长
+                if let Some(n) = body.declared {
+                    stats.note_segment_size(i, n);
+                }
                 // 这一段的槽位"转正"：整段已收完、排在 `ready` 里等写盘，
                 // 落盘之前它没有资格算进进度（进度只认光标那一个）——清零即可。
                 stats.slot(i).store(0, Ordering::Relaxed);
@@ -2770,12 +3068,21 @@ mod tests {
             .expect("下载");
         assert_eq!(done.bytes, expected_bytes);
 
-        // 下载完成后估算应收敛到真实总长（相等分片 → 误差极小）
+        // 下载完成后"界面上的总长"应收敛到真实值（相等分片 → 误差极小）。
+        //
+        // 取值口径与引擎一致：**精确值优先**。服务器支持 `Range`，后台探测
+        // （`spawn_size_prober`）会把全部段长度补齐 → `exact_total` 直接等于
+        // 真值；此时 `publish_estimate` 会主动停手（那是事实，不该再被外推
+        // 覆盖），所以 `estimated_total` 可能停在 0 —— 这不是缺陷，两个字段的
+        // 分工就是这样。没有精确值时才看估算。
+        let exact = stats.exact_total.load(Ordering::Relaxed);
         let est = stats.estimated_total.load(Ordering::Relaxed);
-        let diff = (est as i64 - expected_bytes as i64).abs();
+        let shown = if exact > 0 { exact } else { est };
+        assert!(shown > 0, "总长应至少有一个来源（精确或估算）");
+        let diff = (shown as i64 - expected_bytes as i64).abs();
         assert!(
             diff * 100 <= (expected_bytes as i64) * 10,
-            "估算总长 {est} 与真实 {expected_bytes} 相差超过 10%"
+            "总长 {shown}（exact={exact} est={est}）与真实 {expected_bytes} 相差超过 10%"
         );
         // 没有重试时"已接收"必须正好等于产物大小：多一个字节就是把丢弃的
         // 分片算进了进度（界面会虚高），少一个则是漏记（界面会停住）
@@ -2996,11 +3303,26 @@ mod tests {
         // BYTERANGE 直接给出大小 → 无需探测即知总长
         assert_eq!(plan.total, Some((a + b + c) as u64));
         let path = dir.join("out.ts");
-        download_playlist(&client, &path, &plan, &opts, &cancel, PlaylistStats::new(0))
+        let stats = PlaylistStats::new(0);
+        download_playlist(&client, &path, &plan, &opts, &cancel, stats.clone())
             .await
             .expect("下载");
         assert_eq!(std::fs::read(&path).unwrap(), blob[..a + b + c]);
         assert_eq!(srv.hits("/m/all.ts"), 3, "每个区间各一次带 Range 的请求");
+
+        // **BYTERANGE 段不得把"整文件长度"当成自己的长度**。
+        //
+        // 这几个段同属一个文件，`Content-Range` 的 `/total` 是**整个文件**的
+        // 长度（48KB），而每段对产物的贡献只是清单里那个区间长度。若照搬
+        // `Content-Range`，三个段会各自报 48000 → 精确总长被算成 144KB，是
+        // 真实产物（26KB）的 5 倍。真值清单本来就给了，不该再从响应头取。
+        let exact = stats.exact_total.load(Ordering::Relaxed);
+        assert!(
+            exact == 0 || exact == (a + b + c) as u64,
+            "BYTERANGE 的精确总长只能是 0（未记账）或区间长度之和 {}，实际 {exact} \
+             —— 说明把整个文件的长度当成了单段的长度",
+            a + b + c
+        );
     }
 
     /// fMP4：`#EXT-X-MAP` 必须排在所有分片之前。
@@ -3377,7 +3699,13 @@ mod tests {
         let dir = tmpdir("hls-bitrate");
         // 40 > SIZE_PROBE_SAMPLE(32) → 不预探测，总长只能靠估算
         let count = 40usize;
-        let seg_size = 16 * 1024usize;
+        // **分片大小必须与声明的码率自洽**：每段 4 秒、码率 800_000 bit/s →
+        // 800_000 / 8 × 4 = 400_000 字节。构造得自洽是必要的 —— 否则实测外推
+        // （按真实字节算）会得出一个与 `BANDWIDTH × 时长` 完全不同的值，而
+        // "估算允许被修正下调"正是本次改动要保证的行为，用例就会变成在断言一个
+        // 早已被证伪的偏高值。（旧实现靠 `fetch_max` 把码率初值永久锁死，所以
+        // 分片大小随便写都能"过"，那是假通过。）
+        let seg_size = 400_000usize;
         let names: Vec<String> = (1..=count).map(|i| format!("s{i}.ts")).collect();
         let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         let mut files = HashMap::new();
@@ -3514,6 +3842,219 @@ mod tests {
             "总长估算峰值 {peak_est} 比真实总长 {real_total} 高出 30% 以上 —— \
              外推的分子把在飞分片的半截字节也算进去了（并发越高虚高越多，\
              用户看到的就是「下载中 8GB、完成后 2GB」）"
+        );
+    }
+
+    /// `note_segment_size` 只在**全部**段都确知时才发布 `exact_total`。
+    ///
+    /// 这条不变式防的是"把一个部分和当成精确总长"：`sizes` 是按需增长的，若
+    /// 不先知道段总数，只确知前几段时 `all(is_some)` 就会成立，于是把一个远小于
+    /// 真值的部分和当成"精确值"发布出去 —— 比估算还离谱（进度条瞬间冲过 100%）。
+    #[test]
+    fn exact_total_waits_until_every_segment_is_known() {
+        let s = PlaylistStats::new(0);
+        // 还没告诉它段总数：怎么报都不该发布精确值
+        s.note_segment_size(0, 100);
+        s.note_segment_size(1, 200);
+        assert_eq!(
+            s.exact_total.load(Ordering::Relaxed),
+            0,
+            "段总数未知时不得发布精确总长（那只是部分和）"
+        );
+
+        // 告诉它一共 3 段；此时只确知 2 段，仍不该发布
+        s.reserve_segments(3);
+        assert_eq!(s.exact_total.load(Ordering::Relaxed), 0, "还差一段");
+
+        // 补齐第 3 段 → 发布 100+200+300
+        s.note_segment_size(2, 300);
+        assert_eq!(s.exact_total.load(Ordering::Relaxed), 600);
+        assert!(s.total_is_exact());
+
+        // 重复上报同一段取首次（长度不会变），不得把总和算重
+        s.note_segment_size(2, 999);
+        assert_eq!(s.exact_total.load(Ordering::Relaxed), 600, "重复上报应被忽略");
+    }
+
+    /// **精确总长优先于估算，且估算能被修正下调**。
+    ///
+    /// 现场症状："下载中总大小虚高、完成后才正常"。根因是两层"只增不减"
+    /// （`fetch_max` + 引擎侧 `.max(旧值)`）把开头那个由峰值码率算出来的偏高值
+    /// 永久锁死。正确口径：估算用 `store`（跟着最新样本走，允许降），精确值一到
+    /// 就覆盖一切。
+    #[test]
+    fn exact_total_overrides_and_estimates_can_go_down() {
+        let s = PlaylistStats::new(0);
+        // 模拟"开头按峰值码率给的高值"
+        s.estimated_total.store(8_000_000_000, Ordering::Relaxed);
+        assert_eq!(s.estimated_total.load(Ordering::Relaxed), 8_000_000_000);
+
+        // 实测外推修正下调 —— 必须真的降下来（旧实现 fetch_max 会锁死在 8GB）
+        s.estimated_total.store(2_000_000_000, Ordering::Relaxed);
+        assert_eq!(
+            s.estimated_total.load(Ordering::Relaxed),
+            2_000_000_000,
+            "估算必须能下调，否则用户永远看到那个虚高的 8GB"
+        );
+
+        // 精确值一到就定格
+        s.reserve_segments(2);
+        s.note_segment_size(0, 1_000);
+        s.note_segment_size(1, 1_000);
+        assert_eq!(s.exact_total.load(Ordering::Relaxed), 2_000);
+        assert!(s.total_is_exact());
+    }
+
+    /// **外推估算必须能下调**（`publish_estimate` 里 `store` vs `fetch_max`）。
+    ///
+    /// 这是"总大小虚高"的核心：初值来自主清单 `BANDWIDTH × 时长`，而
+    /// `BANDWIDTH` 按 RFC 8216 是**峰值**码率，系统性偏高。旧实现用 `fetch_max`
+    /// 写估算，那个偏高值一旦在下载第一秒被写进去就**再也降不下来** —— 用户
+    /// 看到的就是"下载中总大小虚高、完成后才正常"。
+    ///
+    /// 这条用例**刻意关掉大小探测**（`probe_sizes: false`）把外推这条路单独隔离
+    /// 出来：否则后台探测会很快给出 `exact_total`，`publish_estimate` 主动停手，
+    /// 估算能不能下调就无从验证了（会变成假通过）。
+    ///
+    /// 清单里 `BANDWIDTH` 虚报 4 倍，且**不写 `AVERAGE-BANDWIDTH`** —— 于是初值
+    /// 必然偏高，只有靠实测外推才能把它拉回真值。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn estimate_is_corrected_downward_when_bitrate_is_inflated() {
+        use std::time::Instant;
+
+        let dir = tmpdir("hls-est-down");
+        // 40 段 > SIZE_PROBE_SAMPLE(32) → 预探测本就不会做；再显式关掉后台探测
+        let count = 40usize;
+        let seg_bytes = 32 * 1024usize;
+        let real_total = (count * seg_bytes) as u64; // 1.25MB
+                                                     // 真实码率 = 32768B/4s = 65536 bit/s，虚报 4 倍
+        let names: Vec<String> = (1..=count).map(|i| format!("s{i}.ts")).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let mut files = HashMap::new();
+        files.insert(
+            "/m/master.m3u8".to_string(),
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=262144\nv1.m3u8\n"
+                .as_bytes()
+                .to_vec(),
+        );
+        files.insert("/m/v1.m3u8".to_string(), media_playlist(&refs).into_bytes());
+        for (i, n) in names.iter().enumerate() {
+            files.insert(format!("/m/{n}"), sample(i as u8 + 1, seg_bytes));
+        }
+        let srv = start_server(files, HashMap::new()).await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        // 关掉一切"拿真值"的途径，把外推单独隔离出来
+        let po = PlaylistOptions {
+            concurrency: 8,
+            probe_sizes: false,
+            ..Default::default()
+        };
+        let plan = fetch_plan(&client, &srv.url("/m/master.m3u8"), &cancel, &[], &po)
+            .await
+            .expect("取清单");
+        assert_eq!(plan.total, None);
+        assert_eq!(plan.bitrate, Some(262_144), "应记下（偏高的）码率");
+
+        let path = dir.join("out.ts");
+        let stats = PlaylistStats::new(0);
+        let dl = tokio::spawn({
+            let client = client.clone();
+            let path = path.clone();
+            let plan = plan.clone();
+            let po = po.clone();
+            let cancel = cancel.clone();
+            let stats = stats.clone();
+            async move { download_playlist(&client, &path, &plan, &po, &cancel, stats).await }
+        });
+
+        // 逐帧采样：初值、是否观察到下调
+        let mut first = 0u64;
+        let mut prev = 0u64;
+        let mut saw_decrease = false;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(20) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let cur = stats.estimated_total.load(Ordering::Relaxed);
+            if first == 0 && cur > 0 {
+                first = cur;
+            }
+            if prev > 0 && cur > 0 && cur < prev {
+                saw_decrease = true;
+            }
+            if cur > 0 {
+                prev = cur;
+            }
+            if dl.is_finished() {
+                break;
+            }
+        }
+        let done = dl.await.expect("不应 panic").expect("下载应成功");
+        assert_eq!(done.bytes, real_total);
+
+        assert!(first > 0, "下载一开始就该有码率推算的总长");
+        assert!(
+            first > real_total,
+            "初值应由虚报的码率算出（偏高），实际 {first}，真实 {real_total}"
+        );
+        assert!(
+            saw_decrease,
+            "全程没观察到估算被下调（初值 {first}）—— `fetch_max` 把偏高值锁死了，\
+             这正是用户看到的「下载中总大小虚高」"
+        );
+        let last = stats.estimated_total.load(Ordering::Relaxed);
+        let diff = (last as i64 - real_total as i64).abs();
+        assert!(
+            diff * 100 <= (real_total as i64) * 10,
+            "最终估算 {last} 与真实 {real_total} 相差超过 10%"
+        );
+    }
+
+    /// 精确总长一旦确定，就不该再被外推覆盖（`publish_estimate` 的守卫）。
+    ///
+    /// 走真实下载：40 段（> `SIZE_PROBE_SAMPLE`，不预探测）、每段等大。服务器
+    /// 支持 `Range`，所以后台探测会把全部段长度补齐 → `exact_total` 必须等于
+    /// 真实总长，且下载结束时 `estimated_total` 不得再压过它。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn background_probe_converges_to_exact_total() {
+        let dir = tmpdir("hls-exact-total");
+        let count = 40usize;
+        let seg_size = 64 * 1024usize;
+        let names: Vec<String> = (1..=count).map(|i| format!("s{i}.ts")).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let mut files = HashMap::new();
+        // 清单**不带** BANDWIDTH/时长：总长只能靠探测与外推
+        files.insert("/m/index.m3u8".to_string(), media_playlist(&refs).into_bytes());
+        for (i, n) in names.iter().enumerate() {
+            files.insert(format!("/m/{n}"), sample(i as u8 + 1, seg_size));
+        }
+        let srv = start_server(files, HashMap::new()).await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        let po = PlaylistOptions::default();
+        let plan = fetch_plan(&client, &srv.url("/m/index.m3u8"), &cancel, &[], &po)
+            .await
+            .expect("取清单");
+        assert_eq!(plan.total, None, "这条用例要的是「靠探测收敛」的路径");
+        let real_total = (count * seg_size) as u64;
+
+        let path = dir.join("out.ts");
+        let stats = PlaylistStats::new(0);
+        let done = download_playlist(&client, &path, &plan, &po, &cancel, stats.clone())
+            .await
+            .expect("下载应成功");
+        assert_eq!(done.bytes, real_total);
+        // 服务器支持 Range → 后台探测应把全部段长度补齐，收敛到精确值
+        assert!(
+            stats.total_is_exact(),
+            "服务器支持 Range 时应收敛到精确总长，实际 exact_total=0"
+        );
+        assert_eq!(
+            stats.exact_total.load(Ordering::Relaxed),
+            real_total,
+            "精确总长必须等于产物真实字节数"
         );
     }
 }
