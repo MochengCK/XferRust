@@ -216,7 +216,7 @@ impl NativeDispatcher {
             "engine.getVersion" => Ok(json!({
                 "name": ENGINE_NAME,
                 "version": ENGINE_VERSION,
-                "features": ["http", "resume", "checksum", "bt", "events", "bitfield", "wanted-bitfield", "ban-peer", "change-uri", "get-servers", "verify-files"],
+                "features": ["http", "resume", "checksum", "bt", "hls", "events", "bitfield", "wanted-bitfield", "ban-peer", "change-uri", "get-servers", "verify-files"],
             })),
             "engine.globalStat" => Ok(e.global_stat_native()),
             "engine.getOptions" => Ok(e.get_global_option()),

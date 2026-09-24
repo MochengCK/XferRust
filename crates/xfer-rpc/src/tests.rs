@@ -37,6 +37,18 @@ async fn native_get_version_and_stat() {
     assert_eq!(v["result"]["version"], ENGINE_VERSION);
     assert_eq!(v["result"]["name"], ENGINE_NAME);
 
+    // 能力列表直接展示在应用「进阶设置 → 引擎信息」卡片上，新增传输能力
+    // （例如 HLS）时必须同步进来，否则引擎明明支持、界面上却看不到。
+    let feats = v["result"]["features"]
+        .as_array()
+        .expect("features 必须是数组");
+    for expected in ["http", "bt", "hls", "resume", "bitfield"] {
+        assert!(
+            feats.iter().any(|f| f == expected),
+            "features 缺少 {expected}：{feats:?}"
+        );
+    }
+
     let s = handle(
         &router,
         r#"{"jsonrpc":"2.0","id":2,"method":"engine.globalStat","params":{}}"#,
