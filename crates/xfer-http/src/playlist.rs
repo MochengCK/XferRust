@@ -1843,7 +1843,11 @@ pub async fn download_playlist(
         if let Some(bw) = plan.bitrate {
             let est = (bw as f64 / 8.0 * plan.duration_secs) as u64;
             if est > 0 {
-                stats.estimated_total.fetch_max(est, Ordering::Relaxed);
+                // 与 `publish_estimate` 同口径：**`store` 而非 `fetch_max`**。
+                // 此处 `stats` 是全新的（初值 0），两者行为等价，但"估算一律
+                // `store`"是这一版的核心不变式（只增不减会把偏高值永久锁死），
+                // 留一处 `fetch_max` 会让它字面失效、误导后续维护。
+                stats.estimated_total.store(est, Ordering::Relaxed);
             }
         }
     }
