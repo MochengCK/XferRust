@@ -3945,7 +3945,23 @@ mod tests {
         for (i, n) in names.iter().enumerate() {
             files.insert(format!("/m/{n}"), sample(i as u8 + 1, seg_bytes));
         }
-        let srv = start_server(files, HashMap::new()).await;
+        // 分片响应改成"分块慢发"：本地回环下 40×32KB 几毫秒就下完了，10ms 的
+        // 采样间隔抓不到"初值偏高"那一帧 —— 段长均匀时外推第一次就能给出真值，
+        // `estimated_total` 早已被覆盖（CI 上就是这样偶发失败的）。
+        // 每块 8KB、间隔 30ms → 每段约 120ms，8 并发下总时长约 600ms，
+        // 采样窗口足够宽；慢速传输不影响"外推把偏高初值拉回真值"这一被验证的行为。
+        let mut trickle = HashMap::new();
+        for n in &names {
+            trickle.insert(format!("/m/{n}"), (8 * 1024usize, 30u64));
+        }
+        let srv = start_server_opts(
+            files,
+            ServerOpts {
+                trickle,
+                ..Default::default()
+            },
+        )
+        .await;
 
         let client = crate::build_client();
         let cancel = CancellationToken::new();
