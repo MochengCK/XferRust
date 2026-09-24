@@ -259,6 +259,21 @@ pub struct TrackerSubscription {
 }
 
 /// 引擎核心：任务生命周期管理。
+/// HTTP 客户端后台构建期间置位"忙碌"的标志守卫。
+///
+/// 析构时清除标志——包括构建 panic 的 unwind 路径，否则任务驱动会永久
+/// 等在 [`TaskManager::wait_client_ready`] 上。
+struct ClientBuildGuard(tokio::sync::watch::Sender<bool>);
+
+impl Drop for ClientBuildGuard {
+    fn drop(&mut self) {
+        // 用 `send_replace` 而不是 `send`：`watch::Sender::send` 在"当前没有
+        // 接收者"时会失败**且不更新值**（初始化时 Receiver 已被丢弃），
+        // 那样标志会永远停在 true、任务永久等在门口。
+        self.0.send_replace(false);
+    }
+}
+
 pub struct TaskManager {
     inner: Mutex<Inner>,
     /// 活动 BT 引擎注册表（gid → 引擎）：全局限速变更时下发
@@ -273,6 +288,26 @@ pub struct TaskManager {
     events: broadcast::Sender<EngineEvent>,
     /// HTTP 客户端（按 `user-agent` / `all-proxy` 全局选项构建，变更时重建）。
     client: std::sync::RwLock<reqwest::Client>,
+    /// `client` **当前生效**的 `(user-agent, all-proxy, no-proxy)` 签名。
+    ///
+    /// 两个用途，都与"构建 reqwest 客户端很慢"有关（启用了
+    /// `rustls-tls-native-roots`，每次构建都要读系统证书库——macOS 上是
+    /// 钥匙串，实测 0.5~2.5s）：
+    ///
+    /// 1. **跳过无变化的重建**：应用端启动时会连续推送多次全局配置
+    ///    （`changeGlobalOption`），每次都带 `user-agent`；无条件重建等于
+    ///    每次白等 1~2 秒。
+    /// 2. 重建改为后台执行时，用它在构建完成前就认领新值（见
+    ///    [`Self::rebuild_http_client`]）。
+    client_sig: Mutex<Option<(Option<String>, Option<String>, Option<String>)>>,
+    /// 客户端**重建进行中**的标志（`true` = 后台正在构建）。
+    ///
+    /// 任务驱动开跑前会等它就绪：引擎启动时由 CLI 注入 `all-proxy` /
+    /// `user-agent` 会触发一次后台重建，而会话恢复的任务在 `serve` 之后
+    /// 立刻开跑——正好落在重建窗口里，拿到旧客户端直连，于是"配置里明明
+    /// 填了代理，下载却仍 403"。用 `watch` 而不是 `Notify`：等待方可能
+    /// 晚于通知方注册，`watch` 始终能读到当前值，不会漏掉唤醒。
+    client_busy: tokio::sync::watch::Sender<bool>,
     /// 上次落盘会话内容的哈希：内容未变化时跳过写盘（30s 定期保存此前
     /// 无条件重写整份会话——分片位图可达数百 KB，空闲时纯属重复 IO）。
     session_hash: std::sync::atomic::AtomicU64,
@@ -309,6 +344,8 @@ impl TaskManager {
             sub_pending: Mutex::new(Vec::new()),
             events: tx,
             client: std::sync::RwLock::new(xfer_http::build_client()),
+            client_sig: Mutex::new(None),
+            client_busy: tokio::sync::watch::channel(false).0,
             session_hash: std::sync::atomic::AtomicU64::new(0),
             shutdown_token: CancellationToken::new(),
         })
@@ -324,7 +361,7 @@ impl TaskManager {
     /// 只被存下来、从不生效 —— 表现为"配置里明明填了代理，下载却仍是直连"，
     /// 对按地区/机房 IP 做拦截的 CDN 直接返回 403。桌面端每次启动都走这条
     /// 路径注入配置，所以这不是边角情况。
-    pub fn set_initial_options(&self, opts: &[(String, String)]) {
+    pub fn set_initial_options(self: &Arc<Self>, opts: &[(String, String)]) {
         let client_changed = {
             let mut inner = self.inner.lock().unwrap();
             let mut changed = false;
@@ -345,8 +382,11 @@ impl TaskManager {
     ///
     /// 唯一实现：CLI 注入（[`Self::set_initial_options`]）与运行期热更新
     /// （`changeGlobalOption`）都必须走这里，否则两条路各写一份，迟早分叉。
-    fn rebuild_http_client(&self) {
-        let (ua, proxy, no_proxy) = {
+    /// 返回 `true` 表示**确实触发了一次重建**（在后台线程进行）；`false` 表示
+    /// 目标值与当前生效的一致、已跳过。返回值只为可测性：应用端启动会连续
+    /// 推送多次全局配置，跳过与否直接决定这几次调用是否各白等 1~2 秒。
+    fn rebuild_http_client(self: &Arc<Self>) -> bool {
+        let sig = {
             let g = self.inner.lock().unwrap().global_options.clone();
             (
                 g.get("user-agent").cloned(),
@@ -354,13 +394,61 @@ impl TaskManager {
                 g.get("no-proxy").cloned(),
             )
         };
-        *self.client.write().unwrap() =
-            xfer_http::build_client_with(ua.as_deref(), proxy.as_deref(), no_proxy.as_deref());
-        tracing::info!(
-            proxy = proxy.as_deref().unwrap_or("(直连)"),
-            user_agent = ua.as_deref().unwrap_or("(引擎默认)"),
-            "HTTP 客户端已按 user-agent / all-proxy / no-proxy 重建"
-        );
+        {
+            let mut cur = self.client_sig.lock().unwrap();
+            if *cur == Some(sig.clone()) {
+                // 当前客户端就是按这组值建的：跳过。应用端启动时会连续推送
+                // 多次全局配置，每次都带 user-agent，不去重就是每次白等 1~2 秒。
+                return false;
+            }
+            // 先认领新签名，避免并发触发重复构建
+            *cur = Some(sig.clone());
+        }
+        // **必须离开调用线程**：构建 reqwest 客户端会加载系统根证书
+        // （`rustls-tls-native-roots`，macOS 上读钥匙串），实测 0.5~2.5 秒。
+        // 此前它在启动路径上同步执行，把「引擎可响应 RPC」推到 4 秒上下，
+        // 而应用侧的 RPC 超时是 5 秒——叠加几次配置推送就报
+        // `JSONRPC call timeout: engine.getVersion`（界面里引擎版本显示
+        // Unknown、任务列表拉不出来）。这里用独立线程而非 tokio::spawn：
+        // 它是纯阻塞调用，丢进 runtime 只会换个地方堵。
+        // 标记重建进行中：任务驱动会等它就绪再开跑（`send_replace`：此刻
+        // 可能还没有接收者，普通 `send` 会失败且不更新值）
+        self.client_busy.send_replace(true);
+        let me = self.clone();
+        std::thread::spawn(move || {
+            // 无论构建是否成功都要清标志（`build_client_with` 失败会 panic，
+            // guard 在 unwind 时同样会清），否则任务会永久等在门口
+            let _ready = ClientBuildGuard(me.client_busy.clone());
+            let (ua, proxy, no_proxy) = sig;
+            let client = xfer_http::build_client_with(
+                ua.as_deref(),
+                proxy.as_deref(),
+                no_proxy.as_deref(),
+            );
+            *me.client.write().unwrap() = client;
+            tracing::info!(
+                proxy = proxy.as_deref().unwrap_or("(直连)"),
+                user_agent = ua.as_deref().unwrap_or("(引擎默认)"),
+                "HTTP 客户端已按 user-agent / all-proxy / no-proxy 重建"
+            );
+        });
+        true
+    }
+
+    /// 等 HTTP 客户端重建完成。任务驱动在开跑前调用。
+    ///
+    /// 引擎启动时 CLI 注入 `all-proxy` / `user-agent` 会触发一次后台重建
+    /// （构建 reqwest 客户端要读系统证书库，实测 0.5~2.5s），而会话恢复的
+    /// 任务在 `serve` 之后立刻开跑——不等就会拿到旧客户端直连，表现为
+    /// "配了代理仍 403"。代价是首个任务最多多等一次构建的时间。
+    async fn wait_client_ready(&self) {
+        let mut rx = self.client_busy.subscribe();
+        while *rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                // 发送端已销毁（管理器正在释放）：不再等待
+                break;
+            }
+        }
     }
 
     /// 启动调度器循环（须在 tokio runtime 内调用，幂等性由调用方保证）。
@@ -2157,7 +2245,7 @@ impl TaskManager {
     // 全局选项
     // ------------------------------------------------------------------
 
-    pub fn change_global_option(&self, options: &Value) -> Result<(), String> {
+    pub fn change_global_option(self: &Arc<Self>, options: &Value) -> Result<(), String> {
         let Some(opts) = options.as_object() else {
             return Err("options 必须是对象".into());
         };
@@ -2298,6 +2386,8 @@ impl TaskManager {
                     | "hls-variant"
                     | "hls-probe-size"
                     | "hls-segment-retries"
+                    | "hls-concurrency"
+                    | "hls-write-mode"
             ) {
                 // HTTP 分片参数 / BT 连接参数 / BT 做种配置 / 网络发现开关
                 // / 磁力存种子 / 磁盘缓存 / HTTP 续传与客户端配置 / HLS
@@ -2306,6 +2396,28 @@ impl TaskManager {
                 if k == "bt-seed-time" && v.trim().parse::<u64>().is_err() {
                     tracing::warn!(value = %v, "bt-seed-time 取值无效（应为分钟数），已忽略该键");
                     continue;
+                }
+                if k == "hls-concurrency" {
+                    // 1..=64（引擎内部上限）；**空串 = 自动** —— 恢复默认由
+                    // 「显式设置过的 split / max-connection-per-server」推导，
+                    // 不能当成非法值跳过（跳过会让旧值留在配置里）。
+                    let t = v.trim();
+                    let ok = t.is_empty()
+                        || t.parse::<usize>()
+                            .map(|n| (1..=64).contains(&n))
+                            .unwrap_or(false);
+                    if !ok {
+                        tracing::warn!(value = %v, "hls-concurrency 取值无效（应为 1-64 或留空），已忽略该键");
+                        continue;
+                    }
+                }
+                if k == "hls-write-mode" {
+                    let m = v.trim().to_ascii_lowercase();
+                    // 空串 = 恢复默认（乱序落盘）
+                    if !m.is_empty() && !matches!(m.as_str(), "unordered" | "ordered") {
+                        tracing::warn!(value = %v, "hls-write-mode 取值无效（应为 unordered / ordered 或留空），已忽略该键");
+                        continue;
+                    }
                 }
                 if k == "disk-cache" && parse_size_bytes(&v).is_none() {
                     tracing::warn!(value = %v, "disk-cache 取值无效（应为字节数或 K/M/G 后缀），已忽略该键");
@@ -4316,6 +4428,10 @@ async fn drive_download(
     task: &Arc<Task>,
     cancel: &CancellationToken,
 ) -> Result<(), TaskFailure> {
+    // 等客户端重建完成再开跑：引擎启动时由 CLI 注入 all-proxy/user-agent
+    // 会触发一次后台重建，会话恢复的任务在 serve 之后立刻开跑，不等就会
+    // 拿到旧客户端直连——配置里填了代理，下载却仍 403。
+    mgr.wait_client_ready().await;
     let mut last_err: Option<TaskFailure> = None;
     let mut path_reset_done = false;
     // URI 列表快照：驱动期间 changeUri 可能并发更新（仅 waiting/paused
@@ -4578,6 +4694,8 @@ async fn drive_playlist(
     task: &Arc<Task>,
     cancel: &CancellationToken,
 ) -> Result<(), TaskFailure> {
+    // 同上：HLS 是最容易撞上重建窗口的（清单只有一个，且会话恢复时会立刻重下）
+    mgr.wait_client_ready().await;
     let uris_snapshot = task.uris.lock().unwrap().clone();
     let mut last_err: Option<TaskFailure> = None;
     for (idx, uri) in uris_snapshot.iter().enumerate() {
@@ -5243,29 +5361,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mgr = TaskManager::start(dir.clone(), 1);
-        // 模拟引擎启动时由命令行注入的运行时选项（桌面端每次启动都走这里）
+        // 模拟引擎启动时由命令行注入的运行时选项（桌面端每次启动都走这里）。
+        // **注入必须立刻返回**：构建 reqwest 客户端要读系统证书库（macOS 上
+        // 是钥匙串，实测 0.5~2.5s），同步做会把「引擎可响应 RPC」推到 4s 上下，
+        // 顶着应用侧 5s 的 RPC 超时（表现为引擎版本 Unknown、任务列表拉不出来）。
+        let t0 = std::time::Instant::now();
         mgr.set_initial_options(&[
             ("all-proxy".to_string(), format!("http://127.0.0.1:{port}")),
             ("user-agent".to_string(), "UnitUA/9".to_string()),
         ]);
+        let inject_cost = t0.elapsed();
+        assert!(
+            inject_cost < Duration::from_millis(200),
+            "set_initial_options 不应阻塞在客户端构建上（实际 {inject_cost:?}）"
+        );
 
-        let client = mgr.client.read().unwrap().clone();
-        let body = client
-            .get("http://example.invalid/should-go-through-proxy")
-            .send()
-            .await
-            .expect("请求应走假代理")
-            .text()
-            .await
-            .unwrap();
-        assert_eq!(body, "PROXIED", "set_initial_options 注入的 all-proxy 没有生效");
+        // 重建在后台线程进行：轮询等新客户端上线。
+        // 判据必须是**拿到假代理的响应**——旧客户端仍会走环境变量代理
+        // （`HTTP_PROXY` 等）并拿到一个 502 响应体，那是成功的 HTTP 响应
+        // 而不是 Err，只看"请求是否返回"会把旧客户端误判为就绪。
+        let mut body = String::new();
+        for _ in 0..60 {
+            let client = mgr.client.read().unwrap().clone();
+            let req = client.get("http://example.invalid/should-go-through-proxy");
+            if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_millis(500), req.send()).await
+            {
+                let text = resp.text().await.unwrap_or_default();
+                if text == "PROXIED" {
+                    body = text;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            body, "PROXIED",
+            "set_initial_options 注入的 all-proxy 没有生效（等待后台重建超时）"
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 1, "请求没有打到代理端口");
         assert_eq!(
             mgr.get_global_option()["all-proxy"],
             serde_json::json!(format!("http://127.0.0.1:{port}"))
         );
 
+        // 幂等：同一组值再触发一次不应重建。应用端启动后会连续推送多次全局
+        // 配置（system / user 各一次，且都带 user-agent），不去重就是每次
+        // 白等一次客户端构建，叠加起来正是 RPC 超时的来源。
+        assert!(
+            !mgr.rebuild_http_client(),
+            "值未变化时不应重复重建客户端"
+        );
+        // 值真变了才重建；且 set_initial_options 内部已按新值触发过一次，
+        // 紧随其后再调应被签名去重挡下
+        mgr.set_initial_options(&[("user-agent".to_string(), "UnitUA/10".to_string())]);
+        assert!(
+            !mgr.rebuild_http_client(),
+            "set_initial_options 已按新值触发重建，紧随其后应被跳过"
+        );
+
         proxy.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 客户端重建期间，任务驱动必须等在门口：否则会话恢复的任务会拿旧
+    /// 客户端直连（配置里填了代理、下载却仍 403）。
+    #[tokio::test]
+    async fn wait_client_ready_blocks_until_rebuild_done() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = std::env::temp_dir().join(format!("xfer-client-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = TaskManager::start(dir.clone(), 1);
+
+        // 先置"重建进行中"，再让等待方起来（顺序反了就成了"先放行才置忙"）
+        mgr.client_busy.send_replace(true);
+        let done = Arc::new(AtomicBool::new(false));
+        let done_in_task = done.clone();
+        let mgr_in_task = mgr.clone();
+        let waiter = tokio::spawn(async move {
+            mgr_in_task.wait_client_ready().await;
+            done_in_task.store(true, Ordering::SeqCst);
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "重建未完成时不应放行任务"
+        );
+
+        // 构建完成 → 放行
+        mgr.client_busy.send_replace(false);
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("重建完成后应立刻唤醒等待方")
+            .unwrap();
+        assert!(done.load(Ordering::SeqCst));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5316,6 +5508,56 @@ mod tests {
         assert_eq!(conn(), 2);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// HLS 全局选项（应用「偏好设置 → 传输设置」里那几项）：
+    /// 合法值存下、非法值只跳过该键（不中断整批、不覆盖已存值），
+    /// **空串按"恢复默认"接受** —— 用户把某项改回「自动」时必须真的写进去，
+    /// 否则引擎会一直沿用上一次的值。
+    #[tokio::test]
+    async fn hls_global_options_validate_and_store() {
+        let dir = std::env::temp_dir().join(format!("xfer-hls-globals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = TaskManager::new(dir.clone(), 1);
+
+        mgr.change_global_option(&serde_json::json!({
+            "hls-variant": "worst",
+            "hls-write-mode": "ordered",
+            "hls-concurrency": "32",
+            "hls-segment-retries": "5",
+            "hls-probe-size": false,
+        }))
+        .unwrap();
+        let g = mgr.get_global_option();
+        assert_eq!(g["hls-variant"], serde_json::json!("worst"));
+        assert_eq!(g["hls-write-mode"], serde_json::json!("ordered"));
+        assert_eq!(g["hls-concurrency"], serde_json::json!("32"));
+        assert_eq!(g["hls-segment-retries"], serde_json::json!("5"));
+        assert_eq!(g["hls-probe-size"], serde_json::json!("false"));
+
+        // 非法值：跳过该键（保留原值），整批其余键照常生效
+        mgr.change_global_option(&serde_json::json!({
+            "hls-concurrency": "0",
+            "hls-write-mode": "random",
+            "hls-variant": "worst",
+        }))
+        .unwrap();
+        let g = mgr.get_global_option();
+        assert_eq!(g["hls-concurrency"], serde_json::json!("32"), "非法并发不应覆盖旧值");
+        assert_eq!(g["hls-write-mode"], serde_json::json!("ordered"), "非法落盘方式不应覆盖旧值");
+
+        // 空串 = 恢复默认
+        mgr.change_global_option(&serde_json::json!({
+            "hls-concurrency": "",
+            "hls-write-mode": "",
+        }))
+        .unwrap();
+        let g = mgr.get_global_option();
+        assert_eq!(g["hls-concurrency"], serde_json::json!(""), "空串必须被接受（恢复自动）");
+        assert_eq!(g["hls-write-mode"], serde_json::json!(""), "空串必须被接受（恢复乱序）");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@
 - Resume continues from the last durable contiguous prefix; if the playlist changes, the download restarts from scratch instead of gluing two different playlists together
 - Per-task request headers (`header` / `referer` / `user-agent`) now apply to the playlist, the key and every segment as well
 - `.m3u8` URLs are now downloaded as playlists by default (see Behavior Changes)
+- Fixed the configured proxy never taking effect: the injected proxy was only stored in the options without rebuilding the HTTP client, so every download went out directly and CDNs that block by region or datacenter IP answered with 403
 
 ## New Features
 
@@ -30,7 +31,7 @@
 - Unsupported cases fail loudly instead of producing a broken file: `SAMPLE-AES` encryption is rejected outright, and when a URL looks like a playlist by extension but the content is not one (a 403 error page, say) the task fails rather than saving that page as a video.
 - When a URL does not look like a playlist but the response declares `mpegurl` (e.g. `application/vnd.apple.mpegurl`), it is tried as a playlist first; if the content really is not a playlist, the download falls back to plain HTTP — neither kind of URL fails because of the sniffing.
 
-### HLS options (`hls-concurrency` / `hls-variant` / `hls-probe-size` / `hls-segment-retries`)
+### HLS options (`hls-concurrency` / `hls-write-mode` / `hls-variant` / `hls-probe-size` / `hls-segment-retries`)
 
 - **Write mode (`hls-write-mode`)**: `unordered` (default) writes each segment straight into its own segment file and splices the contiguous prefix into the output as soon as it is ready; `ordered` is the previous behavior (write the output in playlist order while downloading, so the partial output is a playable prefix). Out-of-order writing fixes three things at once: (1) **throughput** — nothing has to be buffered in memory waiting for its turn, so the "stop dispatching when the memory budget is full" gate is gone and connections keep working while the head segment is slow; (2) **progress** — bytes that land in segment files count immediately, so progress equals the real bytes on disk and matches the reported speed (in-order mode can only absorb the head segment rate, which is why the UI showed "a few MB/s but only a few KB of progress"); (3) **zero loss on pause** — everything downloaded lives in segment files (including partial ones) and resumes from each file length. The cost is splicing segment files into the output when finishing (local sequential I/O, ~1-2s per GB); segments are spliced and deleted as you go, so peak disk usage does not double. Both modes produce a **byte-identical** output.
 - `hls-concurrency` sets the segment concurrency (number of in-flight requests, capped at 64) directly. When omitted it is derived from the user's **explicitly set** `max-connection-per-server` / `split` (the smaller of the two when both are set) and defaults to 16 when neither is set.
@@ -39,6 +40,12 @@
 - `hls-segment-retries` sets the transient-failure retry count for a single segment (3 by default).
 - The per-task `max-download-limit` applies as well.
 - `hls=false` forces plain HTTP downloading for a URL whose extension looks like a playlist.
+
+## Bug Fixes
+
+- Fixed the proxy from the configuration never taking effect: the proxy injected on the engine's command line was only written into the options without rebuilding the HTTP client, so every download went out directly and CDNs that block by region or datacenter IP answered with 403. The client is now rebuilt as soon as the options are injected, and tasks that are about to start are held back until that rebuild finishes, so a task that happens to land inside the rebuild window no longer goes out directly with the old client.
+- Fixed the engine becoming slow to start — and briefly unreachable over RPC — once the proxy worked: rebuilding the HTTP client loads the system root certificate store (the keychain on macOS), which takes 0.5–2.5s per build, and the client pushes its global options several times in a row at startup, each one treated as a rebuild. Rebuilding is now idempotent (skipped when the values are unchanged) and runs on a background thread; time to a responsive RPC endpoint went from about 4s back to about 1.2s.
+- Fixed `hls-concurrency` / `hls-write-mode` not taking effect as global options: neither key was on the global whitelist, so both were logged as "not supported yet, ignored" and dropped. They are whitelisted now, with validation (concurrency accepts 1–64 or an empty string, write mode accepts `unordered` / `ordered` or an empty string, where an empty string restores the default); an invalid value only skips that key and never overwrites the stored one.
 
 ## Behavior Changes
 
