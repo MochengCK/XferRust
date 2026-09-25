@@ -3267,9 +3267,13 @@ impl TaskManager {
     }
 
     /// 任务服务器列表（原生 task.getServers，aria2 getServers 兼容形状）。
-    /// HTTP 任务返回当前 URI 的汇总条目（本引擎同一时刻仅对一个 URI
-    /// 活跃，逐服务器语义上即单条目）；BT 任务无服务器概念返回空数组。
-    /// 汇总条目的 downloadSpeed/downloadLength 为任务级实时值。
+    ///
+    /// HTTP 任务：**逐连接**返回当前在飞的请求明细（主机 / 已收字节 /
+    /// 实时速率）——分片下载同一条 URI 会开多条连接，界面"连接详情"
+    /// 展示的连接数/每连接速度即来自这里；此前这里写死单条目，
+    /// 界面上永远只看到 1 个连接。没有在飞连接（单连接路径、暂停中、
+    /// 分片协程都在等段）时回退为一条汇总条目，速度取任务级实时值。
+    /// BT 任务无服务器概念返回空数组。
     pub fn get_servers(&self, gid: &Gid) -> Result<Value, String> {
         let task = self.task_of(gid)?;
         if task.bt_meta.lock().unwrap().is_some()
@@ -3284,15 +3288,42 @@ impl TaskManager {
         let Some(uri) = task.uris.lock().unwrap().first().cloned() else {
             return Ok(Value::Array(vec![]));
         };
-        let entry = json!({
-            "index": 1,
-            "servers": [{
+        let conns = task
+            .http_split_stats
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.conn_snapshot())
+            .unwrap_or_default();
+        // 只上报**在飞**连接：连接表为防抖动保留了刚结束请求的残影
+        // （TTL 内），全量上报会让界面"总连接数"虚高于真实并发
+        // （实测 split=8 的下载可显示到 24 行）。无在飞连接时回退汇总条目。
+        let live: Vec<xfer_http::ConnSnapshot> = conns.into_iter().filter(|c| c.active).collect();
+        let servers: Vec<Value> = if live.is_empty() {
+            vec![json!({
                 "index": 1,
                 "currentUri": uri.clone(),
                 "uri": uri,
                 "downloadSpeed": task.speed_live(),
                 "downloadLength": task.completed_live(),
-            }],
+            })]
+        } else {
+            live.iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    json!({
+                        "index": i + 1,
+                        "currentUri": uri.clone(),
+                        "uri": uri,
+                        "downloadSpeed": c.speed,
+                        "downloadLength": c.downloaded,
+                    })
+                })
+                .collect()
+        };
+        let entry = json!({
+            "index": 1,
+            "servers": servers,
         });
         Ok(Value::Array(vec![entry]))
     }
@@ -4573,10 +4604,13 @@ async fn try_uri(
         let pieces = xfer_http::PieceTrack::new(total, opts.min_split_size);
         stats.attach_pieces(pieces.clone());
         *task.http_pieces.write().unwrap() = Some(pieces);
+        // 连接统计句柄挂到任务：getServers 据此返回逐连接明细
+        *task.http_split_stats.write().unwrap() = Some(stats.clone());
         let sampler = spawn_split_sampler(task, &stats);
         let r = xfer_http::download_split(client, uri, &path, total, &opts, cancel, stats.clone())
             .await;
         sampler.abort();
+        *task.http_split_stats.write().unwrap() = None;
         match r {
             Ok(_) => {
                 {

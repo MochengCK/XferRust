@@ -237,6 +237,10 @@ pub struct Task {
     /// 维护；BT 任务不使用——分片信息来自 bt_meta）。暂停后保留最后
     /// 已知状态供 UI 展示；未知总长或不支持 Range 的任务为 None。
     pub http_pieces: RwLock<Option<Arc<xfer_http::PieceTrack>>>,
+    /// HTTP 分片下载的实时统计句柄（下载进行中挂接；`getServers`
+    /// 经它读**逐连接**明细——主机/已收字节/实时速率，供界面
+    /// "连接详情"展示真实连接数）。
+    pub http_split_stats: RwLock<Option<Arc<xfer_http::SplitStats>>>,
     /// 磁力任务等待文件选择：元数据就绪后自动暂停，等用户在 TUI
     /// 勾选要下载的文件（`bt-file-selection` 任务选项置位）。
     pub awaiting_selection: AtomicBool,
@@ -319,6 +323,7 @@ impl Task {
             bt_peers: Mutex::new(Vec::new()),
             bt_bitfield: Mutex::new(Vec::new()),
             http_pieces: RwLock::new(None),
+            http_split_stats: RwLock::new(None),
             awaiting_selection: AtomicBool::new(false),
             selected_files: Mutex::new(None),
             created_at: SystemTime::now(),
@@ -381,6 +386,7 @@ impl Task {
             bt_peers: Mutex::new(Vec::new()),
             bt_bitfield: Mutex::new(Vec::new()),
             http_pieces: RwLock::new(None),
+            http_split_stats: RwLock::new(None),
             awaiting_selection: AtomicBool::new(false),
             selected_files: Mutex::new(None),
             created_at: SystemTime::now(),
@@ -443,6 +449,7 @@ impl Task {
             bt_peers: Mutex::new(Vec::new()),
             bt_bitfield: Mutex::new(Vec::new()),
             http_pieces: RwLock::new(None),
+            http_split_stats: RwLock::new(None),
             awaiting_selection: AtomicBool::new(false),
             selected_files: Mutex::new(None),
             created_at: SystemTime::now(),

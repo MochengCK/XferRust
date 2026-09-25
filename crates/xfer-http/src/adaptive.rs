@@ -113,8 +113,10 @@ pub enum ScheduleAction {
     /// `conn_id` 为决策依据的段 ID；写线程发现其已失效
     /// （完成/已切分）时回退「收缩剩余最多者」。
     Shrink { conn_id: usize, reclaim_bytes: u64 },
-    /// 退役该连接（停滞或持续低效）。
-    Retire,
+    /// 退役该连接（停滞或持续低效）：携带其段 ID，写线程据此把剩余
+    /// 区间**转交**给新连接（只减员不换人解决不了停滞——换一条新连接
+    /// 才会真正推进，等价于用户手动"暂停再继续"）。
+    Retire { conn_id: usize },
     /// 新增一个连接。
     Spawn,
 }
@@ -291,9 +293,9 @@ impl AdaptiveScheduler {
         for &(conn_id, throughput, _delta, seen, stall_count, assigned_range) in &perf_snapshots
         {
             if stall_count >= self.config.stall_eval_limit && n_active > 1 {
-                // 停滞连接 → 退役
-                actions.push(ScheduleAction::Retire);
-                tracing::debug!(conn_id, stall_count, "自适应调度：退役停滞连接");
+                // 停滞连接 → 转交其剩余区间（写线程换人）
+                actions.push(ScheduleAction::Retire { conn_id });
+                tracing::debug!(conn_id, stall_count, "自适应调度：停滞连接，剩余区间转交");
                 continue;
             }
 
@@ -455,7 +457,9 @@ mod tests {
         tx.send(report(1, 500_000, 10_000_000)).unwrap(); // B 将停滞
         let actions = s.evaluate(); // 预热：不计停滞
         assert!(
-            !actions.iter().any(|a| matches!(a, ScheduleAction::Retire)),
+            !actions
+                .iter()
+                .any(|a| matches!(a, ScheduleAction::Retire { .. })),
             "预热窗口不应退役: {actions:?}"
         );
         let mut a_bytes = 1_000_000u64;
@@ -466,7 +470,9 @@ mod tests {
             tx.send(report(0, a_bytes, 10_000_000)).unwrap(); // A 前进
             tx.send(report(1, 500_000, 10_000_000)).unwrap(); // B 无进度
             let actions = s.evaluate(); // 停滞计数逐窗口累积
-            saw_retire |= actions.iter().any(|a| matches!(a, ScheduleAction::Retire));
+            saw_retire |= actions
+                .iter()
+                .any(|a| matches!(a, ScheduleAction::Retire { .. }));
         }
         assert!(saw_retire, "连续停滞达到阈值应退役");
     }

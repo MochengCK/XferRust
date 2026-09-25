@@ -335,9 +335,75 @@ async fn multi_connection_split_download() {
     assert!(!ctrl_of(&dir, "file.bin").exists());
 }
 
+/// 连接详情（getServers）必须返回**逐连接**明细：多连接分片下载期间
+/// 应报出 ≥2 条在飞连接、并带实时速率与目标主机。此前这里写死单条目，
+/// 界面"连接详情"永远只显示 1 个连接（用户报障的直接回归守卫）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn split_option_limits_connections() {
-    // 任务级 split=2 应限制并发（服务器峰值 ≤ 2 + 偶发重叠的探测请求）
+async fn get_servers_reports_per_connection_rows() {
+    let dir = tmpdir("conn-rows");
+    let data = Arc::new(sample(4 * 1024 * 1024));
+    let srv = start_server(data.clone(), Duration::from_millis(3), false).await;
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = mgr
+        .add_uri(
+            vec![srv.url()],
+            &serde_json::json!({
+                "dir": dir,
+                "split": "8",
+                "min-split-size": "64K",
+            }),
+            None,
+        )
+        .expect("addUri 应成功");
+
+    let mut max_rows = 0usize;
+    let mut saw_speed = false;
+    let mut saw_uri = false;
+    for _ in 0..400 {
+        let servers = mgr.get_servers(&gid).expect("getServers 应成功");
+        if let Some(list) = servers
+            .get(0)
+            .and_then(|f| f.get("servers"))
+            .and_then(|s| s.as_array())
+        {
+            max_rows = max_rows.max(list.len());
+            saw_speed |= list
+                .iter()
+                .any(|r| r["downloadSpeed"].as_u64().unwrap_or(0) > 0);
+            saw_uri |= list
+                .iter()
+                .any(|r| r["currentUri"].as_str().is_some_and(|u| !u.is_empty()));
+        }
+        let st = mgr.tell_status_native(&gid, None).unwrap();
+        if st["status"].as_str() == Some("complete") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        max_rows >= 2,
+        "连接详情只报出 {max_rows} 条连接：应为逐连接明细，而不是写死的单条目"
+    );
+    // 只报在飞连接：行数不得超过配置的并发（残影/幽灵连接会让界面虚高）
+    assert!(
+        max_rows <= 8,
+        "连接详情报出 {max_rows} 行（split=8）：混进了已结束连接的残影"
+    );
+    assert!(saw_speed, "连接条目应带实时速率");
+    assert!(saw_uri, "连接条目应带目标地址");
+
+    wait_status(&mgr, &gid, "complete", 30_000)
+        .await
+        .expect("30s 内未完成");
+    // 终态不再提供连接明细（界面只在 active/waiting 时请求）
+    assert_eq!(mgr.get_servers(&gid).unwrap(), serde_json::json!([]));
+    let out = std::fs::read(dir.join("file.bin")).unwrap();
+    assert_eq!(out, *data, "多连接下载文件与源数据不一致");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_option_limits_connections() {    // 任务级 split=2 应限制并发（服务器峰值 ≤ 2 + 偶发重叠的探测请求）
     let dir = tmpdir("limit");
     let data = Arc::new(sample(512 * 1024));
     let srv = start_server(data.clone(), Duration::from_millis(3), false).await;

@@ -55,35 +55,46 @@ const PARK_MS: u64 = 250;
 /// 从 N×单连接速率塌缩到 1×，表现为"速度骤降归零"。
 const ENDGAME_THRESHOLD: u64 = 64 * 1024 * 1024;
 /// 尾声切分下限：细段并行收尾（往返开销换并行度，仅在尾声值得）。
-const ENDGAME_MIN_SPLIT: u64 = 256 * 1024;
+/// 取 64KiB：尾段能切多细就切多细——每一份都能交给一条独立连接，
+/// 单条连接卡住不再拖住整条尾巴。
+const ENDGAME_MIN_SPLIT: u64 = 64 * 1024;
+
+/// 连接静默上限（读空闲）：响应体连续该时长无任何字节，即按"这条连接
+/// 已经不行了"处理——断开并从水位重连。
+///
+/// **不再按"剩余量是否进入尾声"分层取值**。分层是历史包袱：大文件下到
+/// 99% 时全局剩余往往还有几十 MB（1% of 4GB = 40MB），"剩余 ≤ 8MiB 才
+/// 收紧"的判据根本不成立，僵死连接照样等满 10s —— 用户看到的正是
+/// "99% 卡十几秒、暂停再继续才恢复"。
+///
+/// 静默重连续传的代价只有一次往返（已收字节全部保留、不占失败预算，
+/// 见 [`MAX_SHORT_READS`]），因此阈值该取"明显异常"的量级（3s），
+/// 而不是"确定死亡"的量级。
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+/// 首字节等待上限：请求发出（含建连/TLS/服务端思考）到响应体首块的
+/// 允许时长。与读空闲分开取值：请求刚发出时尚未证明连接有问题，
+/// 给足建连与首包时间；一旦开始出数据，间隙判据收紧到 3s。
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 段租约：持有者连续该时长无字节落盘即视为搁浅，写线程把剩余区间
+/// **转交**给新连接（见 [`Writer::handoff`]）。
+///
+/// 与读空闲超时的分工：读空闲让持有者自己重连（大多数情况够用）；
+/// 租约由写线程换人，覆盖持有者来不及或无法自救的场合（连接半死但
+/// 读没超时、需要一条全新连接绕过服务器对旧连接的限速、协程扑在
+/// 别的等待上）。刻意略大于读空闲超时，避免两条自救路径抢跑。
+const SEG_LEASE: Duration = Duration::from_secs(4);
+/// 转交阈值（整段 / 最小）：剩余 ≤ [`HANDOFF_WHOLE_MAX`] 时整个剩余区间
+/// 交给新连接；否则只转交后半、持有者保留前半再给一次机会。
+/// 小于 [`HANDOFF_MIN`] 的尾巴不值得另开连接（读空闲重连即可）。
+const HANDOFF_WHOLE_MAX: u64 = 4 * 1024 * 1024;
+const HANDOFF_MIN: u64 = 32 * 1024;
+
 /// 停滞看门狗阈值：全局无字节落盘达到该时长即强制回收搁浅段。
-/// 刻意大于读超时（30s）——只在所有常规恢复路径都失效时才出手。
-const STALL_TIMEOUT: Duration = Duration::from_secs(60);
-/// 读空闲超时：响应体连续该时长无任何字节即断开重连（按短读处理）。
-///
-/// 背景：reqwest `read_timeout`（30s）触发后归类为 `Timeout`，消耗的是
-/// 普通失败预算（4 次即任务失败）；而"连接静默停摆（对端无数据也无
-/// FIN）"与尾段断流一样是可再生瞬态。10s 无字节即从水位重连续传——
-/// 已收字节不丢、不占致命预算，恢复速度也从最坏 30s 缩短到 10s。
-const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
-/// 尾声读空闲超时的生效门槛：剩余待下字节 ≤ 该值即视为尾声。
-///
-/// 取 8MiB：既覆盖"最后一个分片还在收尾"的典型现场（99% 时剩余通常
-/// 只有几 MB），又不会在下载中段误伤慢连接。
-const ENDGAME_IDLE_THRESHOLD: u64 = 8 * 1024 * 1024;
-/// 尾声读空闲超时：比常规值短得多。
-///
-/// 线上"下载到 99% 卡十几秒"的主因就在这里：最后一个分片的连接僵死
-/// （对端无数据也无 FIN），其余协程早已 Park，整条任务停在 99% 零速，
-/// 直到常规读空闲超时（10s）才断开重连——加上退避与重连，用户看到的
-/// 就是十几秒不动。
-///
-/// 尾声里这个等待没有任何收益：剩余数据已经很少，一次重连（RTT + 从
-/// 水位续传）的成本远低于干等 10s。因此剩余 ≤ [`ENDGAME_IDLE_THRESHOLD`]
-/// 时改用本值。代价是"尾部突发式发数据的慢服务器"可能被多断几次——
-/// 短读不消耗致命失败预算（见 [`MAX_SHORT_READS`]），断掉后从水位续传，
-/// 只是多几次重连，不会失败。
-const ENDGAME_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+/// 租约（[`SEG_LEASE`]）已覆盖"持有者搁浅"，本看门狗只兜底
+/// "段既无人持有、也不在队列"的理论缺口（出队/归还竞态引入的 bug），
+/// 因此取值远大于租约、只作最后防线。
+const STALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// 控制文件的最小落盘间隔（节流 fsync）。
 const CTRL_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 /// 请求批水位（通道容量）：过高徒增内存，过低限制吞吐。
@@ -127,41 +138,146 @@ pub struct SplitStats {
     pub completed: AtomicU64,
     /// 当前活跃连接数。
     pub connections: AtomicUsize,
-    /// 剩余待下字节数（写线程在启动与每次落盘后更新）。
-    ///
-    /// 供工作协程判断"是否已到尾声"：尾声里一个僵死连接的代价是
-    /// 整条任务停在 99% 零速，早断开早重连远比等满常规读空闲超时划算
-    /// （见 [`ENDGAME_READ_IDLE_TIMEOUT`]）。[`Self::new`] 初始化为
-    /// [`REMAINING_UNKNOWN`]，此时按"非尾声"处理，不影响未走写线程的场景。
-    remaining: AtomicU64,
     /// 实时分片位图（下载启动时挂接一次，写线程增量维护）。
     pieces: OnceLock<Arc<PieceTrack>>,
+    /// 活跃连接表（"连接详情"数据源：逐连接的主机/已收字节/实时速率）。
+    conns: Mutex<Vec<ConnSlot>>,
+    /// 连接号分配（每次请求一个，只增不减）。
+    next_conn_id: AtomicU64,
 }
 
-/// `remaining` 的"未知"哨兵：未启动写线程（或测试直接构造）时取该值。
-const REMAINING_UNKNOWN: u64 = u64::MAX;
+/// 连接表条目：一条**在飞的请求**的实时状态。
+struct ConnSlot {
+    id: u64,
+    host: String,
+    /// 本次请求已接收字节。
+    downloaded: u64,
+    /// 速率结算窗口：窗口内累计字节与窗口起点。
+    window_bytes: u64,
+    window_start: Instant,
+    /// 平滑后的实时速率（字节/秒）。
+    speed: u64,
+    /// 请求是否仍在飞。
+    active: bool,
+    /// 最近一次数据/状态更新时刻（过期即从表中剔除）。
+    updated: Instant,
+}
+
+/// 连接详情快照（供 RPC/界面逐连接展示）。
+#[derive(Debug, Clone)]
+pub struct ConnSnapshot {
+    /// 连接号（每次请求递增）。
+    pub id: u64,
+    /// 目标主机。
+    pub host: String,
+    /// 本次请求已接收字节。
+    pub downloaded: u64,
+    /// 实时速率（字节/秒）。
+    pub speed: u64,
+    /// 请求是否仍在飞。
+    pub active: bool,
+}
+
+/// 速率结算窗口（时间/字节先到者）：界面轮询间隔通常 0.3~1s，
+/// 结算粒度取 100ms 或攒够 256KiB ——分片区间可能几十毫秒就下完，
+/// 只按时间结算会让这些"短促快连接"永远算不出速率（显示 0）。
+const CONN_SPEED_SETTLE: Duration = Duration::from_millis(100);
+const CONN_SPEED_SETTLE_BYTES: u64 = 256 * 1024;
+/// 速率陈旧时限：在飞连接超过该时长没有新字节，速率按 0 报
+/// （对端静默 = 没有下载能力，界面应显示为不活跃）。
+const CONN_SPEED_STALE: Duration = Duration::from_millis(700);
+/// 连接表批量结算阈值（字节 / 时间先到者）：避免每块一次加锁。
+const CONN_FLUSH_BYTES: u64 = 64 * 1024;
+const CONN_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+/// 连接表过期时限：请求结束后再过该时长仍未更新即剔除
+/// （留一点"残影"，界面轮询间隔通常 0.3~1s，不至于闪烁消失）。
+const CONN_IDLE_TTL: Duration = Duration::from_secs(2);
+/// 在飞请求的过期时限：请求在飞但长时间无字节（僵死连接的现场），
+/// 超过该时长也不再展示（此时租约/读空闲已在换人）。
+const CONN_ACTIVE_TTL: Duration = Duration::from_secs(6);
 
 impl SplitStats {
     pub fn new(baseline: u64) -> Arc<Self> {
         Arc::new(Self {
             completed: AtomicU64::new(baseline),
             connections: AtomicUsize::new(0),
-            remaining: AtomicU64::new(REMAINING_UNKNOWN),
             pieces: OnceLock::new(),
+            conns: Mutex::new(Vec::new()),
+            next_conn_id: AtomicU64::new(0),
         })
     }
 
-    /// 更新剩余待下字节数（写线程调用）。
-    fn set_remaining(&self, remaining: u64) {
-        self.remaining.store(remaining, Ordering::Relaxed);
+    /// 登记一条新连接（每次请求一次），返回连接号。
+    pub fn conn_open(&self, host: &str) -> u64 {
+        let id = self.next_conn_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = Instant::now();
+        let mut t = self.conns.lock().unwrap();
+        prune_conns(&mut t, now);
+        t.push(ConnSlot {
+            id,
+            host: host.to_string(),
+            downloaded: 0,
+            window_bytes: 0,
+            window_start: now,
+            speed: 0,
+            active: true,
+            updated: now,
+        });
+        id
     }
 
-    /// 剩余待下字节数；未知时返回 `None`。
-    fn remaining(&self) -> Option<u64> {
-        match self.remaining.load(Ordering::Relaxed) {
-            REMAINING_UNKNOWN => None,
-            v => Some(v),
+    /// 记账：连接 `id` 本次请求新收到 `n` 字节（顺带结算窗口速率）。
+    pub fn conn_bytes(&self, id: u64, n: u64) {
+        let now = Instant::now();
+        let mut t = self.conns.lock().unwrap();
+        let Some(slot) = t.iter_mut().find(|s| s.id == id) else {
+            return;
+        };
+        slot.downloaded += n;
+        slot.window_bytes += n;
+        slot.updated = now;
+        let dt = now.duration_since(slot.window_start);
+        if dt >= CONN_SPEED_SETTLE || slot.window_bytes >= CONN_SPEED_SETTLE_BYTES {
+            let inst = slot.window_bytes as f64 / dt.as_secs_f64().max(0.001);
+            // 与上一窗口各半：界面轮询周期与结算周期不同步，平滑后不跳变
+            slot.speed = if slot.speed == 0 {
+                inst as u64
+            } else {
+                ((slot.speed as f64 + inst) / 2.0) as u64
+            };
+            slot.window_bytes = 0;
+            slot.window_start = now;
         }
+    }
+
+    /// 标记连接 `id` 的请求结束（保留条目至过期，速率归零）。
+    pub fn conn_close(&self, id: u64) {
+        let now = Instant::now();
+        let mut t = self.conns.lock().unwrap();
+        if let Some(slot) = t.iter_mut().find(|s| s.id == id) {
+            slot.active = false;
+            slot.speed = 0;
+            slot.updated = now;
+        }
+    }
+
+    /// 一致快照（过期条目已剔除；在飞但久无字节者速率按 0 报）。
+    pub fn conn_snapshot(&self) -> Vec<ConnSnapshot> {
+        let now = Instant::now();
+        let mut t = self.conns.lock().unwrap();
+        prune_conns(&mut t, now);
+        t.iter()
+            .map(|s| {
+                let live = s.active && now.duration_since(s.updated) < CONN_SPEED_STALE;
+                ConnSnapshot {
+                    id: s.id,
+                    host: s.host.clone(),
+                    downloaded: s.downloaded,
+                    speed: if live { s.speed } else { 0 },
+                    active: s.active,
+                }
+            })
+            .collect()
     }
 
     /// 挂接分片位图（下载启动时一次；重复调用忽略后续）。
@@ -178,6 +294,19 @@ impl SplitStats {
     pub fn piece_snapshot(&self) -> Option<PieceSnapshot> {
         self.pieces.get().map(|t| t.snapshot())
     }
+}
+
+/// 剔除过期的连接表条目（已结束超过 [`CONN_IDLE_TTL`]、或在飞但
+/// 超过 [`CONN_ACTIVE_TTL`] 无字节的僵死连接）。
+fn prune_conns(t: &mut Vec<ConnSlot>, now: Instant) {
+    t.retain(|s| {
+        let ttl = if s.active {
+            CONN_ACTIVE_TTL
+        } else {
+            CONN_IDLE_TTL
+        };
+        now.duration_since(s.updated) < ttl
+    });
 }
 
 /// 分片位图快照：查询侧读取的一致视图。
@@ -363,8 +492,18 @@ pub async fn download_split(
     // 调度器期望的协程数（自适应增减的落点）：
     // - 初始 = 启动协程数；
     // - 调度器 Spawn 决策抬高 → 主循环补拉协程；
-    // - 退休/Done 递减 → 防止主循环把刻意减员补回来。
+    // - 段转交/退休后由写线程按需重算（见 Writer::ensure_spare）——
+    //   池子只减不增会让尾段只剩一条连接可用，这正是"暂停再继续才恢复"
+    //   的现场：恢复动作重建了整池连接。
     let desired_workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // 连接详情用主机名（同一 URI 的所有分片连接同主机）。
+    let host: Arc<str> = Arc::from(
+        reqwest::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_default()
+            .as_str(),
+    );
 
     // 自适应调度器初始化（若启用）
     let adaptive_tx = if opts.adaptive.is_some() {
@@ -454,6 +593,7 @@ pub async fn download_split(
         let ctx = WorkerCtx {
             client: client.clone(),
             url: Arc::clone(&url_arc),
+            host: Arc::clone(&host),
             tx: tx.clone(),
             stats: stats.clone(),
             stop: stop.clone(),
@@ -476,11 +616,12 @@ pub async fn download_split(
             _ = cancel.cancelled() => break true,
             _ = done_notify.notified() => break false,
             _ = tick.tick() => {
-                // 周期性保存控制文件（防崩溃丢进度；写线程内 1s 节流）
+                // 周期性保存控制文件（防崩溃丢进度；写线程内 1s 节流）；
+                // 顺带在写线程里做租约回收与停滞兜底。
                 let _ = tx.send(ToWriter::SaveCtrl).await;
                 // 收割已退出的协程（Done/退休/panic 转移后自然结束）
                 handles.retain(|h| !h.is_finished());
-                // 按调度器期望补拉协程（自适应 Spawn 的增长落点）
+                // 按写线程/调度器期望补拉协程（增长与"转交换人"的落点）
                 let want = desired_workers.load(Ordering::Acquire);
                 while handles.len() < want {
                     handles.push(spawn_worker(&tx));
@@ -590,14 +731,22 @@ enum FinishMode {
 // 写线程（调度 + 磁盘 IO 单点）
 // ---------------------------------------------------------------------------
 
+/// 分片区间。多个协程可先后（甚至同时）持有同一段：水位守卫
+/// （[`Writer::on_write`]）只接受恰接水位的那条流，因此并发持有
+/// 不会双计、不会留空洞；`holders` 只用于归还判定（无人持有且
+/// 未完成的段必须回到队列，否则 `todo` 永不归零）。
 struct Seg {
     start: u64,
-    /// 声明区间终点（对冲收缩）。
+    /// 声明区间终点（对冲/转交收缩）。
     end: u64,
     /// pwrite 高水位（相对 start）。
     written: u64,
     done: bool,
     queued: bool,
+    /// 正在读取本段的协程数。
+    holders: usize,
+    /// 最近一次有字节落盘的时刻（段租约的续租点）。
+    last_progress: Instant,
     /// 与工作协程共享的端点（收缩广播）。
     end_shared: Arc<AtomicU64>,
 }
@@ -725,11 +874,9 @@ struct Writer {
     opts: SplitOptions,
     /// 自适应调度模式是否启用。
     adaptive_enabled: bool,
-    /// 调度器期望的协程数（与主循环共享；Spawn 抬高、退休递减）。
+    /// 调度器期望的协程数（与主循环共享：Spawn/转交抬高、退休递减）。
     desired_workers: Arc<std::sync::atomic::AtomicUsize>,
-    /// 调度器待执行的减员建议数（next_work 无段可领时消化）。
-    retire_hint: u32,
-    /// 最近一次有字节落盘的时间（停滞看门狗用）。
+    /// 最近一次有字节落盘的时间（停滞兜底看门狗用）。
     last_progress: Instant,
     /// 可复用的控制文件序列化缓冲：避免每次 save_ctrl 都分配新 Vec。
     /// 下载过程中频繁保存控制文件时减少内存分配 / GC 压力。
@@ -779,7 +926,11 @@ impl Writer {
         // 空段表继续走下去：空段表让下面 todo 算出 0，于是一个字节都
         // 没下载也判 `finished`（假成功，且目标文件不会被截齐到 total）。
         let loaded = loaded.and_then(|c| {
-            let mut sorted = c.segs.clone();
+            // 零长度段（租约转交可能留下的空段）先剔除：它们不含任何
+            // 字节，留着会让下面的严格平铺校验整体失败（详见
+            // serialize_ctrl 的说明）。老版本写出的控制文件不含空段，
+            // 这里只是对新旧格式都不挑剔。
+            let mut sorted: Vec<CtrlSeg> = c.segs.into_iter().filter(|s| s.e > s.s).collect();
             sorted.sort_by_key(|s| s.s);
             let mut cursor = c.base.min(total);
             let tiled = !sorted.is_empty() && {
@@ -826,6 +977,8 @@ impl Writer {
                     written,
                     done,
                     queued: !done,
+                    holders: 0,
+                    last_progress: Instant::now(),
                     end_shared: Arc::new(AtomicU64::new(s.e)),
                 });
             }
@@ -849,6 +1002,8 @@ impl Writer {
                         written: 0,
                         done: false,
                         queued: true,
+                        holders: 0,
+                        last_progress: Instant::now(),
                         end_shared: Arc::new(AtomicU64::new(end)),
                     });
                     prev = end;
@@ -879,8 +1034,6 @@ impl Writer {
             base + (total - base).saturating_sub(todo),
             Ordering::Relaxed,
         );
-        // 剩余量初始值：工作协程据此判定尾声（收尾阶段的读空闲超时取值）
-        stats.set_remaining(todo);
         let mut w = Self {
             file: file.clone(),
             path: path.to_path_buf(),
@@ -901,7 +1054,6 @@ impl Writer {
             opts: opts.clone(),
             adaptive_enabled: opts.adaptive.is_some(),
             desired_workers: desired_workers.clone(),
-            retire_hint: 0,
             last_progress: Instant::now(),
             ctrl_buf: Vec::new(),
             syncer: CtrlSyncer::start(file, ctrl.to_path_buf()),
@@ -946,11 +1098,11 @@ impl Writer {
             Some(s) => s,
             None => return,
         };
-        // 越界（对冲收缩后协程多读的部分）或回退写（重试竞态）→ 丢弃。
-        // 只接受恰好衔接水位的写：正常单持有者流天然连续；但停滞看门狗
-        // 回收后旧持有者可能"复活"并与接替协程双流并行——接受越过水位的
-        // 写会在 [水位, offset) 留下永久空洞而 todo 照常归零（假完成、
-        // 文件损坏）。落后的流只会被丢弃或追平，不会产生空洞。
+        // 越界（对冲/转交收缩后协程多读的部分）或回退写（重试/转交竞态）
+        // → 丢弃。只接受恰好衔接水位的写：一段可能被两个持有者并发读取
+        // （租约转交后新旧连接并存），接受越过水位的写会在 [水位, offset)
+        // 留下永久空洞而 todo 照常归零（假完成、文件损坏）。落后的流只会
+        // 被丢弃或追平，不会产生空洞。
         if offset < seg.start || offset >= seg.end || offset - seg.start != seg.written {
             return;
         }
@@ -964,15 +1116,14 @@ impl Writer {
             return;
         }
         seg.written = offset + n as u64 - seg.start;
+        // 段续租：有字节落盘就不再算搁浅
+        seg.last_progress = Instant::now();
         self.stats.completed.fetch_add(n as u64, Ordering::Relaxed);
         if let Some(p) = &self.pieces {
             p.add_range(offset, n as u64);
         }
         self.todo -= n as u64;
         self.last_progress = Instant::now();
-        // 同步剩余量给工作协程（尾声判定用；relaxed 即可，早一拍晚一拍
-        // 只影响读空闲超时选 3s 还是 10s，不影响正确性）
-        self.stats.set_remaining(self.todo);
         if seg.written == seg.end - seg.start && !seg.done {
             seg.done = true;
             // 段完成不触发 save_ctrl：由 1s 心跳统一节流保存。
@@ -994,6 +1145,34 @@ impl Writer {
         }
     }
 
+    /// 把 `[cut, seg.end)` 从段 `sid` 上切出，作为新段入队，返回新段号。
+    ///
+    /// `cut` 必须落在 `[水位, seg.end)` 内。原段端点收缩到 `cut` 并广播，
+    /// 持有者（若有）在下一个块边界自行截断。**只切出、不复制**：
+    /// `todo` 与已落盘字节都不变，段的剩余量在新旧段之间平移。
+    fn split_off(&mut self, sid: usize, cut: u64) -> usize {
+        let (old_end, start, written) = {
+            let s = &self.segs[sid];
+            (s.end, s.start, s.written)
+        };
+        debug_assert!(cut >= start + written && cut < old_end);
+        self.segs[sid].end = cut;
+        self.segs[sid].end_shared.store(cut, Ordering::Release);
+        let nsid = self.segs.len();
+        self.segs.push(Seg {
+            start: cut,
+            end: old_end,
+            written: 0,
+            done: false,
+            queued: true,
+            holders: 0,
+            last_progress: Instant::now(),
+            end_shared: Arc::new(AtomicU64::new(old_end)),
+        });
+        self.queue.push_back(nsid);
+        nsid
+    }
+
     /// 从剩余最多的活跃段对半切出一段新工作（工作窃取对冲）。
     /// 仅当剩余 ≥ 2×生效下限，保证切出的段不小于生效下限。
     fn try_steal(&mut self) -> Option<usize> {
@@ -1009,43 +1188,123 @@ impl Writer {
             }
         }
         let (_, sid) = best?;
-        let seg = &mut self.segs[sid];
-        let old_end = seg.end;
-        let pos = seg.start + seg.written;
+        let (pos, old_end) = {
+            let s = &self.segs[sid];
+            (s.start + s.written, s.end)
+        };
         let mid = pos + (old_end - pos) / 2;
-        seg.end = mid;
-        seg.end_shared.store(mid, Ordering::Release);
-        let nsid = self.segs.len();
+        let nsid = self.split_off(sid, mid);
         tracing::debug!(
             seg = sid,
             from = mid,
             to = old_end,
             "对冲切分：空闲协程接管慢段后半区间"
         );
-        self.segs.push(Seg {
-            start: mid,
-            end: old_end,
-            written: 0,
-            done: false,
-            queued: false,
-            end_shared: Arc::new(AtomicU64::new(old_end)),
-        });
         Some(nsid)
+    }
+
+    /// 转交搁浅段的剩余区间：把 `[cut, end)` 交给新连接重新取（全新请求，
+    /// 等价于用户手动"暂停再继续"，但不中断任务、已下字节全部保留）。
+    ///
+    /// `whole` 为真时整段转交（`cut` = 当前水位）；否则只转交后半，
+    /// 持有者保留前半再给一次机会。原段被截断到 `cut`：持有者在下一个
+    /// 块边界自行收尾（若它只是慢而不是死，前半仍归它继续收）。
+    ///
+    /// `force` 忽略 [`HANDOFF_MIN`]——兜底看门狗路径上无论多小的尾巴
+    /// 都要换人（那里已确认全局长时间无进度，不值得再等持有者自救）。
+    ///
+    /// 与旧"读空闲超时"的区别：那条路要等**持有者**发现静默（10s 且
+    /// 判据失效）并重连；这里由写线程在租约到期时直接换人，恢复时间
+    /// 与持有者状态无关。
+    fn handoff(&mut self, sid: usize, whole: bool, force: bool) -> bool {
+        let (pos, old_end, holders) = {
+            let Some(s) = self.segs.get(sid) else {
+                return false;
+            };
+            (s.start + s.written, s.end, s.holders)
+        };
+        if pos >= old_end {
+            return false;
+        }
+        let remaining = old_end - pos;
+        if remaining < HANDOFF_MIN && !force {
+            return false; // 太小的尾巴交给持有者自己的读空闲重连
+        }
+        let cut = if whole || remaining <= HANDOFF_WHOLE_MAX {
+            pos
+        } else {
+            pos + remaining / 2
+        };
+        self.split_off(sid, cut);
+        if cut == pos {
+            // 剩余整段已切走：原段就此了结（迟到写入被 on_write 丢弃）
+            self.segs[sid].done = true;
+        }
+        self.segs[sid].last_progress = Instant::now();
+        tracing::debug!(
+            seg = sid,
+            cut,
+            end = old_end,
+            holders,
+            whole = cut == pos,
+            "租约转交：剩余区间交给新连接"
+        );
+        true
+    }
+
+    /// 保证有协程能接手被转交的区间：把期望协程数抬到「存活 + 1」，
+    /// 上限为配置的连接数。
+    ///
+    /// 池子只减不增是本轮之前的另一处根因：协程因偶发失败退休后
+    /// `desired_workers` 只降不升，尾段只剩一两条连接可用——用户看到的
+    /// "连接数掉到 1、卡尾、暂停再继续才恢复"（恢复会重建整池连接）。
+    fn ensure_spare(&mut self) {
+        let cap = self.opts.connections.max(1);
+        let want = (self.alive + 1).min(cap);
+        if want > self.desired_workers.load(Ordering::Acquire) {
+            self.desired_workers.store(want, Ordering::Release);
+            tracing::debug!(alive = self.alive, want, "转交后扩充协程：保证有人接手");
+        }
+    }
+
+    /// 租约回收：持有中但连续 [`SEG_LEASE`] 无字节落盘的段，剩余区间
+    /// 直接转交给新连接（转交即让"此刻正在等活"的协程立刻接手）。
+    fn reclaim_stalled(&mut self) {
+        if self.finished || self.fatal.is_some() || self.todo == 0 {
+            return;
+        }
+        let mut reclaimed = 0usize;
+        for i in 0..self.segs.len() {
+            let stalled = {
+                let s = &self.segs[i];
+                !s.done
+                    && !s.queued
+                    && s.holders > 0
+                    && s.end - s.start > s.written
+                    && s.last_progress.elapsed() >= SEG_LEASE
+            };
+            if stalled && self.handoff(i, false, false) {
+                reclaimed += 1;
+            }
+        }
+        if reclaimed > 0 {
+            tracing::warn!(reclaimed, todo = self.todo, "段租约到期：搁浅区间已转交新连接");
+            self.ensure_spare();
+        }
     }
 
     fn next_work(&mut self, release: Option<(usize, bool)>, failures: u32) -> Assignment {
         if let Some((sid, _failed)) = release {
             if let Some(seg) = self.segs.get_mut(sid) {
-                // 释放时未完成的段一律回队——不区分成败。
+                // 归还：段可能在归还前被转交/收缩（竞态），仍按当时状态判定。
                 //
-                // 关键不变式：未完成段要么在队列、要么正被某协程持有。
-                // 若只按 failed 回队，收缩竞态（协程按旧端点发送、
-                // on_write 丢弃越界写入、协程 sent 却前进）会把段留在
-                // "既不在队、也无人续传"的搁浅态：todo 永不归零，
-                // 任务卡在尾声零速（暂停/恢复恰能救活，因为恢复时
+                // 关键不变式：未完成段要么在队列、要么有持有者。若丢了这个
+                // 不变式，段会停在"既不在队、也无人续传"的搁浅态：todo 永不
+                // 归零，任务卡在尾声零速（暂停/恢复恰能救活，因为恢复时
                 // bootstrap 会把未完成段重新入队）。
+                seg.holders = seg.holders.saturating_sub(1);
                 let incomplete = !seg.done && seg.end - seg.start > seg.written;
-                if incomplete && !seg.queued {
+                if incomplete && !seg.queued && seg.holders == 0 {
                     seg.queued = true;
                     self.queue.push_back(sid);
                 }
@@ -1056,6 +1315,8 @@ impl Writer {
             self.desired_workers.store(0, Ordering::Release);
             return Assignment::Done;
         }
+        // 租约回收先于派发：让"此刻正在等活"的协程立即接手搁浅区间
+        self.reclaim_stalled();
         // 出队时跳过已完成段：在途写入竞态可能把队列中的段写完
         // （旧持有者的迟到写入落在 [written, end) 内会被接受），
         // 派发空区间会发出非法 Range 请求。
@@ -1065,6 +1326,8 @@ impl Writer {
                     continue;
                 }
                 seg.queued = false;
+                seg.holders += 1;
+                seg.last_progress = Instant::now();
                 let from = seg.start + seg.written;
                 return Assignment::Work {
                     seg: sid,
@@ -1074,26 +1337,18 @@ impl Writer {
             }
         }
         if let Some(sid) = self.try_steal() {
-            let seg = &self.segs[sid];
+            let seg = &mut self.segs[sid];
+            seg.queued = false;
+            seg.holders += 1;
+            seg.last_progress = Instant::now();
             return Assignment::Work {
                 seg: sid,
                 from: seg.start,
                 end: seg.end_shared.clone(),
             };
         }
-        // 无段可领：消化调度器的减员建议（至少保留 min_connections）
-        let min_alive = self
-            .opts
-            .adaptive
-            .as_ref()
-            .map(|a| a.min_connections.max(1))
-            .unwrap_or(1);
-        if self.retire_hint > 0 && self.alive > min_alive {
-            self.retire_hint -= 1;
-            self.retire_one();
-            return Assignment::Retire;
-        }
-        // 失败较多的协程退休（至少保留一名存活）
+        // 失败较多的协程退休（至少保留一名存活；池子随后由
+        // ensure_spare / 调度器 Spawn 在需要时补回）
         if failures >= 2 && self.alive > 1 {
             self.retire_one();
             return Assignment::Retire;
@@ -1108,14 +1363,13 @@ impl Writer {
         self.desired_workers.store(self.alive, Ordering::Release);
     }
 
-    /// 停滞看门狗：全局长时间无任何字节落盘时，把所有"不在队列"
-    /// 的未完成段强制回队。
+    /// 停滞兜底看门狗：全局长时间无任何字节落盘时，把"不在队列且无人
+    /// 正常流转"的未完成段剩余区间整体转交。
     ///
-    /// 兜底防线（释放回队是第一道）：若某协程异常挂在持有段上
-    /// （读超时之外的非预期路径），段无人认领 → todo 不动 →
-    /// 任务永挂。看门狗在写线程 SaveCtrl 心跳（500ms）里检查，
-    /// 60s 无进度即回收。回收后旧持有者的迟到写入仍会被
-    /// `on_write` 的水位/区间守卫安全丢弃或合并，不会双计。
+    /// 第一道防线是段租约（[`SEG_LEASE`]，4s、按段判定），本看门狗只兜底
+    /// 理论缺口——"段既不在队列、也没有持有者"（出队/归还竞态引入的 bug）
+    /// 与"协程扑在非预期等待上"。因此阈值取 [`STALL_TIMEOUT`]（15s），
+    /// 远大于租约，只在所有常规路径都失效时才出手。
     fn watchdog_requeue_stalled(&mut self) {
         if self.finished || self.fatal.is_some() || self.todo == 0 {
             return;
@@ -1125,27 +1379,31 @@ impl Writer {
         }
         let mut requeued = 0usize;
         for i in 0..self.segs.len() {
-            let incomplete = {
+            let stalled = {
                 let s = &self.segs[i];
                 !s.done && !s.queued && s.end - s.start > s.written
             };
-            if incomplete {
-                self.segs[i].queued = true;
-                self.queue.push_back(i);
+            if stalled && self.handoff(i, true, true) {
                 requeued += 1;
             }
         }
         if requeued > 0 {
-            tracing::warn!(requeued, todo = self.todo, "停滞看门狗：强制回收搁浅段");
+            tracing::warn!(requeued, todo = self.todo, "停滞看门狗：搁浅区间已整体转交");
+            self.ensure_spare();
         }
-        // 重置计时：给回收的段一个完整窗口，避免每个心跳重复回收刷屏
+        // 重置计时：给转交后的区间一个完整窗口，避免每个心跳重复转交刷屏
         self.last_progress = Instant::now();
     }
 
     /// 序列化控制文件内容（水位快照）到复用缓冲，返回可移交的字节。
     ///
     /// 注意：已完成段也要保存（w == e-s）——恢复时据此跳过重下，
-    /// 且保证段表平铺 [base, total) 的校验可以通过。
+    /// 且保证段表平铺 [base, total) 的校验可以通过。**零长度段除外**：
+    /// 租约转交会把"尚未写入任何字节就整段交出"的原段截断成 [x, x)，
+    /// 这类空段不含任何字节，写进控制文件反而会让恢复时的
+    /// "严格平铺、无重叠无间隙"校验整体失败——校验一失败，控制文件
+    /// 被当作不存在，文件长度被误当作连续前缀（中间空洞被静默跳过，
+    /// 假完成、文件损坏）。
     fn serialize_ctrl(&mut self) -> io::Result<Vec<u8>> {
         let cf = CtrlFile {
             v: 1,
@@ -1155,6 +1413,7 @@ impl Writer {
             segs: self
                 .segs
                 .iter()
+                .filter(|s| s.end > s.start)
                 .map(|s| CtrlSeg {
                     s: s.start,
                     w: s.written,
@@ -1250,12 +1509,15 @@ impl Writer {
     /// - `Shrink`：定向收缩调度器指认的慢段（段已完成/已切分时
     ///   回退收缩剩余最多者），尾部区间立即重建为新段入队
     ///   （语义同对冲切分 [`Writer::try_steal`]，字节不丢失）。
+    /// - `Retire`：调度器判定该连接连续多个评估窗口无进展（≈3s）
+    ///   → **转交**其剩余区间给新连接（语义同租约回收
+    ///   [`Writer::reclaim_stalled`]）。不再只是"减员建议"：降池速不
+    ///   解决问题，换一条新连接才会真正推进（用户的手动"暂停再继续"
+    ///   就是这个动作）。
     /// - `Spawn`：抬高期望协程数（主循环 500ms 内补拉），上限
     ///   `max_connections` 且不超过当前段数的 2 倍——超出可并行
     ///   工作量的协程只能空转 Park；增长步长翻倍，吞吐仍在上升时
     ///   快速爬坡。
-    /// - `Retire`：登记一条减员建议，`next_work` 无段可领时消化
-    ///   （至少保留 `min_connections`）。
     /// - `Grow`：倾向性日志（快连接的尾部区间已通过对冲切分即时入队）。
     fn apply_adaptive_action(&mut self, action: ScheduleAction) {
         if !self.adaptive_enabled {
@@ -1272,12 +1534,11 @@ impl Writer {
             } => {
                 self.shrink_seg(conn_id, reclaim_bytes);
             }
-            ScheduleAction::Retire => {
-                self.retire_hint = self.retire_hint.saturating_add(1);
-                tracing::debug!(
-                    hint = self.retire_hint,
-                    "自适应：建议退休慢连接（无段可领时消化）"
-                );
+            ScheduleAction::Retire { conn_id } => {
+                if self.handoff(conn_id, false, false) {
+                    tracing::debug!(conn_id, "自适应：停滞连接区间已转交新连接");
+                    self.ensure_spare();
+                }
             }
             ScheduleAction::Spawn => {
                 let cap = self
@@ -1302,18 +1563,15 @@ impl Writer {
         }
     }
 
-    /// 收缩指定慢段：把尾部 `reclaim` 字节重建为新段并入队。
+    /// 收缩指定慢段：把尾部 `reclaim` 字节切出为新段并入队。
     /// `preferred` 为调度器指认的段（决策依据）；其已失效
     /// （完成/剩余不足）时回退收缩剩余最多的活跃段。
     ///
     /// 与对冲切分共享同一语义：活跃协程通过 `end_shared` 观察到收缩后
-    /// 自行截断，越界写入由 `on_write` 丢弃。尾部必须立即重建入队——
+    /// 自行截断，越界写入由 `on_write` 丢弃。尾部必须立即切出入队——
     /// 否则收缩的字节会永久脱离段表，`todo` 无法归零，任务将挂起。
     fn shrink_seg(&mut self, preferred: usize, reclaim_bytes: u64) {
         let floor = self.effective_min_split();
-        if reclaim_bytes < floor {
-            return; // 收缩量小于最小分段：切了徒增请求往返开销
-        }
         // 目标选择：指认段有效则定向收缩，否则回退「收缩剩余最多者」。
         // 调度决策滞后一个评估周期，指认段可能已完成/已被对冲切分。
         let eligible = |s: &Seg| !s.done && s.end - s.start - s.written >= floor.saturating_mul(2);
@@ -1333,30 +1591,20 @@ impl Writer {
         if remaining < floor.saturating_mul(2) {
             return; // 两侧都不小于 min_split_size 才切
         }
+        // 不做"reclaim < floor 就放弃"的提前返回：慢段的原始分配区间（
+        // assigned_range）可能很小（尾部段尤甚），按比例算出的 reclaim
+        // 会低于下限而被整天跳过——慢尾段因此一直留在慢连接上。这里
+        // 由 clamp 抬到下限，保证每次评估至少把 floor 字节交给别的连接。
         let reclaim = reclaim_bytes.clamp(floor, remaining - floor);
         let new_end = old_end - reclaim;
-        {
-            let s = &mut self.segs[sid];
-            s.end = new_end;
-            s.end_shared.store(new_end, Ordering::Release);
-        }
-        let nsid = self.segs.len();
+        self.split_off(sid, new_end);
         tracing::debug!(
             seg = sid,
             from = new_end,
             to = old_end,
             targeted = sid == preferred,
-            "自适应：收缩慢段，尾部重建入队"
+            "自适应：收缩慢段，尾部切出入队"
         );
-        self.segs.push(Seg {
-            start: new_end,
-            end: old_end,
-            written: 0,
-            done: false,
-            queued: true,
-            end_shared: Arc::new(AtomicU64::new(old_end)),
-        });
-        self.queue.push_back(nsid);
     }
 
     /// 找到剩余字节数最多的活跃（未完成、已入队或正在下载）段。
@@ -1401,6 +1649,9 @@ fn writer_loop(mut w: Writer, mut rx: mpsc::Receiver<ToWriter>) {
             }
             ToWriter::Fatal { err } => w.set_fatal(err),
             ToWriter::SaveCtrl => {
+                // 心跳里的两道收尾防线：租约回收（搁浅段换人）在先，
+                // 停滞兜底在后（兜底只处理"既不在队、也无人持有"的缺口）
+                w.reclaim_stalled();
                 w.watchdog_requeue_stalled();
                 if let Err(e) = w.save_ctrl(false) {
                     tracing::warn!(error = %e, "控制文件保存失败");
@@ -1437,6 +1688,8 @@ struct WorkerCtx {
     /// 逐任务自定义请求头（见 [`SplitOptions::headers`]）。Arc 共享：
     /// 每个工作协程各持一份引用，不重复拷贝整个头列表。
     headers: Arc<crate::RequestHeaders>,
+    /// 连接详情用主机名。
+    host: Arc<str>,
 }
 
 /// panic 隔离包装：协程 panic → 转致命错误，避免主流程死等。
@@ -1569,23 +1822,60 @@ async fn ask_next(
     rx_reply.await.ok()
 }
 
-/// 下载一个段区间：`from..end`（`end` 可能被对冲收缩，协程自截）。
+/// 连接表批量结算器（见 [`run_segment`]）：热路径只累加本地计数，
+/// 攒够 [`CONN_FLUSH_BYTES`] 或超过 [`CONN_FLUSH_INTERVAL`] 才进表一次。
+struct ConnMeter<'a> {
+    stats: &'a SplitStats,
+    id: u64,
+    pending: u64,
+    since: Instant,
+}
+
+impl ConnMeter<'_> {
+    fn add(&mut self, n: u64) {
+        self.pending += n;
+        if self.pending >= CONN_FLUSH_BYTES || self.since.elapsed() >= CONN_FLUSH_INTERVAL {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pending > 0 {
+            self.stats.conn_bytes(self.id, self.pending);
+            self.pending = 0;
+        }
+        self.since = Instant::now();
+    }
+}
+
+impl Drop for ConnMeter<'_> {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+/// 下载一个段区间：`from..end`（`end` 可能被对冲/转交收缩，协程自截）。
 ///
-/// 自适应模式启用时，采样 RTT / 吞吐 / 连接建立时间并上报给调度器。
+/// 自适应模式启用时，采样 RTT / 吞吐 / 连接建立时间并上报给调度器；
+/// 同时把本条请求登记进连接表（界面"连接详情"逐连接展示的数据源）。
 async fn run_segment(
     ctx: &WorkerCtx,
     seg: usize,
     from: u64,
     end_shared: &Arc<AtomicU64>,
 ) -> Result<(), HttpError> {
-    struct ConnGuard<'a>(&'a AtomicUsize);
-    impl Drop for ConnGuard<'_> {
+    /// 连接存活守卫：退出时统一标记请求结束并递减活跃计数
+    /// （所有 return 路径都覆盖，含取消/错误/panic 展开）。
+    struct ConnLease<'a> {
+        stats: &'a SplitStats,
+        id: u64,
+    }
+    impl Drop for ConnLease<'_> {
         fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::Relaxed);
+            self.stats.connections.fetch_sub(1, Ordering::Relaxed);
+            self.stats.conn_close(self.id);
         }
     }
-    ctx.stats.connections.fetch_add(1, Ordering::Relaxed);
-    let _g = ConnGuard(&ctx.stats.connections);
 
     let end = end_shared.load(Ordering::Acquire);
     // 空区间防御：在途写入竞态可能在派发前把该段写满
@@ -1596,14 +1886,38 @@ async fn run_segment(
         return Ok(());
     }
 
+    let conn_id = ctx.stats.conn_open(&ctx.host);
+    ctx.stats.connections.fetch_add(1, Ordering::Relaxed);
+    let _lease = ConnLease {
+        stats: &ctx.stats,
+        id: conn_id,
+    };
+    // 连接详情批量结算：热路径上只累加协程本地计数，攒够阈值才进表
+    // （每块一次加锁在高吞吐下是白送的争用）。Drop 时结算余量，
+    // 任何 return 路径都不会少记字节。声明在 `_lease` 之后 ⇒ 先析构，
+    // 保证最后一笔进表后连接才被标记结束。
+    let mut meter = ConnMeter {
+        stats: &ctx.stats,
+        id: conn_id,
+        pending: 0,
+        since: Instant::now(),
+    };
+
     // 性能采样开始
     let t_request_start = Instant::now();
 
-    let resp = crate::apply_headers(ctx.client.get(&*ctx.url), &ctx.headers)
-        .header("Range", format!("bytes={}-{}", from, end - 1))
-        .send()
-        .await
-        .map_err(|e| HttpError::from_reqwest(&e))?;
+    // 首字节上限：请求发出（建连/TLS/服务端首包）超过 [`FIRST_BYTE_TIMEOUT`]
+    // 即按短读重连续传；不再依赖 reqwest 的 read_timeout（30s，且会消耗
+    // 普通失败预算）。
+    let resp = tokio::time::timeout(
+        FIRST_BYTE_TIMEOUT,
+        crate::apply_headers(ctx.client.get(&*ctx.url), &ctx.headers)
+            .header("Range", format!("bytes={}-{}", from, end - 1))
+            .send(),
+    )
+    .await
+    .map_err(|_| HttpError::ShortRead)?
+    .map_err(|e| HttpError::from_reqwest(&e))?;
 
     // RTT = 请求发出到首字节到达
     let rtt = t_request_start.elapsed();
@@ -1628,25 +1942,21 @@ async fn run_segment(
 
     let mut stream = resp.bytes_stream();
     let mut sent: u64 = 0;
-    let mut truncated = false; // 命中对冲收缩端点，提前结束
+    let mut truncated = false; // 命中对冲/转交收缩端点，提前结束
     let t_first_byte = Instant::now();
     let mut bytes_this_seg: u64 = 0;
     // 周期上报窗口：给调度器连续的实时指标（而非段末一次性突发）
     let mut bytes_since_report: u64 = 0;
     let mut last_report = t_first_byte;
+    // 静默上限（绝对时刻）：自上一块起算，**不再按"是否尾声"分层**。
+    // 分层判据在大文件 99% 时形同虚设（全局剩余仍有几十 MB），僵死连接
+    // 照样等满 10s —— 用户看到的"99% 卡十几秒"就是这么来的。
+    //
+    // 首块单独放宽到 [`FIRST_BYTE_TIMEOUT`]（服务端"先给响应头、再慢慢
+    // 生成首块"是正常行为；"接受请求后一直不吭声"的僵死则由段租约在
+    // 4s 内换人，不靠这条超时兜着）。
+    let mut gap_deadline = tokio::time::Instant::now() + FIRST_BYTE_TIMEOUT;
     loop {
-        // 读空闲超时按"是否已到尾声"取值：尾声里干等常规 10s 就是
-        // 用户看到的"99% 卡十几秒"，此时重连远比干等划算（详见常量注释）。
-        // 每轮循环重新判定：剩余量在收尾过程中是持续下降的。
-        let idle_timeout = if ctx
-            .stats
-            .remaining()
-            .is_some_and(|r| r <= ENDGAME_IDLE_THRESHOLD)
-        {
-            ENDGAME_READ_IDLE_TIMEOUT
-        } else {
-            READ_IDLE_TIMEOUT
-        };
         let chunk = tokio::select! {
             biased;
             _ = ctx.stop.cancelled() => return Ok(()), // 收尾由主流程统一处理
@@ -1655,16 +1965,17 @@ async fn run_segment(
                 Some(Err(e)) => return Err(HttpError::from_reqwest(&e)),
                 None => break,
             },
-            // 读空闲超时：连接静默停摆（对端无数据也无 FIN）时按短读
-            // 处理——从水位重连续传，不占普通失败预算。每次循环新建
-            // 定时器，计时的自然是"距上一块的间隔"。
-            _ = tokio::time::sleep(idle_timeout) => {
+            // 连接静默（对端无数据也无 FIN）→ 按短读处理：断开后从水位
+            // 重连（全新连接），已收字节不丢、不占普通失败预算。
+            _ = tokio::time::sleep_until(gap_deadline) => {
+                tracing::debug!(seg, sent, "读空闲超时，重连续传");
                 return Err(HttpError::ShortRead);
             }
         };
         if chunk.is_empty() {
             continue;
         }
+        gap_deadline = tokio::time::Instant::now() + READ_IDLE_TIMEOUT;
         let end = end_shared.load(Ordering::Acquire);
         let pos = from + sent;
         if pos >= end {
@@ -1695,6 +2006,8 @@ async fn run_segment(
         sent += cap as u64;
         bytes_this_seg += cap as u64;
         bytes_since_report += cap as u64;
+        // 连接详情记账：本连接已接收字节与速率（界面逐连接展示）
+        meter.add(cap as u64);
         if let Some(perf_tx) = &ctx.perf_tx {
             let now = Instant::now();
             if bytes_since_report >= PERF_REPORT_BYTES
@@ -2113,10 +2426,195 @@ mod tests {
         }
     }
 
+    /// 回归（根因级）：僵死连接由**写线程换人**，不再等持有者自救。
+    ///
+    /// 场景：服务器对首个落在某区间的请求先发一小块后**永久静默**
+    /// （连接半死，无数据也无 FIN），之后的请求一切正常。旧实现把恢复
+    /// 完全押在"持有者读空闲超时后自己重连"上，且阈值按"剩余量是否
+    /// 进入尾声"分层——大文件 99% 时剩余仍有几十 MB，判据失效 ⇒ 干等
+    /// 10s（用户看到的"99% 卡十几秒、暂停再继续才恢复"）。新实现：
+    /// 读空闲统一 3s + 段租约 4s 把剩余区间转交新连接。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dead_connection_seg_handed_off_fast() {
+        let len = 16 * 1024 * 1024;
+        let data = Arc::new(sample(len));
+        let expect = data.clone();
+        // 首个落在前 1MiB 的请求注入永久静默；后续同区间请求正常服务。
+        // 恢复速度用**服务端时刻差**度量（僵死开始 → 同区间重连请求到达）：
+        // 只含"客户端发现静默并换人"的耗时，不受同进程并行用例抢 CPU 影响。
+        let poisoned = Arc::new(AtomicBool::new(false));
+        let early_requests = Arc::new(AtomicUsize::new(0));
+        let early_requests_srv = early_requests.clone();
+        let stall_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let reconnect_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let stall_at_srv = stall_at.clone();
+        let reconnect_at_srv = reconnect_at.clone();
+        let app = axum::Router::new().route(
+            "/file.bin",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let data = data.clone();
+                let poisoned = poisoned.clone();
+                let early_requests = early_requests_srv.clone();
+                let stall_at = stall_at_srv.clone();
+                let reconnect_at = reconnect_at_srv.clone();
+                async move {
+                    let range = headers
+                        .get(header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let total = data.len();
+                    let (from, to) =
+                        match range.strip_prefix("bytes=").and_then(|r| r.split_once('-')) {
+                            Some((f, t)) => (
+                                f.parse::<usize>().unwrap_or(0),
+                                t.parse::<usize>().unwrap_or(total),
+                            ),
+                            None => (0, total),
+                        };
+                    let from = from.min(total);
+                    let to = (to + 1).min(total).max(from);
+                    // 首个区间起点 < 1MiB 的请求：发 8KB 后永久挂起
+                    let stall = from < 1024 * 1024 && !poisoned.swap(true, Ordering::SeqCst);
+                    if from < 1024 * 1024 {
+                        early_requests.fetch_add(1, Ordering::SeqCst);
+                        if stall {
+                            *stall_at.lock().unwrap() = Some(Instant::now());
+                        } else if stall_at.lock().unwrap().is_some()
+                            && reconnect_at.lock().unwrap().is_none()
+                        {
+                            *reconnect_at.lock().unwrap() = Some(Instant::now());
+                        }
+                    }
+                    let mut head: Vec<Result<Bytes, std::io::Error>> = Vec::new();
+                    let mut rest: Vec<Result<Bytes, std::io::Error>> = Vec::new();
+                    let mut off = from;
+                    while off < to {
+                        let end = (off + 8192).min(to);
+                        let c = Ok(Bytes::copy_from_slice(&data[off..end]));
+                        if stall && off == from {
+                            head.push(c);
+                        } else {
+                            rest.push(c);
+                        }
+                        off = end;
+                    }
+                    let stream = futures_util::stream::iter(head)
+                        .chain(futures_util::stream::once(async move {
+                            if stall {
+                                // 永久静默：连接不关闭、不再发一个字节
+                                std::future::pending::<()>().await;
+                            }
+                            Ok(Bytes::new())
+                        }))
+                        .chain(futures_util::stream::iter(rest));
+                    let mut resp =
+                        axum::response::Response::new(axum::body::Body::from_stream(stream));
+                    *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                    resp.headers_mut().insert(
+                        header::CONTENT_RANGE,
+                        HeaderValue::from_str(&format!("bytes {}-{}/{}", from, to - 1, total))
+                            .unwrap(),
+                    );
+                    resp
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let dir = tmpdir("dead-conn-handoff");
+        let path = dir.join("out.bin");
+        let cancel = CancellationToken::new();
+        let t0 = Instant::now();
+        download_split(
+            &crate::build_client(),
+            &format!("http://{addr}/file.bin"),
+            &path,
+            len as u64,
+            &opts(4, 64 * 1024),
+            &cancel,
+            SplitStats::new(0),
+        )
+        .await
+        .expect("僵死连接不该拖死整条任务");
+        let elapsed = t0.elapsed();
+        assert_file(&path, &expect);
+        assert!(
+            early_requests.load(Ordering::SeqCst) >= 2,
+            "前 1MiB 区间只被请求了一次：僵死段未被重新取（没有换人也没有重连）"
+        );
+        let stalled = stall_at.lock().unwrap().expect("僵死注入未生效");
+        let recovered = reconnect_at
+            .lock()
+            .unwrap()
+            .expect("僵死区间始终没有新的请求到达（任务靠别的路径侥幸完成？）");
+        let recovery = recovered.duration_since(stalled);
+        // 旧行为：分层读空闲在此规模（剩余 > 8MiB）下判据失效 ⇒ 干等 10s
+        // 才重连；新行为：读空闲 3s / 租约 4s → 6s 内必有新请求落到该区间。
+        assert!(
+            recovery < Duration::from_secs(6),
+            "僵死连接恢复耗时 {recovery:?}（总耗时 {elapsed:?}），疑似仍在等旧的分层读空闲/长超时"
+        );
+    }
+
+    /// 连接详情的数据源：分片下载期间连接表必须反映**多条在飞连接**，
+    /// 且结束后不再有在飞条目（界面"连接数恒为 1"的直接回归守卫）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn conn_snapshot_reports_live_connections() {
+        let data = Arc::new(sample(1024 * 1024));
+        let srv = start_server(data.clone(), Duration::from_millis(5), None, 1, false).await;
+        let dir = tmpdir("conn-table");
+        let path = dir.join("out.bin");
+        let stats = SplitStats::new(0);
+        let cancel = CancellationToken::new();
+        let dl = {
+            let stats = stats.clone();
+            let url = srv.url();
+            let path = path.clone();
+            let cancel = cancel.clone();
+            let total = data.len() as u64;
+            tokio::spawn(async move {
+                download_split(
+                    &crate::build_client(),
+                    &url,
+                    &path,
+                    total,
+                    &opts(4, 64 * 1024),
+                    &cancel,
+                    stats,
+                )
+                .await
+            })
+        };
+        let mut max_active = 0usize;
+        let mut host_seen = String::new();
+        while !dl.is_finished() {
+            let snap = stats.conn_snapshot();
+            max_active = max_active.max(snap.iter().filter(|c| c.active).count());
+            if let Some(c) = snap.iter().find(|c| !c.host.is_empty()) {
+                host_seen = c.host.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        dl.await.unwrap().expect("分片下载失败");
+        assert_file(&path, &data);
+        assert!(
+            max_active >= 2,
+            "连接详情只看到 {max_active} 条在飞连接（并发 4 路却报不出多连接）"
+        );
+        assert_eq!(host_seen, "127.0.0.1", "连接条目应带上目标主机");
+        assert!(
+            stats.conn_snapshot().iter().all(|c| !c.active),
+            "下载结束后不应残留在飞连接"
+        );
+    }
+
     /// 回归：读空闲超时。服务器对首个区间请求先发一小块后静默停摆
-    /// （无数据也无 FIN，模拟连接僵死）。修复前只能等 reqwest 30s
-    /// read_timeout（归类 Timeout，消耗普通失败预算）；修复后 10s
-    /// 读空闲即按短读从水位重连续传——总耗时应明显小于 30s。
+    /// （无数据也无 FIN，模拟连接僵死）。旧行为只能等 reqwest 30s
+    /// read_timeout（归类 Timeout，消耗普通失败预算）；现在读空闲
+    /// 统一 3s 即按短读从水位重连续传——总耗时应明显小于 30s。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn read_idle_stall_recovers_fast() {
         let len = 4 * 1024 * 1024;
@@ -2145,7 +2643,7 @@ mod tests {
                         };
                     let from = from.min(total);
                     let to = (to + 1).min(total).max(from);
-                    // 仅首个请求注入 12s 静默停摆（> READ_IDLE_TIMEOUT 10s）
+                    // 仅首个请求注入 12s 静默停摆（> 读空闲 3s）
                     let stall = !stall_flag.swap(true, Ordering::SeqCst);
                     let mut head: Vec<Result<Bytes, std::io::Error>> = Vec::new();
                     let mut rest: Vec<Result<Bytes, std::io::Error>> = Vec::new();
@@ -2209,7 +2707,7 @@ mod tests {
         .expect("分片下载失败");
         let elapsed = t0.elapsed();
         assert_file(&path, &expect);
-        // 修复前：僵死连接要等 30s read_timeout 才恢复；修复后 10s 读空闲
+        // 旧行为：僵死连接要等 30s read_timeout 才恢复；现在读空闲 3s
         // 即重连续传。25s 上限证明走的是快路径（留足 CI 抖动余量）。
         assert!(
             elapsed < Duration::from_secs(25),
@@ -2217,12 +2715,12 @@ mod tests {
         );
     }
 
-    /// 回归：尾声读空闲超时收紧。同样注入 12s 静默停摆，但剩余量落在
-    /// 尾声门槛内——此时应当用 [`ENDGAME_READ_IDLE_TIMEOUT`]（3s）断开
-    /// 重连，而不是等满常规 [`READ_IDLE_TIMEOUT`]（10s）。
+    /// 回归：静默恢复必须发生在**读空闲阈值**（[`READ_IDLE_TIMEOUT`]，3s）
+    /// 附近——不因"剩余量多少"而分层放宽。
     ///
-    /// 这条守护的正是线上「下载到 99% 卡十几秒」：最后一个分片的连接
-    /// 僵死，其余协程全在 Park，任务停在 99% 零速等满读空闲超时。
+    /// 守护的正是线上「下载到 99% 卡十几秒」：最后一个分片的连接僵死，
+    /// 其余协程全在 Park，任务停在 99% 零速。旧实现按"剩余是否 ≤ 8MiB"
+    /// 分层取值，大文件 99% 时剩余仍有几十 MB ⇒ 判据失效、干等 10s。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn endgame_idle_stall_recovers_faster() {
         let len = 4 * 1024 * 1024;
@@ -2230,12 +2728,12 @@ mod tests {
         let expect = data.clone();
         let stall_flag = Arc::new(AtomicBool::new(false));
         // 服务端观测点：僵死开始时刻、以及**僵死 1s 之后**到达的首个请求
-        // （= 客户端读空闲超时后从水位重连的那一次）。
+        // （= 客户端发现静默后从水位重连的那一次；1s 用于排除起始批次的
+        // 并发请求）。
         //
         // 断言这两个时刻的间隔，而不是整个下载的耗时：总耗时里还叠着
-        // 同进程并行用例争抢 CPU 的时间（本机串行 7.4s、并行跑满时
-        // 8.9s+），与"尾声该用 3s 还是 10s 读空闲"无关，却是把原断言
-        // 顶破的元凶。间隔只含"客户端发现连接静默所花的时间"。
+        // 同进程并行用例争抢 CPU 的时间，与"静默阈值取多少"无关，却是
+        // 把总耗时断言顶破的元凶。间隔只含"客户端发现连接静默所花的时间"。
         let stall_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let reconnect_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let stall_at_h = stall_at.clone();
@@ -3029,7 +3527,7 @@ mod tests {
     }
 
     /// 停滞看门狗：段不在队、无人认领（模拟协程挂死持有）时，
-    /// 超时后强制回收回队。
+    /// 超时后把剩余区间**转交**（切出新段入队），不丢字节。
     #[test]
     fn watchdog_requeues_stranded_segs() {
         let dir = tmpdir("watchdog");
@@ -3062,18 +3560,30 @@ mod tests {
         let Assignment::Work { seg: sid, .. } = w.next_work(None, 0) else {
             panic!();
         };
+        w.segs[sid].holders = 1;
         w.on_write(sid, 0, &[9u8; 1024]);
         assert!(!w.segs[sid].queued);
+        let todo_before = w.todo;
+        let end_before = w.segs[sid].end;
+        let nsegs_before = w.segs.len();
 
         // 未到超时：看门狗不动
         w.watchdog_requeue_stalled();
         assert!(!w.segs[sid].queued, "超时前不应回收");
 
-        // 快进停滞时间：libstd 无法 mock Instant，直接把 last_progress
-        // 拨回过去模拟 60s 无进度
+        // 快进停滞时间：libstd 无法 mock Instant，直接把进度时间拨回
+        // 过去模拟长时间无进度
         w.last_progress = Instant::now() - STALL_TIMEOUT - Duration::from_secs(1);
         w.watchdog_requeue_stalled();
-        assert!(w.segs[sid].queued, "超时后搁浅段应被强制回队");
+        // 转交语义：剩余区间切为新段入队（原段被截断到水位），
+        // todo 不变、字节不丢
+        assert_eq!(w.todo, todo_before, "转交不得改变剩余量");
+        assert!(w.segs.len() > nsegs_before, "应切出新段");
+        let nsid = w.segs.len() - 1;
+        assert!(w.segs[nsid].queued, "新段应在队列里");
+        assert_eq!(w.segs[nsid].start, 1024, "新段起点 = 原段水位");
+        assert_eq!(w.segs[nsid].end, end_before, "新段覆盖原剩余区间");
+        assert!(w.segs[sid].done, "原段截断到水位后即了结");
     }
 
     /// 回归：续传时已完成段必须保留在段表——否则保存后的控制文件
@@ -3312,6 +3822,76 @@ mod tests {
         // 指认段无效（已完成）→ 回退收缩剩余最多者（段 2 剩 2MB）
         w.shrink_seg(0, mb);
         assert_eq!(w.segs[2].end, 5 * mb, "应回退收缩剩余最多的段");
+    }
+
+    /// 自适应的"停滞连接"决策必须是**换人**（转交区间），不是减员。
+    ///
+    /// 旧行为：调度器每评估周期给一条停滞连接发一条 Retire 减员建议，
+    /// 空闲协程在 `next_work` 里把建议消化成"自己退休"——一条僵死连接
+    /// 每秒制造一条建议，空闲协程逐个退出，池子在一个下载内就塌到
+    /// `min_connections`（=1）。现场表现正是用户报的"连接数一直只有 1、
+    /// 尾巴卡住、暂停再继续才恢复"（恢复会重建整池连接）。
+    #[test]
+    fn adaptive_retire_hands_off_instead_of_draining_pool() {
+        let dir = tmpdir("retire-handoff");
+        let notify = Arc::new(Notify::new());
+        let fatal: Arc<Mutex<Option<HttpError>>> = Arc::new(Mutex::new(None));
+        let desired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stats = Arc::new(SplitStats::new(0));
+        let opts = SplitOptions {
+            headers: crate::RequestHeaders::new(),
+            connections: 4,
+            min_split_size: 1024 * 1024,
+            adaptive: Some(AdaptiveConfig {
+                enabled: true,
+                initial_connections: 4,
+                max_connections: 4,
+                min_connections: 1,
+                ..Default::default()
+            }),
+            limiter: None,
+        };
+        let path = dir.join("t.bin");
+        let mut w = Writer::bootstrap(
+            &path,
+            &ctrl_path(&path),
+            "http://x/t.bin",
+            8 * 1024 * 1024,
+            &opts,
+            &stats,
+            &notify,
+            &fatal,
+            &desired,
+        )
+        .unwrap();
+        w.alive = 4;
+        desired.store(4, Ordering::Release);
+
+        // 协程 0 领取段 0 后停滞（只落了 1MiB）
+        let Assignment::Work { seg: sid, .. } = w.next_work(None, 0) else {
+            panic!("应能领取段");
+        };
+        w.segs[sid].holders = 1;
+        w.on_write(sid, 0, &vec![1u8; 512 * 1024]);
+        let nsegs_before = w.segs.len();
+        let end_before = w.segs[sid].end;
+        assert!(!w.segs[sid].done, "段应处于未完成（停滞）状态");
+
+        // 调度器判定该连接停滞 → 转交
+        w.apply_adaptive_action(ScheduleAction::Retire { conn_id: sid });
+
+        assert_eq!(w.alive, 4, "不得因停滞连接而减员（池子只减不增是旧缺陷）");
+        assert_eq!(
+            desired.load(Ordering::Acquire),
+            4,
+            "期望协程数不得被压低（否则主循环再也不会补拉）"
+        );
+        assert!(w.segs.len() > nsegs_before, "停滞区间应切出为新工作");
+        let nsid = w.segs.len() - 1;
+        assert!(w.segs[nsid].queued && w.queue.contains(&nsid), "新工作必须立即可领");
+        assert_eq!(w.segs[nsid].start, 512 * 1024, "新工作从停滞段水位开始");
+        assert_eq!(w.segs[nsid].end, end_before);
+        assert!(w.segs[sid].done, "原段已在转交点了结");
     }
 
     /// 自适应调度：吞吐上升时应真实扩充并发（评估 → Spawn →

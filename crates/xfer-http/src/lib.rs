@@ -18,7 +18,8 @@ pub use playlist::{
 };
 pub use rate::RateLimiter;
 pub use split::{
-    ctrl_path, download_split, PieceSnapshot, PieceTrack, SplitDone, SplitOptions, SplitStats,
+    ctrl_path, download_split, ConnSnapshot, PieceSnapshot, PieceTrack, SplitDone, SplitOptions,
+    SplitStats,
 };
 
 use std::time::Duration;
@@ -406,6 +407,19 @@ pub async fn download(
 }
 
 /// 同 [`download`]，但携带逐任务自定义请求头（见 [`RequestHeaders`]）。
+///
+/// **内建静默重连**：单连接与多连接一样会遇到"服务器半路不再发数据"
+/// （对端无数据也无 FIN、按连接限速、CDN 节点静默掉线）。旧实现把恢复
+/// 押在 reqwest 的 `read_timeout`（30s）上，且超时归类 `Timeout` 会消耗
+/// 引擎的重试预算——用户看到的就是"卡住十几秒甚至更久、暂停再继续才
+/// 恢复"。现在每块之间的静默超过 [`READ_IDLE_TIMEOUT`] 即断开，并在本
+/// 函数内部**从水位重连续传**（全新连接，已落盘字节全部保留）：
+///
+/// - 续传请求若拿到 206 → 直接从水位继续写；
+/// - 若服务器忽略 Range 回了 200（整文件重发）→ 丢弃前缀后继续写，
+///   不截断已落盘数据、不需要重建 sink；
+/// - 连续多次尝试均无任何进展（[`MAX_STALL_ATTEMPTS`]）才把最后一次
+///   错误交还调用方（进而由镜像切换/失败预算接管）。
 #[allow(clippy::too_many_arguments)]
 pub async fn download_with(
     client: &reqwest::Client,
@@ -419,59 +433,205 @@ pub async fn download_with(
     if cancel.is_cancelled() {
         return Err(HttpError::Cancelled);
     }
-    let mut req = apply_headers(client.get(url), headers);
-    if start > 0 {
-        req = req.header("Range", format!("bytes={start}-"));
-    }
-    let resp = req.send().await.map_err(|e| HttpError::from_reqwest(&e))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(HttpError::Http(status.as_u16()));
-    }
-
-    let restarted_from_zero = start > 0 && status.as_u16() != 206;
-    let total_len = if status.as_u16() == 206 {
-        resp.headers()
-            .get("content-range")
-            .and_then(|v| v.to_str().ok())
-            .and_then(total_from_content_range)
-    } else {
-        resp.content_length()
-    };
-
-    sink.begin(restarted_from_zero)
-        .map_err(|e| HttpError::Io(e.to_string()))?;
+    // 下一字节要写入的文件偏移（续传点随重连推进；服务器整文件重发时归零）
+    let mut pos = start;
+    // 首次响应决定 sink 语义（截断重建 or 续写），此后不再调用 begin
+    let mut began = false;
+    let mut restarted_from_zero = false;
+    let mut total_len: Option<u64> = None;
     let mut transferred: u64 = 0;
-    let mut stream = resp.bytes_stream();
-    loop {
-        // 取消优先：服务器静默时每块间隔检查最坏要等读超时（30s）
-        // 才能感知暂停，select 使取消立即生效。
-        let chunk = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(HttpError::Cancelled),
-            c = stream.next() => match c {
-                Some(Ok(c)) => c,
-                Some(Err(e)) => return Err(HttpError::from_reqwest(&e)),
-                None => break,
-            },
+    // 连续无进展尝试计数（尝试有实质进展才清零，见 MIN_ATTEMPT_PROGRESS）
+    let mut idle_attempts = 0u32;
+    // 本次尝试已落盘字节（用于判定"实质进展"）
+    let mut attempt_bytes = 0u64;
+
+    'attempt: loop {
+        if cancel.is_cancelled() {
+            return Err(HttpError::Cancelled);
+        }
+        // 上一次尝试有实质进展 → 清零"连续无进展"计数。用字节阈值而不是
+        // "写过一个字节就算"：对"每次只挤几字节就静默"的坏服务器，后者会
+        // 无限重连（活锁、任务永不失败），前者在几次尝试后交给上层收敛。
+        if attempt_bytes >= MIN_ATTEMPT_PROGRESS {
+            idle_attempts = 0;
+        }
+        attempt_bytes = 0;
+        let mut req = apply_headers(client.get(url), headers);
+        if pos > 0 {
+            req = req.header("Range", format!("bytes={pos}-"));
+        }
+        let resp = match tokio::time::timeout(FIRST_BYTE_TIMEOUT, req.send()).await {
+            // 首字节迟迟不来：与"读静默"同类，按可重连瞬态处理
+            Err(_) => {
+                stall_retry(cancel, &mut idle_attempts, HttpError::Timeout, MAX_STALL_ATTEMPTS)
+                    .await?;
+                continue;
+            }
+            Ok(Err(e)) => {
+                let err = HttpError::from_reqwest(&e);
+                if !err.is_retryable() {
+                    return Err(err);
+                }
+                // 建连/协议类失败：少量重试后交给上层的镜像切换
+                // （比静默类少，避免在坏服务器上耗掉整轮预算）
+                stall_retry(cancel, &mut idle_attempts, err, MAX_CONN_ATTEMPTS).await?;
+                continue;
+            }
+            Ok(Ok(r)) => r,
         };
-        if chunk.is_empty() {
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(HttpError::Http(status.as_u16()));
+        }
+        let partial = status.as_u16() == 206;
+        if total_len.is_none() {
+            total_len = if partial {
+                resp.headers()
+                    .get("content-range")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(total_from_content_range)
+            } else {
+                resp.content_length()
+            };
+        }
+        if !began {
+            // 首个响应：服务器忽略 Range 时必须截断重建（sink 契约）
+            restarted_from_zero = pos > 0 && !partial;
+            sink.begin(restarted_from_zero)
+                .map_err(|e| HttpError::Io(e.to_string()))?;
+            if restarted_from_zero {
+                pos = 0;
+            }
+            began = true;
+        }
+        // 忽略 Range 的成功响应从 0 开始发：丢弃水位之前的前缀
+        let mut skip = if partial { 0 } else { pos };
+        let mut stream = resp.bytes_stream();
+        let mut gap_deadline = tokio::time::Instant::now() + FIRST_BYTE_TIMEOUT;
+        loop {
+            // 取消优先：服务器静默时靠 select 立即感知暂停（不等静默阈值）
+            let chunk = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(HttpError::Cancelled),
+                c = stream.next() => match c {
+                    Some(Ok(c)) => c,
+                    Some(Err(e)) => {
+                        let err = HttpError::from_reqwest(&e);
+                        if !err.is_retryable() {
+                            return Err(err);
+                        }
+                        stall_retry(cancel, &mut idle_attempts, err, MAX_STALL_ATTEMPTS).await?;
+                        continue 'attempt;
+                    }
+                    None => break,
+                },
+                // 读静默：对端长时间无字节 → 断开，从水位重连续传
+                _ = tokio::time::sleep_until(gap_deadline) => {
+                    stall_retry(
+                        cancel,
+                        &mut idle_attempts,
+                        HttpError::ShortRead,
+                        MAX_STALL_ATTEMPTS,
+                    )
+                    .await?;
+                    continue 'attempt;
+                }
+            };
+            if chunk.is_empty() {
+                continue;
+            }
+            gap_deadline = tokio::time::Instant::now() + READ_IDLE_TIMEOUT;
+            if skip > 0 {
+                // 服务器整文件重发（忽略 Range）：前缀已在盘上，丢弃即可
+                let n = skip.min(chunk.len() as u64);
+                skip -= n;
+                if n as usize == chunk.len() {
+                    continue;
+                }
+                let rest = &chunk[n as usize..];
+                if let Some(l) = limiter {
+                    l.acquire(rest.len()).await;
+                }
+                sink.write_chunk(rest)
+                    .map_err(|e| HttpError::Io(e.to_string()))?;
+                transferred += rest.len() as u64;
+                pos += rest.len() as u64;
+                attempt_bytes += rest.len() as u64;
+                continue;
+            }
+            // 全局限速：落盘前消费令牌，不足时等待（TCP 背压收敛速率）
+            if let Some(l) = limiter {
+                l.acquire(chunk.len()).await;
+            }
+            sink.write_chunk(&chunk)
+                .map_err(|e| HttpError::Io(e.to_string()))?;
+            transferred += chunk.len() as u64;
+            pos += chunk.len() as u64;
+            attempt_bytes += chunk.len() as u64;
+        }
+        // EOF：已知总长且未收齐 → 短读（服务器提前收尾），重连续传
+        if total_len.is_some_and(|t| pos < t) {
+            stall_retry(
+                cancel,
+                &mut idle_attempts,
+                HttpError::ShortRead,
+                MAX_STALL_ATTEMPTS,
+            )
+            .await?;
             continue;
         }
-        // 全局限速：落盘前消费令牌，不足时等待（TCP 背压收敛速率）
-        if let Some(l) = limiter {
-            l.acquire(chunk.len()).await;
-        }
-        sink.write_chunk(&chunk)
-            .map_err(|e| HttpError::Io(e.to_string()))?;
-        transferred += chunk.len() as u64;
+        break;
     }
+
     sink.finish().map_err(|e| HttpError::Io(e.to_string()))?;
     Ok(TransferDone {
         transferred,
         total_len,
         restarted_from_zero,
     })
+}
+
+/// 单连接路径的最大静默重连次数（连续无进展尝试）。
+///
+/// 静默（半死连接、尾段断流）是"重连几乎必然推进"的瞬态，值得多试几次；
+/// 建连/协议类失败见 [`MAX_CONN_ATTEMPTS`]。
+const MAX_STALL_ATTEMPTS: u32 = 8;
+/// 建连/协议类失败的重试上限：少量重试后交还调用方，
+/// 由镜像切换与任务级失败预算收敛（否则坏服务器上会耗掉整轮预算）。
+const MAX_CONN_ATTEMPTS: u32 = 3;
+/// 单次尝试的"实质进展"下限：低于它的尝试不计入进展，连续多次后
+/// 交还上层（防"每次挤几字节就静默"的坏服务器把重连变成活锁）。
+const MIN_ATTEMPT_PROGRESS: u64 = 1024;
+/// 单连接路径的静默阈值：与分片路径同取 3s（见 `split` 模块同名常量）。
+const READ_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// 单连接路径的首字节上限（建连/TLS/服务端首包）。
+const FIRST_BYTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// 记一次无进展尝试并退避；超出 `max` 则把最后一次错误返回给调用方。
+async fn stall_retry(
+    cancel: &CancellationToken,
+    attempts: &mut u32,
+    last: HttpError,
+    max: u32,
+) -> Result<(), HttpError> {
+    *attempts += 1;
+    if *attempts > max {
+        return Err(last);
+    }
+    backoff_or_cancel(cancel, *attempts).await
+}
+
+/// 重连退避：0.3s 起步、上限 2s；取消立即返回。
+async fn backoff_or_cancel(cancel: &CancellationToken, attempt: u32) -> Result<(), HttpError> {
+    let ms = match attempt {
+        0 | 1 => 300,
+        2 => 800,
+        _ => 2000,
+    };
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => Ok(()),
+        _ = cancel.cancelled() => Err(HttpError::Cancelled),
+    }
 }
 
 /// 解析 `Content-Range: bytes 0-1/1234` 的总长度；`*` 返回 None。
@@ -962,5 +1122,217 @@ mod tests {
         // 探测自带 Range（引擎算的），下载 start=0 不带 Range
         assert_eq!(seen[0].3, "bytes=0-0");
         assert_eq!(seen[1].3, "");
+    }
+
+    /// 单连接路径内存 sink。
+    struct BufSink2 {
+        buf: Vec<u8>,
+    }
+    impl TransferSink for BufSink2 {
+        fn begin(&mut self, restarted: bool) -> std::io::Result<u64> {
+            if restarted {
+                self.buf.clear();
+            }
+            Ok(self.buf.len() as u64)
+        }
+        fn write_chunk(&mut self, data: &[u8]) -> std::io::Result<()> {
+            self.buf.extend_from_slice(data);
+            Ok(())
+        }
+        fn finish(&mut self) -> std::io::Result<u64> {
+            Ok(self.buf.len() as u64)
+        }
+    }
+
+    /// 回归：单连接路径半路静默（对端无数据也无 FIN）→ 内部重连续传。
+    ///
+    /// 旧实现把恢复押在 reqwest `read_timeout`（30s）上，用户看到的是
+    /// "卡住十几秒到半分钟、暂停再继续才恢复"。现在读静默 3s 即断开并从
+    /// 水位重连：断言整体耗时远小于 30s，内容严格一致。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_conn_stall_reconnects_and_completes() {
+        use axum::http::{header, HeaderValue, StatusCode};
+        use bytes::Bytes;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use std::sync::Arc;
+        let total = 512 * 1024;
+        let data: Arc<Vec<u8>> = Arc::new((0..total).map(|i| (i % 251) as u8).collect());
+        let expect = data.clone();
+        let first = Arc::new(AtomicBool::new(true));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_srv = requests.clone();
+        let app = axum::Router::new().route(
+            "/file.bin",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let data = data.clone();
+                let first = first.clone();
+                let requests = requests_srv.clone();
+                async move {
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let range = headers
+                        .get(header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let total = data.len();
+                    let (from, to) =
+                        match range.strip_prefix("bytes=").and_then(|r| r.split_once('-')) {
+                            Some((f, t)) => (
+                                f.parse::<usize>().unwrap_or(0),
+                                t.parse::<usize>()
+                                    .map(|v| v + 1)
+                                    .unwrap_or(total)
+                                    .min(total),
+                            ),
+                            None => (0, total),
+                        };
+                    // 首个请求：发 16KB 后永久静默（连接不关、不再发字节）
+                    let stall = first.swap(false, std::sync::atomic::Ordering::SeqCst);
+                    let cut = if stall { (from + 16 * 1024).min(to) } else { to };
+                    let mut head: Vec<Result<Bytes, std::io::Error>> = Vec::new();
+                    let mut rest: Vec<Result<Bytes, std::io::Error>> = Vec::new();
+                    let mut off = from;
+                    while off < to {
+                        let end = (off + 8192).min(to);
+                        let c = Ok(Bytes::copy_from_slice(&data[off..end]));
+                        if off < cut {
+                            head.push(c);
+                        } else {
+                            rest.push(c);
+                        }
+                        off = end;
+                    }
+                    let stream = futures_util::stream::iter(head)
+                        .chain(futures_util::stream::once(async move {
+                            if stall {
+                                std::future::pending::<()>().await;
+                            }
+                            Ok(Bytes::new())
+                        }))
+                        .chain(futures_util::stream::iter(rest));
+                    let mut resp =
+                        axum::response::Response::new(axum::body::Body::from_stream(stream));
+                    if from > 0 || to < total {
+                        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                        resp.headers_mut().insert(
+                            header::CONTENT_RANGE,
+                            HeaderValue::from_str(&format!(
+                                "bytes {}-{}/{}",
+                                from,
+                                to.saturating_sub(1),
+                                total
+                            ))
+                            .unwrap(),
+                        );
+                    }
+                    resp
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let cancel = CancellationToken::new();
+        let mut sink = BufSink2 { buf: vec![] };
+        let t0 = std::time::Instant::now();
+        let done = download_with(
+            &build_client(),
+            &format!("http://{addr}/file.bin"),
+            0,
+            &cancel,
+            &mut sink,
+            None,
+            &[],
+        )
+        .await
+        .expect("半路静默不该拖死单连接下载");
+        let elapsed = t0.elapsed();
+        assert_eq!(done.total_len, Some(total as u64));
+        assert_eq!(sink.buf.len(), total, "重连续传不得丢字节");
+        assert_eq!(&sink.buf[..total], &expect[..], "重连续传内容错位");
+        assert!(
+            requests.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "没有发生重连接续传"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(12),
+            "静默恢复耗时 {elapsed:?}，疑似仍等 30s read_timeout"
+        );
+    }
+
+    /// 重连时服务器忽略 Range（200 整文件重发）：必须丢弃已落盘前缀后
+    /// 继续写——不截断已有数据、不重复计入进度、内容不错位。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn single_conn_resume_skips_prefix_when_range_ignored() {
+        use axum::http::StatusCode;
+        use bytes::Bytes;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let total = 256 * 1024;
+        let data: Arc<Vec<u8>> = Arc::new((0..total).map(|i| (i % 97) as u8).collect());
+        let expect = data.clone();
+        let first = Arc::new(AtomicBool::new(true));
+        let app = axum::Router::new().route(
+            "/file.bin",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let data = data.clone();
+                let first = first.clone();
+                async move {
+                    let _ = headers;
+                    let stall = first.swap(false, std::sync::atomic::Ordering::SeqCst);
+                    // 恒定返回 200 + 完整文件（忽略 Range）
+                    let mut head: Vec<Result<Bytes, std::io::Error>> = Vec::new();
+                    let mut rest: Vec<Result<Bytes, std::io::Error>> = Vec::new();
+                    let mut off = 0usize;
+                    while off < data.len() {
+                        let end = (off + 8192).min(data.len());
+                        let c = Ok(Bytes::copy_from_slice(&data[off..end]));
+                        if stall && off < 64 * 1024 {
+                            head.push(c);
+                        } else {
+                            rest.push(c);
+                        }
+                        off = end;
+                    }
+                    let stream = futures_util::stream::iter(head)
+                        .chain(futures_util::stream::once(async move {
+                            if stall {
+                                std::future::pending::<()>().await;
+                            }
+                            Ok(Bytes::new())
+                        }))
+                        .chain(futures_util::stream::iter(rest));
+                    let resp =
+                        axum::response::Response::new(axum::body::Body::from_stream(stream));
+                    let mut resp = resp;
+                    *resp.status_mut() = StatusCode::OK;
+                    resp
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let cancel = CancellationToken::new();
+        let mut sink = BufSink2 { buf: vec![] };
+        let done = download_with(
+            &build_client(),
+            &format!("http://{addr}/file.bin"),
+            0,
+            &cancel,
+            &mut sink,
+            None,
+            &[],
+        )
+        .await
+        .expect("Range 被忽略的重发不该失败");
+        // 分块传输（无 Content-Length）时总长未知——由调用方的探测结果界定
+        assert_eq!(done.total_len, None);
+        // 首个请求写了 64KB（0..64KB）；重连收到整文件 200 → 丢弃前 64KB
+        // 前缀后继续写 64KB..256KB。最终内容必须与源文件一致。
+        assert_eq!(sink.buf.len(), total, "前缀丢弃后字节数应恰好补齐");
+        assert_eq!(&sink.buf[..total], &expect[..], "跳过前缀后内容错位");
     }
 }
