@@ -157,7 +157,7 @@ impl DhKeyPair {
         }
 
         let private_key = num_bigint::BigUint::from_bytes_be(&key_bytes);
-        let public_bn = g.modpow(&private_key, &p);
+        let public_bn = g.modpow(&private_key, p);
         let public_key = to_be_96(&public_bn);
 
         DhKeyPair {
@@ -177,7 +177,7 @@ impl DhKeyPair {
     pub fn compute_shared_secret(&self, peer_public_key: &[u8; DH_KEY_LEN]) -> [u8; DH_KEY_LEN] {
         let p = dh_prime();
         let peer_bn = num_bigint::BigUint::from_bytes_be(peer_public_key);
-        let shared_bn = peer_bn.modpow(&self.private_key, &p);
+        let shared_bn = peer_bn.modpow(&self.private_key, p);
         to_be_96(&shared_bn)
     }
 }
@@ -199,11 +199,17 @@ pub fn is_degenerate_key(key: &[u8]) -> bool {
     *key.last().unwrap_or(&0) == 1 && key[..key.len() - 1].iter().all(|&b| b == 0)
 }
 
-/// 获取 DH 素数 P。
-fn dh_prime() -> num_bigint::BigUint {
-    let hex_clean: String = DH_P_HEX.chars().filter(|c| *c != '\\').collect();
-    let hex_trimmed = hex_clean.trim();
-    num_bigint::BigUint::parse_bytes(hex_trimmed.as_bytes(), 16).unwrap()
+/// 获取 DH 素数 P（进程内解析一次后缓存）。
+///
+/// 每次握手会调用两次（生成密钥对 + 计算共享密钥）；此前每次都要在
+/// 近 192 个十六进制字符上做 String 过滤与 BigUint 解析，纯浪费。
+fn dh_prime() -> &'static num_bigint::BigUint {
+    static P: std::sync::OnceLock<num_bigint::BigUint> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let hex_clean: String = DH_P_HEX.chars().filter(|c| *c != '\\').collect();
+        let hex_trimmed = hex_clean.trim();
+        num_bigint::BigUint::parse_bytes(hex_trimmed.as_bytes(), 16).unwrap()
+    })
 }
 
 // ---------------------------------------------------------------------------

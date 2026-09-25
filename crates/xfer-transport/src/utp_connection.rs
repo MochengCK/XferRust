@@ -301,10 +301,13 @@ impl UtpConnection {
         if self.state == UtpState::Closed || self.error {
             return 0;
         }
-        let mut accepted = 0;
-        while accepted < data.len() && self.pending_send.len() < MAX_PENDING_SEND {
-            self.pending_send.push_back(data[accepted]);
-            accepted += 1;
+        // 批量入队：先算容量再一次性 extend，替代逐字节 push_back 的
+        // "每字节一次容量检查 + 回绕判断"（uTP 吞吐路径上这是实打实的
+        // 每字节开销）。
+        let room = MAX_PENDING_SEND.saturating_sub(self.pending_send.len());
+        let accepted = room.min(data.len());
+        if accepted > 0 {
+            self.pending_send.extend(data[..accepted].iter().copied());
         }
         if accepted < data.len() {
             self.want_write = true;
@@ -315,15 +318,17 @@ impl UtpConnection {
     /// 读取已按序到达的数据。
     pub fn read(&mut self, buf: &mut [u8]) -> usize {
         self.want_read = false;
-        let mut n = 0;
-        while n < buf.len() {
-            if let Some(&b) = self.recv_out.front() {
-                buf[n] = b;
-                self.recv_out.pop_front();
-                n += 1;
-            } else {
-                break;
+        // 批量取：VecDeque 的两段切片各一次 memcpy + 一次 drain，
+        // 替代逐字节 pop_front（大窗口下逐字节取数是收包路径的主要 CPU）。
+        let n = buf.len().min(self.recv_out.len());
+        if n > 0 {
+            let (front, back) = self.recv_out.as_slices();
+            let take_front = front.len().min(n);
+            buf[..take_front].copy_from_slice(&front[..take_front]);
+            if n > take_front {
+                buf[take_front..n].copy_from_slice(&back[..n - take_front]);
             }
+            self.recv_out.drain(..n);
         }
         if n == 0
             && self.recv_out.is_empty()
@@ -826,8 +831,17 @@ impl UtpConnection {
             .unwrap_or(Duration::ZERO);
         let off_target = CC_TARGET_US.saturating_sub(our_delay.as_micros() as u32);
         let delay_factor = off_target as f64 / CC_TARGET_US as f64;
-        // 按新确认字节数等比增长（libutp 语义）
-        let delta = (MAX_CWND_INCREASE_PER_RTT * delay_factor * newly_acked as f64) as i64;
+        // 每 RTT 至多增长 [`MAX_CWND_INCREASE_PER_RTT`] 个包（RFC 6817 /
+        // libutp 口径：增量 = MSS × delay_factor × 已确认字节 ÷ 当前窗口）。
+        // 旧实现少了"除以窗口"这一项，增量随已确认字节线性放大 ⇒ 每 RTT
+        // 近乎翻倍（等同永久慢启动），把 LEDBAT"低于尽力而为"的语义做没了
+        // ——与常量注释写的"每 RTT 增长 1 个包"也不符。
+        let cwnd = self.max_window.max(self.packet_size) as f64;
+        let delta = (MAX_CWND_INCREASE_PER_RTT
+            * delay_factor
+            * self.packet_size as f64
+            * newly_acked as f64
+            / cwnd) as i64;
         // 无基线时启动加速（slow start）
         let delta = if self.base_delay.is_none() {
             delta + self.packet_size as i64

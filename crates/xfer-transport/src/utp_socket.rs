@@ -199,6 +199,9 @@ struct ConnContext {
     /// 之前剩余字节被直接丢弃，而 `UtpStream::write_all` 已向调用方返回
     /// Ok —— 上行流出现缺口 → 流损坏。
     write_backlog: Vec<u8>,
+    /// 交付读缓冲（跨调用复用）：uTP 收数据是高频路径，每次交付都
+    /// 新分配 + 清零 64KiB 是白白的内存抖动。
+    read_buf: Vec<u8>,
 }
 
 impl ConnContext {
@@ -329,6 +332,7 @@ impl UtpManager {
             phase_tx,
             phase: UtpPhase::Connecting,
             write_backlog: Vec::new(),
+            read_buf: vec![0u8; UTP_READ_CHUNK],
         };
 
         // 16-bit id 碰撞时不能静默覆盖旧连接 —— 放弃本次拨号
@@ -456,6 +460,7 @@ impl UtpManager {
                 phase_tx,
                 phase: UtpPhase::Connecting,
                 write_backlog: Vec::new(),
+                read_buf: vec![0u8; UTP_READ_CHUNK],
             };
 
             // 入站 SYN 的 recv_id 与现有连接冲突时丢弃该 SYN，
@@ -632,9 +637,13 @@ impl UtpManager {
             // （报文边界错位 → 校验失败/连接反复断开）。容量不足时把数据
             // 留在 recv_out —— 通告窗口（recv_buffered + recv_out）自动
             // 收缩，对端自然减速，这正是 uTP 流控的正确姿势。
+            //
+            // 读缓冲复用（`ConnContext::read_buf`）：只作暂存，交给消费者
+            // 的是一份**精确长度**的拷贝——既不重复分配/清零 64KiB，也让
+            // 消费者拿到小块时不背着 64KiB 的容量尾巴（uTP 交付块常远小于
+            // 64KiB）。
             while ctx.conn.want_read() && data_tx.capacity() > 0 {
-                let mut buf = vec![0u8; 65536];
-                let n = ctx.conn.read(&mut buf);
+                let n = ctx.conn.read(&mut ctx.read_buf);
                 if n == 0 {
                     if ctx.conn.eof_received() || ctx.conn.is_closed() {
                         let _ = data_tx.try_send(Err(io::Error::new(
@@ -644,9 +653,8 @@ impl UtpManager {
                     }
                     break;
                 }
-                buf.truncate(n);
                 // capacity > 0 已检查且管理器单线程，必然成功
-                if data_tx.try_send(Ok(buf)).is_err() {
+                if data_tx.try_send(Ok(ctx.read_buf[..n].to_vec())).is_err() {
                     break;
                 }
             }
@@ -673,6 +681,9 @@ async fn resolve_bind_addr(host: &str, port: u16) -> io::Result<SocketAddr> {
 
 /// 无 uTP 连接时的 tick 间隔（空闲期唤醒频率，见 `UtpManager::run`）。
 const IDLE_TICK: Duration = Duration::from_millis(100);
+
+/// 单次交付的读块上限（复用读缓冲的大小）。
+const UTP_READ_CHUNK: usize = 65536;
 
 /// 新建 tick 定时器（首个 tick 在一个周期后触发，跳过堆积的错失 tick）。
 fn new_tick(period: Duration) -> tokio::time::Interval {

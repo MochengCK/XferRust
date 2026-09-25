@@ -1010,6 +1010,22 @@ fn epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 逐地址计数表的容量上限（拨号失败统计、打洞轮数/尝试数等）。
+///
+/// 这类表按"对端地址"累积，而 DHT/tracker/PEX 会持续喂进海量一次性
+/// 地址（打过就再也不见）——只增不减就是慢性内存泄漏（每条约 40B，
+/// 长会话攒到几十万条即数 MB）。到上限整体清空：表里全是软预算与
+/// 展示统计，重新发现本来就会清零，清空只是重置历史与重试预算，
+/// 不影响可用性。
+const PER_ADDR_MAP_CAP: usize = 4096;
+
+/// 插入前保证容量：达到上限即清空（见 [`PER_ADDR_MAP_CAP`]）。
+fn cap_per_addr_map<K, V>(m: &mut HashMap<K, V>) {
+    if m.len() >= PER_ADDR_MAP_CAP {
+        m.clear();
+    }
+}
+
 pub struct TorrentEngine {
     /// 元数据（磁力模式在 ut_metadata 获取后从 None 变为 Some）。
     meta: RwLock<Option<TorrentMeta>>,
@@ -3371,6 +3387,7 @@ impl TorrentEngine {
     /// 用户可以看到"这个 peer 连了几次才连上"的完整历史）。
     fn note_dial_fail(&self, addr: SocketAddr, is_tcp: bool) {
         let mut stats = self.dial_fail_stats.lock().unwrap();
+        cap_per_addr_map(&mut stats);
         let e = stats.entry(addr).or_insert((0, 0, 0));
         if is_tcp {
             e.0 += 1;
@@ -3382,6 +3399,7 @@ impl TorrentEngine {
     /// 记录一次 UDP 打洞失败（展示统计第三分量）。
     fn note_udp_punch_fail(&self, addr: SocketAddr) {
         let mut stats = self.dial_fail_stats.lock().unwrap();
+        cap_per_addr_map(&mut stats);
         stats.entry(addr).or_insert((0, 0, 0)).2 += 1;
     }
 
@@ -3512,6 +3530,7 @@ impl TorrentEngine {
         // 每目标会话期最多 MAX_HOLEPUNCH_RENDEZVOUS 轮，防止反复失败刷屏
         let round = {
             let mut m = self.holepunch_rp_sent.lock().unwrap();
+            cap_per_addr_map(&mut m);
             let n = m.entry(*target).or_insert(0);
             *n += 1;
             *n
@@ -3589,6 +3608,7 @@ impl TorrentEngine {
         }
         {
             let mut attempts = self.holepunch_attempts.lock().unwrap();
+            cap_per_addr_map(&mut attempts);
             let n = attempts.entry(target).or_insert(0);
             *n += 1;
             if *n > MAX_HOLEPUNCH_ATTEMPTS {
@@ -3665,6 +3685,7 @@ impl TorrentEngine {
         }
         let attempts = {
             let mut fails = self.dial_failures.lock().unwrap();
+            cap_per_addr_map(&mut fails);
             let e = fails.entry(addr).or_insert(0);
             *e += 1;
             *e
