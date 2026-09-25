@@ -161,6 +161,12 @@ fn main() {
             cmd_task_action(&args[0], &args[1..])
         }
         Some("stat") => cmd_stat(&args[1..]),
+        Some("version") => cmd_version(&args[1..]),
+        Some("servers") => cmd_servers(&args[1..]),
+        Some("uris") => cmd_uris(&args[1..]),
+        Some("add-uri") => cmd_add_uri(&args[1..]),
+        Some("verify") => cmd_verify(&args[1..]),
+        Some("options") => cmd_options(&args[1..]),
         Some("--version") | Some("-V") => {
             println!("xfer version {ENGINE_VERSION}");
             0
@@ -197,6 +203,12 @@ fn print_usage() {
             "  xfer list [--scope all|active|waiting|stopped]\n",
             "  xfer pause|resume|remove <gid>\n",
             "  xfer stat                          全局统计\n",
+            "  xfer version                       引擎版本与能力清单\n",
+            "  xfer servers <gid>                 逐连接明细（HTTP 多连接）\n",
+            "  xfer uris <gid>                    地址/镜像列表\n",
+            "  xfer add-uri <gid> <url>           追加镜像地址（自动暂停/恢复）\n",
+            "  xfer verify <gid> [算法]           文件校验（默认 sha256）\n",
+            "  xfer options                       全局选项（JSON）\n",
             "\n",
             "默认 RPC 地址: {DEFAULT_RPC}"
         ),
@@ -213,6 +225,12 @@ fn print_usage() {
             "  xfer list [--scope all|active|waiting|stopped]\n",
             "  xfer pause|resume|remove <gid>\n",
             "  xfer stat                          global stats\n",
+            "  xfer version                       engine version + feature list\n",
+            "  xfer servers <gid>                 per-connection detail (HTTP)\n",
+            "  xfer uris <gid>                    URIs / mirrors\n",
+            "  xfer add-uri <gid> <url>           append mirror (auto pause/resume)\n",
+            "  xfer verify <gid> [algo]           verify files (default sha256)\n",
+            "  xfer options                       global options (JSON)\n",
             "\n",
             "Default RPC: {DEFAULT_RPC}"
         ),
@@ -729,6 +747,21 @@ enum SettingKey {
     BtListenPort,
     /// DHT 监听端口（0 = 随机分配）。
     DhtListenPort,
+    // ---- 追加设置项（索引 18 起，见 [`EXTRA_ROWS`]）的输入型键 ----
+    /// 代理地址（all-proxy；空 = 直连）。
+    AllProxy,
+    /// 直连例外（no-proxy，逗号分隔主机/网段；空 = 全部走代理）。
+    NoProxy,
+    /// 磁盘缓存上限（支持 K/M/G 后缀，0 = 关闭直写）。
+    DiskCache,
+    /// BT 做种时长（分钟，0 = 不限）。
+    BtSeedTime,
+    /// HLS 分片并发（1-64）。
+    HlsConcurrency,
+    /// HLS 单分片重试次数（1-10）。
+    HlsSegmentRetries,
+    /// 出站 User-Agent（空 = 引擎默认）。
+    UserAgent,
 }
 
 /// 输入弹窗类型。
@@ -742,6 +775,10 @@ enum InputKind {
     AddGlobalTracker,
     /// 添加 Tracker 订阅源。
     AddSubscription,
+    /// 追加镜像地址（HTTP/播放列表任务，引擎 changeUri）。
+    AddUri(Gid),
+    /// 单任务下载限速（引擎 changeOption，KB/s；0 = 跟随全局）。
+    TaskLimit(Gid),
 }
 
 /// 主界面状态。
@@ -829,8 +866,70 @@ struct App {
     max_conn_per_server: u64,
     /// 最小分片大小（字节，0 = 引擎默认）。
     min_split_size: u64,
+    // ---- 引擎已有能力：此前 TUI 未暴露的全局选项（设置页追加行）----
+    /// 代理地址（all-proxy；空 = 直连）。
+    all_proxy: String,
+    /// 直连例外（no-proxy；空 = 不过滤）。
+    no_proxy: String,
+    /// 出站 User-Agent（user-agent；空 = 引擎默认）。
+    user_agent: String,
+    /// HTTP 分片自适应调度（adaptive）。
+    http_adaptive: bool,
+    /// 磁盘缓存上限（原始选项值，支持 K/M/G 后缀，0 = 关闭直写）。
+    disk_cache: String,
+    /// 断点续传（continue）。
+    continue_enabled: bool,
+    /// BT 做种时长（分钟，0 = 不限）。
+    bt_seed_time_min: u64,
+    /// 保存 .torrent 元数据到下载目录（bt-save-metadata）。
+    bt_save_metadata: bool,
+    /// 从下载目录加载同名 .torrent（bt-load-saved-metadata）。
+    bt_load_saved_metadata: bool,
+    /// HLS 分片并发（1-64）。
+    hls_concurrency: u64,
+    /// HLS 选流策略（best / worst）。
+    hls_variant: String,
+    /// HLS 分片大小预探测（hls-probe-size）。
+    hls_probe_size: bool,
+    /// HLS 单分片重试次数（1-10）。
+    hls_segment_retries: u64,
+    /// HLS 落盘方式（unordered / ordered）。
+    hls_write_mode: String,
+    /// 详情页：当前 HTTP/播放列表任务的逐连接快照（task.getServers）。
+    detail_conns: Vec<ConnRow>,
+    /// 详情页：当前任务的地址/镜像列表（task.getUris）。
+    detail_uris: Vec<UriRow>,
+    /// 详情页（非 BT）：表格焦点 true = 连接表，false = 地址表。
+    detail_focus_conns: bool,
+    /// 连接表滚动偏移 (行, 列)。
+    conn_scroll: (u16, u16),
+    /// 地址表滚动偏移 (行, 列)。
+    uri_scroll: (u16, u16),
+    /// 后台文件校验：进行中则持有结果接收端（校验大文件耗时，不能阻塞 UI）。
+    verify_rx: Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<(Gid, Result<Value, String>)>>>>,
     /// 新建任务弹窗（地址 + 目录 / 磁力解析 / 文件选择，模态）。
     add_task: Option<AddTaskDialog>,
+}
+
+/// 详情页单行连接信息（HTTP 分片任务的逐连接明细，来自 task.getServers）。
+#[derive(Clone)]
+struct ConnRow {
+    /// 目标主机（同一 URI 的多条连接主机相同）。
+    host: String,
+    /// 本条连接已接收字节。
+    downloaded: u64,
+    /// 本条连接实时速率（字节/秒）。
+    speed: u64,
+    /// 请求是否仍在飞。
+    active: bool,
+}
+
+/// 详情页单行地址/镜像信息（task.getUris）。
+#[derive(Clone)]
+struct UriRow {
+    uri: String,
+    /// 引擎侧状态：waiting / used。
+    status: String,
 }
 
 /// TUI 详情页单行 peer 信息。
@@ -1179,6 +1278,26 @@ async fn app_loop(mgr: Arc<TaskManager>) -> i32 {
         bt_port_mapping: true,
         max_conn_per_server: 0,
         min_split_size: 0,
+        all_proxy: String::new(),
+        no_proxy: String::new(),
+        user_agent: String::new(),
+        http_adaptive: true,
+        disk_cache: String::new(),
+        continue_enabled: true,
+        bt_seed_time_min: 0,
+        bt_save_metadata: false,
+        bt_load_saved_metadata: false,
+        hls_concurrency: 16,
+        hls_variant: "best".to_string(),
+        hls_probe_size: true,
+        hls_segment_retries: 3,
+        hls_write_mode: "unordered".to_string(),
+        detail_conns: Vec::new(),
+        detail_uris: Vec::new(),
+        detail_focus_conns: true,
+        conn_scroll: (0, 0),
+        uri_scroll: (0, 0),
+        verify_rx: None,
         add_task: None,
     };
     refresh_app(&mut app);
@@ -1237,6 +1356,26 @@ async fn app_loop(mgr: Arc<TaskManager>) -> i32 {
 }
 
 /// 拉取全量任务列表与全局统计，更新速度历史。
+/// 详情页滚动目标：BT = (peer 表 / tracker 表)，非 BT = (连接表 / 地址表)。
+/// `first_focused` 表示第一张表是否持有焦点（BT 为 peer，非 BT 为连接）。
+fn detail_scroll_target(
+    app: &mut App,
+    is_bt: bool,
+    first_focused: bool,
+) -> &mut (u16, u16) {
+    if is_bt {
+        if first_focused {
+            &mut app.peer_scroll
+        } else {
+            &mut app.tracker_scroll
+        }
+    } else if first_focused {
+        &mut app.conn_scroll
+    } else {
+        &mut app.uri_scroll
+    }
+}
+
 fn refresh_app(app: &mut App) {
     let arr = app.mgr.list_native("all", 0, -1, None);
     app.tasks = arr.as_array().cloned().unwrap_or_default();
@@ -1327,6 +1466,40 @@ fn refresh_app(app: &mut App) {
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(xfer_engine::DEFAULT_MIN_SPLIT_SIZE);
+    // ---- 引擎已实现、此前 TUI 未暴露的全局选项 ----
+    let opt_str = |k: &str| opts[k].as_str().unwrap_or("").to_string();
+    let opt_num = |k: &str, d: u64| {
+        opts[k]
+            .as_str()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(d)
+    };
+    let opt_bool = |k: &str, d: bool| {
+        opts[k]
+            .as_str()
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(d)
+    };
+    app.all_proxy = opt_str("all-proxy");
+    app.no_proxy = opt_str("no-proxy");
+    app.user_agent = opt_str("user-agent");
+    app.http_adaptive = opt_bool("adaptive", true);
+    app.disk_cache = opt_str("disk-cache");
+    app.continue_enabled = opt_bool("continue", true);
+    app.bt_seed_time_min = opt_num("bt-seed-time", 0);
+    app.bt_save_metadata = opt_bool("bt-save-metadata", false);
+    app.bt_load_saved_metadata = opt_bool("bt-load-saved-metadata", false);
+    app.hls_concurrency = opt_num("hls-concurrency", 16);
+    app.hls_variant = {
+        let v = opt_str("hls-variant").to_ascii_lowercase();
+        if v == "worst" { "worst".into() } else { "best".into() }
+    };
+    app.hls_probe_size = opt_bool("hls-probe-size", true);
+    app.hls_segment_retries = opt_num("hls-segment-retries", 3);
+    app.hls_write_mode = {
+        let v = opt_str("hls-write-mode").to_ascii_lowercase();
+        if v == "ordered" { "ordered".into() } else { "unordered".into() }
+    };
     // 界面语言：会话里显式保存过才应用（否则沿用 XFER_LANG / 默认）
     if let Some(l) = opts["lang"].as_str() {
         match l {
@@ -1449,10 +1622,83 @@ fn refresh_app(app: &mut App) {
                     })
                 })
                 .unwrap_or_default();
+            // HTTP / 播放列表任务：引擎 getServers 的逐连接明细
+            // （分片路径逐连接上报；其余回退为汇总单条；BT 返回空）
+            app.detail_conns = app
+                .mgr
+                .get_servers(g)
+                .ok()
+                .and_then(|v| {
+                    v.as_array().map(|files| {
+                        files
+                            .iter()
+                            .flat_map(|f| f["servers"].as_array().cloned().unwrap_or_default())
+                            .map(|s| {
+                                let speed = s["downloadSpeed"].as_u64().unwrap_or(0);
+                                ConnRow {
+                                    host: host_of_uri(s["currentUri"].as_str().unwrap_or("-")),
+                                    downloaded: s["downloadLength"].as_u64().unwrap_or(0),
+                                    speed,
+                                    active: speed > 0,
+                                }
+                            })
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            // 地址/镜像列表（aria2 语义：used = 当前正在使用的那条）
+            app.detail_uris = app
+                .mgr
+                .get_uris(g)
+                .ok()
+                .and_then(|v| {
+                    v.as_array().map(|a| {
+                        a.iter()
+                            .map(|u| UriRow {
+                                uri: u["uri"].as_str().unwrap_or("-").to_string(),
+                                status: u["status"].as_str().unwrap_or("-").to_string(),
+                            })
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
         }
     } else {
         app.detail_trackers.clear();
         app.detail_peers.clear();
+        app.detail_conns.clear();
+        app.detail_uris.clear();
+    }
+    // 后台文件校验结果回收（校验大文件可能耗时数分钟，见详情页 `v` 动作）
+    if let Some(rx) = app.verify_rx.clone() {
+        match rx.lock().unwrap().try_recv() {
+            Ok((gid, res)) => {
+                app.verify_rx = None;
+                let short: String = gid.0.chars().take(8).collect();
+                let msg = match res {
+                    Ok(v) => {
+                        let count = v["count"].as_u64().unwrap_or(0);
+                        match v["status"].as_str().unwrap_or("") {
+                            "ok" => format!("{} {short}（{count}）", tr("校验通过", "Verified")),
+                            "missing" => format!(
+                                "{} {short}: {}",
+                                tr("校验：文件缺失", "Verify: missing"),
+                                v["missing"].as_array().map(|a| a.len()).unwrap_or(0)
+                            ),
+                            _ => format!(
+                                "{} {short}: {}",
+                                tr("校验：大小不符", "Verify: size mismatch"),
+                                v["mismatched"].as_array().map(|a| a.len()).unwrap_or(0)
+                            ),
+                        }
+                    }
+                    Err(e) => format!("{}: {e}", tr("校验失败", "Verify failed")),
+                };
+                app.message = Some((msg, std::time::Instant::now()));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => app.verify_rx = None,
+        }
     }
 }
 
@@ -1476,17 +1722,24 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                         | InputKind::EditSetting(SettingKey::MaxUploadLimit)
                         | InputKind::EditSetting(SettingKey::MaxConnPerServer)
                         | InputKind::EditSetting(SettingKey::MinSplitSize)
+                        | InputKind::EditSetting(SettingKey::BtSeedTime)
+                        | InputKind::EditSetting(SettingKey::HlsConcurrency)
+                        | InputKind::EditSetting(SettingKey::HlsSegmentRetries)
                 );
                 let decimal_ok = matches!(
                     kind,
                     InputKind::EditSetting(SettingKey::BtSeedRatio)
                 );
+                // 磁盘缓存：数字 + K/M/G 后缀（与引擎 parse_size_bytes 同口径）
+                let size_ok = matches!(kind, InputKind::EditSetting(SettingKey::DiskCache));
                 // digit_only → 仅数字；decimal_ok → 数字或小数点（仅一个）；
                 // 其他（目录等）→ 任意字符
                 let ok = if digit_only {
                     c.is_ascii_digit()
                 } else if decimal_ok {
                     c.is_ascii_digit() || (c == '.' && !buf.contains('.'))
+                } else if size_ok {
+                    c.is_ascii_digit() || matches!(c.to_ascii_lowercase(), 'k' | 'm' | 'g')
                 } else {
                     true
                 };
@@ -1506,6 +1759,8 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                     InputKind::AddTracker(gid) => submit_tracker(app, gid, &val),
                     InputKind::AddGlobalTracker => submit_global_tracker(app, &val),
                     InputKind::AddSubscription => submit_subscription(app, &val),
+                    InputKind::AddUri(gid) => submit_add_uri(app, &gid, &val),
+                    InputKind::TaskLimit(gid) => submit_task_limit(app, &gid, &val),
                 }
             }
             KeyCode::Esc => app.input = None,
@@ -1654,54 +1909,105 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
             }
             _ => {}
         },
-        MainView::Detail(_) => match k.code {
+        MainView::Detail(_) => {
+            // BT 任务看 tracker/peer 两表；HTTP/播放列表看连接/地址两表
+            let is_bt = current_gid(app)
+                .map(|g| app.mgr.is_bt_task(&g))
+                .unwrap_or(false);
+            let first_focused = if is_bt {
+                app.detail_focus_peers
+            } else {
+                app.detail_focus_conns
+            };
+            match k.code {
             KeyCode::Char('q') => app.confirm_quit = true,
             KeyCode::Esc | KeyCode::Enter => {
                 app.view = MainView::List;
             }
-            // Tab：tracker 表 / peer 表焦点切换
-            KeyCode::Tab => app.detail_focus_peers = !app.detail_focus_peers,
-            // 滚动：方向键作用于当前聚焦的表格（tracker 表 / peer 表）
-            KeyCode::Up => {
-                if app.detail_focus_peers {
-                    app.peer_scroll.0 = app.peer_scroll.0.saturating_sub(1);
+            // Tab：两表焦点切换（BT = peer/tracker；非 BT = 连接/地址）
+            KeyCode::Tab => {
+                if is_bt {
+                    app.detail_focus_peers = !app.detail_focus_peers;
                 } else {
-                    app.tracker_scroll.0 = app.tracker_scroll.0.saturating_sub(1);
+                    app.detail_focus_conns = !app.detail_focus_conns;
                 }
+            }
+            // 滚动：方向键作用于当前聚焦的表格
+            KeyCode::Up => {
+                let t = detail_scroll_target(app, is_bt, first_focused);
+                t.0 = t.0.saturating_sub(1);
             }
             KeyCode::Down => {
-                if app.detail_focus_peers {
-                    app.peer_scroll.0 = app.peer_scroll.0.saturating_add(1);
-                } else {
-                    app.tracker_scroll.0 = app.tracker_scroll.0.saturating_add(1);
-                }
+                let t = detail_scroll_target(app, is_bt, first_focused);
+                t.0 = t.0.saturating_add(1);
             }
             KeyCode::PageUp => {
-                if app.detail_focus_peers {
-                    app.peer_scroll.0 = app.peer_scroll.0.saturating_sub(10);
-                } else {
-                    app.tracker_scroll.0 = app.tracker_scroll.0.saturating_sub(10);
-                }
+                let t = detail_scroll_target(app, is_bt, first_focused);
+                t.0 = t.0.saturating_sub(10);
             }
             KeyCode::PageDown => {
-                if app.detail_focus_peers {
-                    app.peer_scroll.0 = app.peer_scroll.0.saturating_add(10);
-                } else {
-                    app.tracker_scroll.0 = app.tracker_scroll.0.saturating_add(10);
-                }
+                let t = detail_scroll_target(app, is_bt, first_focused);
+                t.0 = t.0.saturating_add(10);
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if app.detail_focus_peers {
-                    app.peer_scroll.1 = app.peer_scroll.1.saturating_sub(2)
-                } else {
-                    app.tracker_scroll.1 = app.tracker_scroll.1.saturating_sub(2)
-                }
+                let t = detail_scroll_target(app, is_bt, first_focused);
+                t.1 = t.1.saturating_sub(2);
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if app.detail_focus_peers {
-                    app.peer_scroll.1 = app.peer_scroll.1.saturating_add(2)
-                } else {
-                    app.tracker_scroll.1 = app.tracker_scroll.1.saturating_add(2)
+                let t = detail_scroll_target(app, is_bt, first_focused);
+                t.1 = t.1.saturating_add(2);
+            }
+            // v：文件校验（sha256，后台线程跑，结果下一拍回显）
+            KeyCode::Char('v') => {
+                if let Some(g) = current_gid(app) {
+                    if app.verify_rx.is_some() {
+                        app.message = Some((
+                            tr("校验进行中…", "Verify already running…").to_string(),
+                            std::time::Instant::now(),
+                        ));
+                    } else {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let mgr = app.mgr.clone();
+                        let g2 = g.clone();
+                        let spawned = std::thread::Builder::new()
+                            .name("xfer-verify".into())
+                            .spawn(move || {
+                                let r = mgr.verify_task_files(&g2, "sha256");
+                                let _ = tx.send((g2, r));
+                            })
+                            .is_ok();
+                        if spawned {
+                            app.verify_rx = Some(Arc::new(std::sync::Mutex::new(rx)));
+                            app.message = Some((
+                                tr("开始校验（sha256）…", "Verifying (sha256)…").to_string(),
+                                std::time::Instant::now(),
+                            ));
+                        } else {
+                            app.message = Some((
+                                tr("无法启动校验线程", "Cannot start verify thread").to_string(),
+                                std::time::Instant::now(),
+                            ));
+                        }
+                    }
+                }
+            }
+            // u：追加镜像地址（仅 HTTP/播放列表任务有 URI 概念）
+            KeyCode::Char('u') => {
+                if let Some(g) = current_gid(app) {
+                    if app.mgr.is_bt_task(&g) {
+                        app.message = Some((
+                            tr("BT 任务无镜像地址", "BT task has no mirrors").to_string(),
+                            std::time::Instant::now(),
+                        ));
+                    } else {
+                        app.input = Some((InputKind::AddUri(g), String::new()));
+                    }
+                }
+            }
+            // o：单任务下载限速
+            KeyCode::Char('o') => {
+                if let Some(g) = current_gid(app) {
+                    app.input = Some((InputKind::TaskLimit(g), String::new()));
                 }
             }
             KeyCode::Char('r') => app_action(app, "toggle"),
@@ -1727,7 +2033,8 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                 }
             }
             _ => {}
-        },
+            }
+        }
         MainView::Settings => match k.code {
             KeyCode::Char('q') => app.confirm_quit = true,
             KeyCode::Esc => app.view = MainView::List,
@@ -1749,8 +2056,11 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                 }
             },
             KeyCode::Down | KeyCode::Char('j') => match app.settings_area {
-                // 参数区共 18 项（0..=17，末项为「界面语言」），上限必须到 17
-                0 => app.settings_sel = (app.settings_sel + 1).min(17),
+                // 参数区 = 原有 18 项（末项为「界面语言」）+ 追加项（EXTRA_ROWS）
+                0 => {
+                    let last = BASE_SETTINGS_ROWS + EXTRA_ROWS.len() - 1;
+                    app.settings_sel = (app.settings_sel + 1).min(last)
+                }
                 1 => {
                     if app.tracker_sel + 1 < app.global_trackers.len() {
                         app.tracker_sel += 1;
@@ -1764,16 +2074,48 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
             },
             KeyCode::Left | KeyCode::Char('-') => {
                 if app.settings_area == 0 {
-                    adjust_concurrency(app, -1);
+                    if app.settings_sel >= BASE_SETTINGS_ROWS {
+                        if let Some(msg) = adjust_extra(app, app.settings_sel, -1) {
+                            app.message = Some((msg, std::time::Instant::now()));
+                        }
+                    } else {
+                        adjust_concurrency(app, -1);
+                    }
                 }
             }
             KeyCode::Right | KeyCode::Char('+') | KeyCode::Char('=') => {
                 if app.settings_area == 0 {
-                    adjust_concurrency(app, 1);
+                    if app.settings_sel >= BASE_SETTINGS_ROWS {
+                        if let Some(msg) = adjust_extra(app, app.settings_sel, 1) {
+                            app.message = Some((msg, std::time::Instant::now()));
+                        }
+                    } else {
+                        adjust_concurrency(app, 1);
+                    }
                 }
             }
             KeyCode::Enter => {
                 if app.settings_area == 0 {
+                    if app.settings_sel >= BASE_SETTINGS_ROWS {
+                        // 追加设置项：输入型弹输入框（初值取原始值），
+                        // 开关/枚举型提示用 ←→
+                        let row = &EXTRA_ROWS[app.settings_sel - BASE_SETTINGS_ROWS];
+                        match row.action {
+                            ExtraAction::Edit(k, sk) => {
+                                app.input = Some((
+                                    InputKind::EditSetting(sk),
+                                    extra_raw_value(app, k),
+                                ));
+                            }
+                            _ => {
+                                app.message = Some((
+                                    tr("按 ←→ 切换该项", "Use ←→ to change").to_string(),
+                                    std::time::Instant::now(),
+                                ));
+                            }
+                        }
+                        return true;
+                    }
                     if app.settings_sel == 17 {
                         // 界面语言：三个选项全部摆出，直接选择
                         app.lang_picker = Some(match lang() {
@@ -2341,6 +2683,58 @@ fn submit_add_task(app: &mut App, d: &AddTaskDialog) {
 }
 
 /// 提交输入的 tracker URL，添加到 BT 任务。
+/// 追加镜像地址：引擎 `changeUri` 只接受 waiting/paused（active 直接报错），
+/// 因此先暂停、改完再恢复——等价于应用端的「暂停→重建」路径，但不重建任务，
+/// 已下字节全部保留。
+fn submit_add_uri(app: &mut App, gid: &Gid, val: &str) {
+    let url = val.trim();
+    if url.is_empty() {
+        app.message = Some((
+            tr("地址为空", "Empty URI").to_string(),
+            std::time::Instant::now(),
+        ));
+        return;
+    }
+    let was_active = app
+        .tasks
+        .iter()
+        .find(|t| t["gid"].as_str() == Some(gid.0.as_str()))
+        .map(|t| t["status"].as_str().unwrap_or("") == "active")
+        .unwrap_or(false);
+    if was_active {
+        let _ = app.mgr.pause(gid);
+    }
+    let r = app.mgr.change_uri(gid, 1, Vec::new(), vec![url.to_string()]);
+    if was_active {
+        let _ = app.mgr.unpause(gid);
+    }
+    let msg = match r {
+        Ok(_) => format!("{} {url}", tr("已追加镜像", "Mirror added")),
+        Err(e) => format!("{}: {e}", tr("追加镜像失败", "Add mirror failed")),
+    };
+    app.message = Some((msg, std::time::Instant::now()));
+}
+
+/// 单任务下载限速（KB/s；0 = 跟随全局）。
+fn submit_task_limit(app: &mut App, gid: &Gid, val: &str) {
+    let msg = match val.trim().parse::<u64>() {
+        Ok(kbs) => {
+            let bytes = kbs.saturating_mul(1024);
+            let opts = json!({ "max-download-limit": bytes.to_string() });
+            app.mgr
+                .change_option(gid, &opts)
+                .map(|_| format!("{} {kbs} KB/s", tr("已设置单任务限速", "Task limit set:")))
+                .unwrap_or_else(|e| format!("{}: {e}", tr("设置失败", "Failed to set")))
+        }
+        _ => tr(
+            "限速须为非负整数（KB/s，0 = 跟随全局）",
+            "Limit must be a non-negative integer (KB/s, 0 = follow global)",
+        )
+        .to_string(),
+    };
+    app.message = Some((msg, std::time::Instant::now()));
+}
+
 fn submit_tracker(app: &mut App, gid: Gid, val: &str) {
     let val = val.trim();
     if val.is_empty() {
@@ -2575,8 +2969,96 @@ fn submit_setting(app: &mut App, key: SettingKey, val: &str) {
             if app.bt_seed_mode { "false" } else { "true" },
             tr("BT 完成行为", "BT on done"),
         ),
+        // ---- 追加设置项（见 EXTRA_ROWS）----
+        SettingKey::AllProxy => {
+            let v = val.trim();
+            if v.is_empty() {
+                // 空 = 直连（引擎 build_client 会过滤空值）
+                apply_global_option(app, "all-proxy", "", tr("代理地址", "proxy"))
+            } else if v.chars().any(char::is_whitespace) {
+                tr("代理地址不能含空白字符", "Proxy must not contain spaces").into()
+            } else {
+                apply_global_option(app, "all-proxy", v, tr("代理地址", "proxy"))
+            }
+        }
+        SettingKey::NoProxy => apply_global_option(
+            app,
+            "no-proxy",
+            val.trim(),
+            tr("直连例外", "no-proxy"),
+        ),
+        SettingKey::DiskCache => {
+            let v = val.trim();
+            if v.is_empty() || v == "0" {
+                apply_global_option(app, "disk-cache", "0", tr("磁盘缓存", "disk cache"))
+            } else if parse_size_suffix(v).is_some() {
+                apply_global_option(app, "disk-cache", v, tr("磁盘缓存", "disk cache"))
+            } else {
+                tr(
+                    "磁盘缓存须为字节数或带 K/M/G 后缀（0 = 关闭）",
+                    "Disk cache must be bytes or K/M/G suffix (0 = off)",
+                )
+                .into()
+            }
+        }
+        SettingKey::BtSeedTime => match val.trim().parse::<u64>() {
+            Ok(n) => apply_global_option(
+                app,
+                "bt-seed-time",
+                &n.to_string(),
+                tr("BT 做种时长（分钟）", "seed time (min)"),
+            ),
+            _ => tr(
+                "做种时长须为非负整数（分钟，0 = 不限）",
+                "Seed time must be a non-negative integer (minutes, 0 = unlimited)",
+            )
+            .into(),
+        },
+        SettingKey::HlsConcurrency => match val.trim().parse::<u64>() {
+            Ok(n) if (1..=64).contains(&n) => apply_global_option(
+                app,
+                "hls-concurrency",
+                &n.to_string(),
+                tr("HLS 分片并发", "HLS concurrency"),
+            ),
+            _ => tr("HLS 并发须为 1-64 的整数", "HLS concurrency must be 1-64").into(),
+        },
+        SettingKey::UserAgent => {
+            // 空格合法（浏览器 UA 就带空格），制表/换行会破坏请求头
+            let v = val.trim();
+            if v.chars().any(|c| c.is_control()) {
+                tr(
+                    "User-Agent 不能含换行/制表等控制字符",
+                    "User-Agent must not contain control characters",
+                )
+                .into()
+            } else {
+                apply_global_option(app, "user-agent", v, tr("User-Agent", "user-agent"))
+            }
+        }
+        SettingKey::HlsSegmentRetries => match val.trim().parse::<u64>() {
+            Ok(n) if (1..=10).contains(&n) => apply_global_option(
+                app,
+                "hls-segment-retries",
+                &n.to_string(),
+                tr("HLS 分片重试", "HLS retries"),
+            ),
+            _ => tr("HLS 重试须为 1-10 的整数", "HLS retries must be 1-10").into(),
+        },
     };
     app.message = Some((msg, std::time::Instant::now()));
+}
+
+/// 校验「字节数或 K/M/G 后缀」写法（与引擎 `parse_size_bytes` 同口径）。
+fn parse_size_suffix(v: &str) -> Option<u64> {
+    let t = v.trim();
+    let (num, mult) = match t.as_bytes().last()? {
+        b'k' | b'K' => (&t[..t.len() - 1], 1024u64),
+        b'm' | b'M' => (&t[..t.len() - 1], 1024 * 1024),
+        b'g' | b'G' => (&t[..t.len() - 1], 1024 * 1024 * 1024),
+        _ => (t, 1),
+    };
+    num.trim().parse::<u64>().ok().map(|n| n.saturating_mul(mult))
 }
 
 /// 应用全局选项，返回反馈消息。
@@ -3571,15 +4053,33 @@ fn draw_detail(f: &mut ratatui::Frame, app: &App, gid: &Gid) {
 
     let is_bt = app.mgr.is_bt_task(gid);
     if !is_bt {
-        // 非 BT 详情：顶部全局信息栏（1 行）+ 原全屏视图（区域整体下移 1 行）
-        let areas = Layout::vertical([Constraint::Length(1), Constraint::Min(5)]).split(f.area());
+        // 非 BT（HTTP / HLS）详情：顶部信息栏 + 主视图 + 连接明细 + 地址/镜像 + 底栏
+        let areas = Layout::vertical([
+            Constraint::Length(1), // 顶部全局信息栏
+            Constraint::Min(10),   // 任务信息 + 进度 + 速度图
+            Constraint::Min(4),    // 连接明细（引擎 getServers 逐连接）
+            Constraint::Min(3),    // 地址/镜像（引擎 getUris）
+            Constraint::Length(1), // 底栏
+        ])
+        .split(f.area());
         draw_top_bar(f, app, areas[0]);
-        let sub = ratatui::layout::Rect {
-            y: f.area().y + 1,
-            height: f.area().height.saturating_sub(1),
-            ..f.area()
-        };
-        draw_in_area(f, &st, gid, &footer, sub, true);
+        draw_in_area(f, &st, gid, &footer, areas[1], false);
+        draw_detail_conns(f, app, areas[2]);
+        draw_detail_uris(f, app, areas[3]);
+        let foot = Paragraph::new(hint_line(&[
+            ("Esc/Enter", tr("返回", "back")),
+            ("Tab", tr("切焦点", "focus")),
+            ("↑↓←→", tr("滚动", "scroll")),
+            ("PgUp/PgDn", tr("翻页", "page")),
+            ("r", tr("暂停/继续", "pause/resume")),
+            ("v", tr("校验", "verify")),
+            ("u", tr("加镜像", "add mirror")),
+            ("o", tr("限速", "limit")),
+            ("x", tr("移除", "remove")),
+            ("q", tr("退出", "quit")),
+        ]))
+        .alignment(Alignment::Center);
+        f.render_widget(foot, areas[4]);
         return;
     }
 
@@ -3606,11 +4106,154 @@ fn draw_detail(f: &mut ratatui::Frame, app: &App, gid: &Gid) {
         ("PgUp/PgDn", tr("翻页", "page")),
         ("r", tr("暂停/继续", "pause/resume")),
         ("t", tr("加tracker", "add tracker")),
+        ("v", tr("校验", "verify")),
+        ("o", tr("限速", "limit")),
         ("x", tr("移除", "remove")),
         ("q", tr("退出", "quit")),
     ]))
     .alignment(Alignment::Center);
     f.render_widget(foot, areas[4]);
+}
+
+/// 详情视图连接明细区块（HTTP/播放列表任务：引擎 `getServers` 的逐连接行）。
+///
+/// 分片下载会对同一 URI 开多条连接，引擎逐连接上报（主机 / 已收字节 /
+/// 实时速率 / 是否在飞）；单连接与播放列表任务回退为汇总单条。
+fn draw_detail_conns(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Padding, Paragraph};
+
+    let dim = ui_dim();
+    let accent = ui_accent();
+    let conns = &app.detail_conns;
+    let focused = app.detail_focus_conns;
+    let active = conns.iter().filter(|c| c.active).count();
+
+    let block = if focused { ui_card_focused() } else { ui_card() }
+        .title(Span::styled(
+            format!(
+                " {}（{}/{}）",
+                tr("连接", "Connections"),
+                active,
+                conns.len()
+            ),
+            if focused {
+                Style::new().fg(Color::Yellow)
+            } else {
+                accent
+            },
+        ))
+        .padding(Padding::horizontal(1));
+
+    if conns.is_empty() {
+        let p = Paragraph::new(Line::from(Span::styled(
+            tr("（暂无连接明细）", "(no connection detail)"),
+            dim,
+        )))
+        .block(block)
+        .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(p, area);
+        return;
+    }
+
+    let inner_w = area.width.saturating_sub(4) as usize; // 边框 + 内边距
+    let num_w = 14usize;
+    let state_w = 8usize;
+    let host_w = inner_w.saturating_sub(num_w * 2 + state_w).max(10);
+    let right = |s: &str, w: usize| -> String {
+        let d = disp_w(s);
+        format!("{}{}", " ".repeat(w.saturating_sub(d)), s)
+    };
+    let green = Style::new().fg(Color::Green);
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled(pad_str(&tr("主机", "Host"), host_w), accent),
+        Span::styled(right(&tr("已下载", "Downloaded"), num_w), accent),
+        Span::styled(right(&tr("速率", "Speed"), num_w), accent),
+        Span::styled(right(&tr("状态", "State"), state_w), accent),
+    ])];
+    for c in conns.iter() {
+        let state = if c.active {
+            tr("活跃", "active")
+        } else {
+            tr("空闲", "idle")
+        };
+        lines.push(Line::from(vec![
+            Span::raw(pad_str(&truncate_to_width(&c.host, host_w), host_w)),
+            Span::raw(right(&fmt_size(c.downloaded), num_w)),
+            Span::raw(right(&format!("{}/s", fmt_size(c.speed)), num_w)),
+            Span::styled(
+                right(&state, state_w),
+                if c.active { green } else { dim },
+            ),
+        ]));
+    }
+    let scroll_y = app.conn_scroll.0.min(lines.len().saturating_sub(1) as u16);
+    let scroll_x = app.conn_scroll.1.min((inner_w as u16).saturating_sub(1));
+    let p = Paragraph::new(lines).block(block).scroll((scroll_y, scroll_x));
+    f.render_widget(p, area);
+}
+
+/// 详情视图地址/镜像区块（引擎 `getUris`：used = 当前正在使用的那条）。
+fn draw_detail_uris(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Padding, Paragraph};
+
+    let dim = ui_dim();
+    let accent = ui_accent();
+    let uris = &app.detail_uris;
+    let focused = !app.detail_focus_conns;
+
+    let block = if focused { ui_card_focused() } else { ui_card() }
+        .title(Span::styled(
+            format!(" {}（{}）", tr("地址 / 镜像", "URIs / mirrors"), uris.len()),
+            if focused {
+                Style::new().fg(Color::Yellow)
+            } else {
+                accent
+            },
+        ))
+        .padding(Padding::horizontal(1));
+
+    if uris.is_empty() {
+        let p = Paragraph::new(Line::from(Span::styled(
+            tr("（无地址记录）", "(no URIs)"),
+            dim,
+        )))
+        .block(block)
+        .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(p, area);
+        return;
+    }
+    let green = Style::new().fg(Color::Green);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, u) in uris.iter().enumerate() {
+        let used = u.status == "used";
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>3}. ", i + 1), dim),
+            Span::styled(
+                if used {
+                    tr("使用中", "used")
+                } else {
+                    tr("待用", "waiting")
+                },
+                if used { green } else { dim },
+            ),
+            Span::raw("  "),
+            Span::raw(u.uri.clone()),
+        ]));
+    }
+    let content_w = uris
+        .iter()
+        .map(|u| disp_w(&u.uri))
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(1) as u16;
+    let scroll_y = app.uri_scroll.0.min(lines.len().saturating_sub(1) as u16);
+    let scroll_x = app.uri_scroll.1.min(content_w);
+    let p = Paragraph::new(lines).block(block).scroll((scroll_y, scroll_x));
+    f.render_widget(p, area);
 }
 
 /// 详情视图 tracker 列表区块（支持上下/横向滚动，聚焦卡片亮边框标记）。
@@ -3875,6 +4518,19 @@ fn truncate_to_width(s: &str, width: usize) -> String {
     out
 }
 
+/// 从 URL 提取主机（去 scheme / 端口 / 路径 / 认证信息）；解析失败原样返回。
+fn host_of_uri(uri: &str) -> String {
+    let rest = uri.split("://").nth(1).unwrap_or(uri);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = host.rsplit('@').next().unwrap_or(host); // 去掉 user:pass@
+    if host.starts_with('[') {
+        // IPv6 字面量 [::1]:8080 → 保留方括号内内容
+        format!("{}]", host.split(']').next().unwrap_or(host))
+    } else {
+        host.split(':').next().unwrap_or(host).to_string()
+    }
+}
+
 /// 从 "ip:port"（IPv6 形如 "[::1]:6881"）中取出纯 IP。
 fn ip_of_addr(addr: &str) -> &str {
     let ip = addr.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(addr);
@@ -3941,6 +4597,301 @@ fn geo_lookup(ip: &str) -> String {
 }
 
 /// 设置视图：可编辑项（并发/连接/限速/目录）+ Tracker 服务器列表 + 引擎信息 / 消息行 / 快捷键底栏。
+/// 设置页「参数」卡片的基础行数（原有 18 项：0..=17，末项为界面语言）。
+/// 追加行排在它之后，见 [`EXTRA_ROWS`]。
+const BASE_SETTINGS_ROWS: usize = 18;
+
+// ---------------------------------------------------------------------------
+// 追加设置项：引擎已实现、TUI 此前未暴露的全局选项
+//
+// 表驱动而非继续堆「下标 match」：每行自带取值渲染与交互动作，
+// 新增一项只需在这里加一行 + 输入型键在 submit_setting 里加一个分支。
+// ---------------------------------------------------------------------------
+
+/// 追加设置项的键。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExtraKey {
+    AllProxy,
+    NoProxy,
+    HttpAdaptive,
+    DiskCache,
+    ContinueEnabled,
+    BtSeedTime,
+    BtSaveMetadata,
+    BtLoadSavedMetadata,
+    HlsConcurrency,
+    HlsVariant,
+    HlsProbeSize,
+    HlsSegmentRetries,
+    HlsWriteMode,
+    /// 出站 User-Agent（user-agent；空 = 引擎默认）。
+    UserAgent,
+}
+
+/// 追加行的交互方式。
+#[derive(Clone, Copy)]
+enum ExtraAction {
+    /// 回车弹输入框（文本 / 数字），携带对应的 SettingKey。
+    Edit(ExtraKey, SettingKey),
+    /// 左右直切开关。
+    Toggle(ExtraKey),
+    /// 左右循环枚举（取值表在动作里）。
+    Cycle(ExtraKey, &'static [&'static str]),
+}
+
+/// 追加行定义。
+struct ExtraRow {
+    zh: &'static str,
+    en: &'static str,
+    action: ExtraAction,
+}
+
+const EXTRA_ROWS: [ExtraRow; 14] = [
+    ExtraRow {
+        zh: "代理地址",
+        en: "Proxy",
+        action: ExtraAction::Edit(ExtraKey::AllProxy, SettingKey::AllProxy),
+    },
+    ExtraRow {
+        zh: "直连例外",
+        en: "No-proxy",
+        action: ExtraAction::Edit(ExtraKey::NoProxy, SettingKey::NoProxy),
+    },
+    ExtraRow {
+        zh: "User-Agent",
+        en: "User-Agent",
+        action: ExtraAction::Edit(ExtraKey::UserAgent, SettingKey::UserAgent),
+    },
+    ExtraRow {
+        zh: "HTTP 自适应调度",
+        en: "HTTP adaptive",
+        action: ExtraAction::Toggle(ExtraKey::HttpAdaptive),
+    },
+    ExtraRow {
+        zh: "磁盘缓存",
+        en: "Disk cache",
+        action: ExtraAction::Edit(ExtraKey::DiskCache, SettingKey::DiskCache),
+    },
+    ExtraRow {
+        zh: "断点续传",
+        en: "Continue",
+        action: ExtraAction::Toggle(ExtraKey::ContinueEnabled),
+    },
+    ExtraRow {
+        zh: "BT 做种时长",
+        en: "Seed time",
+        action: ExtraAction::Edit(ExtraKey::BtSeedTime, SettingKey::BtSeedTime),
+    },
+    ExtraRow {
+        zh: "保存种子元数据",
+        en: "Save metadata",
+        action: ExtraAction::Toggle(ExtraKey::BtSaveMetadata),
+    },
+    ExtraRow {
+        zh: "加载本地元数据",
+        en: "Load metadata",
+        action: ExtraAction::Toggle(ExtraKey::BtLoadSavedMetadata),
+    },
+    ExtraRow {
+        zh: "HLS 分片并发",
+        en: "HLS concurrency",
+        action: ExtraAction::Edit(ExtraKey::HlsConcurrency, SettingKey::HlsConcurrency),
+    },
+    ExtraRow {
+        zh: "HLS 选流",
+        en: "HLS variant",
+        action: ExtraAction::Cycle(ExtraKey::HlsVariant, &["best", "worst"]),
+    },
+    ExtraRow {
+        zh: "HLS 分片预探测",
+        en: "HLS probe size",
+        action: ExtraAction::Toggle(ExtraKey::HlsProbeSize),
+    },
+    ExtraRow {
+        zh: "HLS 分片重试",
+        en: "HLS retries",
+        action: ExtraAction::Edit(ExtraKey::HlsSegmentRetries, SettingKey::HlsSegmentRetries),
+    },
+    ExtraRow {
+        zh: "HLS 落盘方式",
+        en: "HLS write mode",
+        action: ExtraAction::Cycle(ExtraKey::HlsWriteMode, &["unordered", "ordered"]),
+    },
+];
+
+/// 行 → 键。
+fn extra_key_of(row: &ExtraRow) -> ExtraKey {
+    match row.action {
+        ExtraAction::Edit(k, _) | ExtraAction::Toggle(k) | ExtraAction::Cycle(k, _) => k,
+    }
+}
+
+/// 键 → 引擎全局选项名。
+fn extra_option_name(key: ExtraKey) -> &'static str {
+    match key {
+        ExtraKey::AllProxy => "all-proxy",
+        ExtraKey::NoProxy => "no-proxy",
+        ExtraKey::HttpAdaptive => "adaptive",
+        ExtraKey::DiskCache => "disk-cache",
+        ExtraKey::ContinueEnabled => "continue",
+        ExtraKey::BtSeedTime => "bt-seed-time",
+        ExtraKey::BtSaveMetadata => "bt-save-metadata",
+        ExtraKey::BtLoadSavedMetadata => "bt-load-saved-metadata",
+        ExtraKey::HlsConcurrency => "hls-concurrency",
+        ExtraKey::HlsVariant => "hls-variant",
+        ExtraKey::HlsProbeSize => "hls-probe-size",
+        ExtraKey::HlsSegmentRetries => "hls-segment-retries",
+        ExtraKey::HlsWriteMode => "hls-write-mode",
+        ExtraKey::UserAgent => "user-agent",
+    }
+}
+
+/// 追加行的显示值。
+fn extra_value(app: &App, key: ExtraKey) -> String {
+    let on_off = |on: bool| -> String {
+        if on {
+            tr("开", "on").to_string()
+        } else {
+            tr("关", "off").to_string()
+        }
+    };
+    match key {
+        ExtraKey::AllProxy => {
+            if app.all_proxy.trim().is_empty() {
+                tr("直连", "direct").to_string()
+            } else {
+                app.all_proxy.clone()
+            }
+        }
+        ExtraKey::NoProxy => {
+            if app.no_proxy.trim().is_empty() {
+                tr("无", "none").to_string()
+            } else {
+                app.no_proxy.clone()
+            }
+        }
+        ExtraKey::HttpAdaptive => on_off(app.http_adaptive),
+        ExtraKey::DiskCache => {
+            let v = app.disk_cache.trim();
+            if v.is_empty() || v == "0" {
+                on_off(false)
+            } else {
+                v.to_string()
+            }
+        }
+        ExtraKey::ContinueEnabled => on_off(app.continue_enabled),
+        ExtraKey::BtSeedTime => {
+            if app.bt_seed_time_min == 0 {
+                tr("不限", "unlimited").to_string()
+            } else {
+                format!("{} min", app.bt_seed_time_min)
+            }
+        }
+        ExtraKey::BtSaveMetadata => on_off(app.bt_save_metadata),
+        ExtraKey::BtLoadSavedMetadata => on_off(app.bt_load_saved_metadata),
+        ExtraKey::HlsConcurrency => app.hls_concurrency.to_string(),
+        ExtraKey::HlsVariant => {
+            if app.hls_variant == "worst" {
+                tr("最低码率", "worst").to_string()
+            } else {
+                tr("最高码率", "best").to_string()
+            }
+        }
+        ExtraKey::HlsProbeSize => on_off(app.hls_probe_size),
+        ExtraKey::HlsSegmentRetries => app.hls_segment_retries.to_string(),
+        ExtraKey::HlsWriteMode => {
+            if app.hls_write_mode == "ordered" {
+                tr("边下边排", "ordered").to_string()
+            } else {
+                tr("乱序拼接", "unordered").to_string()
+            }
+        }
+        ExtraKey::UserAgent => {
+            if app.user_agent.trim().is_empty() {
+                tr("引擎默认", "engine default").to_string()
+            } else {
+                app.user_agent.clone()
+            }
+        }
+    }
+}
+
+/// 追加行的原始值（进入输入框时的初值；空串 = 未设置）。
+fn extra_raw_value(app: &App, key: ExtraKey) -> String {
+    match key {
+        ExtraKey::AllProxy => app.all_proxy.clone(),
+        ExtraKey::NoProxy => app.no_proxy.clone(),
+        ExtraKey::DiskCache => app.disk_cache.clone(),
+        ExtraKey::BtSeedTime => app.bt_seed_time_min.to_string(),
+        ExtraKey::HlsConcurrency => app.hls_concurrency.to_string(),
+        ExtraKey::HlsSegmentRetries => app.hls_segment_retries.to_string(),
+        ExtraKey::UserAgent => app.user_agent.clone(),
+        _ => String::new(),
+    }
+}
+
+/// 追加行的左右调整（开关直切 / 枚举循环 / 数值步进）。
+/// 返回反馈消息；返回 None 表示该行只能回车输入（或越界）。
+fn adjust_extra(app: &mut App, sel: usize, delta: i32) -> Option<String> {
+    let row = EXTRA_ROWS.get(sel.checked_sub(BASE_SETTINGS_ROWS)?)?;
+    let key = extra_key_of(row);
+    let label = tr(row.zh, row.en);
+    let (val, require_change) = match row.action {
+        ExtraAction::Edit(k, _) => match k {
+            ExtraKey::BtSeedTime => {
+                let n = (app.bt_seed_time_min as i32 + delta).max(0) as u64;
+                (n.to_string(), n != app.bt_seed_time_min)
+            }
+            ExtraKey::HlsConcurrency => {
+                let n = (app.hls_concurrency as i32 + delta).clamp(1, 64) as u64;
+                (n.to_string(), n != app.hls_concurrency)
+            }
+            ExtraKey::HlsSegmentRetries => {
+                let n = (app.hls_segment_retries as i32 + delta).clamp(1, 10) as u64;
+                (n.to_string(), n != app.hls_segment_retries)
+            }
+            // 文本项（代理/例外/磁盘缓存/UA）：只能回车编辑
+            ExtraKey::AllProxy
+            | ExtraKey::NoProxy
+            | ExtraKey::DiskCache
+            | ExtraKey::UserAgent => return None,
+            // Edit 动作只承载数值/文本项；其余键不会走到这里
+            _ => return None,
+        },
+        ExtraAction::Toggle(k) => {
+            let cur = match k {
+                ExtraKey::HttpAdaptive => app.http_adaptive,
+                ExtraKey::ContinueEnabled => app.continue_enabled,
+                ExtraKey::BtSaveMetadata => app.bt_save_metadata,
+                ExtraKey::BtLoadSavedMetadata => app.bt_load_saved_metadata,
+                ExtraKey::HlsProbeSize => app.hls_probe_size,
+                _ => return None,
+            };
+            let next = !cur;
+            (if next { "true" } else { "false" }.to_string(), true)
+        }
+        ExtraAction::Cycle(k, values) => {
+            let cur = match k {
+                ExtraKey::HlsVariant => app.hls_variant.clone(),
+                ExtraKey::HlsWriteMode => app.hls_write_mode.clone(),
+                _ => return None,
+            };
+            let pos = values.iter().position(|&v| v == cur).unwrap_or(0) as i32;
+            let next = values[((pos + delta).rem_euclid(values.len() as i32)) as usize];
+            (next.to_string(), next != cur)
+        }
+    };
+    if !require_change {
+        return None;
+    }
+    Some(apply_global_option(
+        app,
+        extra_option_name(key),
+        &val,
+        label,
+    ))
+}
+
 fn draw_settings(f: &mut ratatui::Frame, app: &App) {
     use ratatui::layout::{Alignment, Constraint, Layout};
     use ratatui::style::{Color, Style};
@@ -3959,14 +4910,21 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
 
     // 分区卡片：参数 / Tracker 服务器 / 订阅源 / 引擎信息
     // （聚焦分区亮边框 + 黄色标题，替代旧的"◄ 焦点"文字标记）
+    //
+    // 参数卡片高度随追加设置项增长，但最多占可视高度的 3/5，
+    // 给下方三张卡片留空间；装不下时 List 自身跟随选中项滚动。
+    let params_want = (BASE_SETTINGS_ROWS + EXTRA_ROWS.len() + 2) as u16;
+    let params_h = params_want
+        .min(f.area().height * 3 / 5)
+        .max(8);
     let areas = Layout::vertical([
-        Constraint::Length(21), // 参数（19 行 + 边框 2）
-        Constraint::Length(1),  // 空行
-        Constraint::Min(5),     // Tracker 服务器列表
-        Constraint::Length(1),  // 空行
-        Constraint::Min(5),     // 订阅源列表
-        Constraint::Length(1),  // 空行
-        Constraint::Length(5),  // 引擎信息（3 行 + 边框 2）
+        Constraint::Length(params_h), // 参数（原有 18 项 + 追加项 + 边框 2）
+        Constraint::Length(1),        // 空行
+        Constraint::Min(5),           // Tracker 服务器列表
+        Constraint::Length(1),        // 空行
+        Constraint::Min(5),           // 订阅源列表
+        Constraint::Length(1),        // 空行
+        Constraint::Length(7),        // 引擎信息（5 行 + 边框 2）
     ])
     .split(rows[0]);
 
@@ -4098,6 +5056,18 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
             ])
         })
         .collect();
+    // 追加设置项（引擎已实现、此前未暴露）：标签与取值都来自表
+    let mut items = items;
+    for (i, row) in EXTRA_ROWS.iter().enumerate() {
+        let idx = BASE_SETTINGS_ROWS + i;
+        let selected = idx == app.settings_sel && app.settings_area == 0;
+        let val = extra_value(app, extra_key_of(row));
+        items.push(Line::from(vec![
+            Span::raw(if selected { "▸ " } else { "  " }),
+            Span::styled(pad_label(&tr(row.zh, row.en)), dim),
+            Span::raw(val),
+        ]));
+    }
     let list = List::new(items).highlight_style(Style::new().bg(Color::DarkGray));
     let mut ls = ListState::default();
     if app.settings_area == 0 {
@@ -4234,6 +5204,16 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
         .padding(Padding::horizontal(2));
     let engine_inner = engine_block.inner(areas[6]);
     f.render_widget(engine_block, areas[6]);
+    let proxy_text = if app.all_proxy.trim().is_empty() {
+        tr("直连", "direct").to_string()
+    } else {
+        app.all_proxy.clone()
+    };
+    let session_text = if app.session_path.trim().is_empty() {
+        tr("未开启（--save-session 启动即开启）", "off (start with --save-session)").to_string()
+    } else {
+        truncate_head(&app.session_path, 48)
+    };
     let info = Paragraph::new(vec![
         Line::from(vec![
             Span::styled(pad_label(&tr("引擎", "Engine")), dim),
@@ -4242,6 +5222,18 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
         Line::from(vec![
             Span::styled(pad_label(&tr("运行时间", "Uptime")), dim),
             Span::raw(fmt_duration(app.started.elapsed().as_secs())),
+        ]),
+        Line::from(vec![
+            Span::styled(pad_label(&tr("能力", "Features")), dim),
+            Span::raw(xfer_rpc::ENGINE_FEATURES.join(" · ")),
+        ]),
+        Line::from(vec![
+            Span::styled(pad_label(&tr("代理", "Proxy")), dim),
+            Span::raw(proxy_text),
+        ]),
+        Line::from(vec![
+            Span::styled(pad_label(&tr("会话", "Session")), dim),
+            Span::raw(session_text),
         ]),
     ]);
     f.render_widget(info, engine_inner);
@@ -4377,6 +5369,34 @@ fn draw_input_popup(f: &mut ratatui::Frame, app: &App) {
         ),
         // BtSeedMode 通过左右切换设置，不走输入框——此处兜底
         InputKind::EditSetting(SettingKey::BtSeedMode) => "".to_string(),
+        // 追加设置项
+        InputKind::EditSetting(SettingKey::AllProxy) => tr(
+            " 代理地址（http://host:port；留空 = 直连） ",
+            " Proxy (http://host:port; empty = direct) ",
+        ),
+        InputKind::EditSetting(SettingKey::NoProxy) => tr(
+            " 直连例外（逗号分隔主机/网段，如 .example.com,192.168.0.0/16） ",
+            " No-proxy hosts (comma separated) ",
+        ),
+        InputKind::EditSetting(SettingKey::DiskCache) => tr(
+            " 磁盘缓存（如 512M；0 = 关闭直写） ",
+            " Disk cache (e.g. 512M; 0 = off) ",
+        ),
+        InputKind::EditSetting(SettingKey::BtSeedTime) => tr(
+            " BT 做种时长（分钟，0 = 不限时） ",
+            " BT seed time (minutes, 0 = unlimited) ",
+        ),
+        InputKind::EditSetting(SettingKey::HlsConcurrency) => tr(
+            " HLS 分片并发（1-64） ",
+            " HLS segment concurrency (1-64) ",
+        ),
+        InputKind::EditSetting(SettingKey::HlsSegmentRetries) => {
+            tr(" HLS 单分片重试次数（1-10） ", " HLS segment retries (1-10) ")
+        }
+        InputKind::EditSetting(SettingKey::UserAgent) => tr(
+            " 出站 User-Agent（留空 = 引擎默认） ",
+            " Outgoing User-Agent (empty = engine default) ",
+        ),
         InputKind::AddTracker(_) => tr(
             " 添加 Tracker（支持空格/逗号分隔批量输入） ",
             " Add trackers (space/comma separated) ",
@@ -4388,6 +5408,14 @@ fn draw_input_popup(f: &mut ratatui::Frame, app: &App) {
         InputKind::AddSubscription => tr(
             " 添加订阅源（格式：名称 URL，或仅输入 URL） ",
             " Add subscription (name URL, or just URL) ",
+        ),
+        InputKind::AddUri(_) => tr(
+            " 追加镜像地址（HTTP 任务；暂停→改 URI→恢复） ",
+            " Add mirror URI (HTTP task; pause → change → resume) ",
+        ),
+        InputKind::TaskLimit(_) => tr(
+            " 单任务下载限速（KB/s，0 = 跟随全局） ",
+            " Task download limit (KB/s, 0 = follow global) ",
         ),
     };
     let area = centered_rect(70, 3, f.area());
@@ -4759,6 +5787,215 @@ fn cmd_stat(args: &[String]) -> i32 {
     }
 }
 
+/// `xfer version`：引擎版本与能力清单（engine.getVersion）。
+fn cmd_version(args: &[String]) -> i32 {
+    match rpc_call(&connect_url(args), "engine.getVersion", with_token(json!({}), args)) {
+        Ok(v) => {
+            println!(
+                "{} v{}",
+                v["name"].as_str().unwrap_or(ENGINE_NAME),
+                v["version"].as_str().unwrap_or(ENGINE_VERSION)
+            );
+            let feats: Vec<String> = v["features"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|f| f.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            println!("{}: {}", tr("能力", "Features"), feats.join(" · "));
+            0
+        }
+        Err(e) => {
+            eprintln!("{}: {e}", tr("失败", "Failed"));
+            1
+        }
+    }
+}
+
+/// `xfer servers <gid>`：逐连接明细（引擎 getServers；HTTP 多连接下载的每一条连接）。
+fn cmd_servers(args: &[String]) -> i32 {
+    let Some(gid) = positional(args, 0) else {
+        eprintln!("{}", tr("用法: xfer servers <gid>", "usage: xfer servers <gid>"));
+        return 2;
+    };
+    match rpc_call(
+        &connect_url(args),
+        "task.getServers",
+        with_token(json!({ "gid": gid }), args),
+    ) {
+        Ok(v) => {
+            let mut rows = 0usize;
+            for file in v.as_array().cloned().unwrap_or_default() {
+                for srv in file["servers"].as_array().cloned().unwrap_or_default() {
+                    rows += 1;
+                    let active = srv["downloadSpeed"].as_u64().unwrap_or(0) > 0;
+                    println!(
+                        "{:>3}. {:<40} {:>12} {:>14} {}",
+                        rows,
+                        srv["currentUri"].as_str().unwrap_or("-"),
+                        fmt_size(srv["downloadLength"].as_u64().unwrap_or(0)),
+                        format!("{}/s", fmt_size(srv["downloadSpeed"].as_u64().unwrap_or(0))),
+                        if active {
+                            tr("活跃", "active")
+                        } else {
+                            tr("空闲", "idle")
+                        },
+                    );
+                }
+            }
+            if rows == 0 {
+                println!("{}", tr("（无连接明细）", "(no connection detail)"));
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{}: {e}", tr("失败", "Failed"));
+            1
+        }
+    }
+}
+
+/// `xfer uris <gid>`：地址/镜像列表（engine task.getUris）。
+fn cmd_uris(args: &[String]) -> i32 {
+    let Some(gid) = positional(args, 0) else {
+        eprintln!("{}", tr("用法: xfer uris <gid>", "usage: xfer uris <gid>"));
+        return 2;
+    };
+    match rpc_call(
+        &connect_url(args),
+        "task.getUris",
+        with_token(json!({ "gid": gid }), args),
+    ) {
+        Ok(v) => {
+            for (i, u) in v.as_array().cloned().unwrap_or_default().iter().enumerate() {
+                println!(
+                    "{:>3}. [{}] {}",
+                    i + 1,
+                    u["status"].as_str().unwrap_or("-"),
+                    u["uri"].as_str().unwrap_or("-")
+                );
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{}: {e}", tr("失败", "Failed"));
+            1
+        }
+    }
+}
+
+/// `xfer add-uri <gid> <url>`：追加镜像地址。
+///
+/// 引擎 `changeUri` 只接受 waiting/paused，因此在跑的任务先暂停、改完再恢复。
+fn cmd_add_uri(args: &[String]) -> i32 {
+    let (Some(gid), Some(uri)) = (positional(args, 0), positional(args, 1)) else {
+        eprintln!(
+            "{}",
+            tr("用法: xfer add-uri <gid> <url>", "usage: xfer add-uri <gid> <url>")
+        );
+        return 2;
+    };
+    let url = connect_url(args);
+    let status = rpc_call(&url, "task.tell", with_token(json!({ "gid": gid }), args))
+        .ok()
+        .and_then(|v| v["status"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let was_active = status == "active";
+    if was_active {
+        let _ = rpc_call(&url, "task.pause", with_token(json!({ "gid": gid }), args));
+    }
+    let r = rpc_call(
+        &url,
+        "task.changeUri",
+        with_token(
+            json!({ "gid": gid, "fileIndex": 1, "addUris": [uri] }),
+            args,
+        ),
+    );
+    if was_active {
+        let _ = rpc_call(&url, "task.resume", with_token(json!({ "gid": gid }), args));
+    }
+    match r {
+        Ok(v) => {
+            println!("{} {uri}", tr("已追加镜像", "Mirror added"));
+            println!("{}", serde_json::to_string(&v).unwrap_or_default());
+            0
+        }
+        Err(e) => {
+            eprintln!("{}: {e}", tr("失败", "Failed"));
+            1
+        }
+    }
+}
+
+/// `xfer verify <gid> [算法]`：文件校验（默认 sha256；`size` 只比大小）。
+fn cmd_verify(args: &[String]) -> i32 {
+    let Some(gid) = positional(args, 0) else {
+        eprintln!(
+            "{}",
+            tr("用法: xfer verify <gid> [算法]", "usage: xfer verify <gid> [algo]")
+        );
+        return 2;
+    };
+    let algo = positional(args, 1).unwrap_or_else(|| "sha256".to_string());
+    match rpc_call(
+        &connect_url(args),
+        "task.verifyFiles",
+        with_token(json!({ "gid": gid, "algorithm": algo }), args),
+    ) {
+        Ok(v) => {
+            let status = v["status"].as_str().unwrap_or("?");
+            println!(
+                "{}: {status}（{} {}）",
+                tr("校验结果", "Verify result"),
+                v["count"].as_u64().unwrap_or(0),
+                tr("个文件", "files")
+            );
+            for h in v["hashes"].as_array().cloned().unwrap_or_default() {
+                println!(
+                    "  {}  {}",
+                    h["path"].as_str().unwrap_or("-"),
+                    h["digest"].as_str().unwrap_or("-")
+                );
+            }
+            for m in v["missing"].as_array().cloned().unwrap_or_default() {
+                println!("  {}: {}", tr("缺失", "missing"), m.as_str().unwrap_or("-"));
+            }
+            for m in v["mismatched"].as_array().cloned().unwrap_or_default() {
+                println!("  {}: {}", tr("大小不符", "size mismatch"), m.as_str().unwrap_or("-"));
+            }
+            if status == "ok" {
+                0
+            } else {
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("{}: {e}", tr("失败", "Failed"));
+            1
+        }
+    }
+}
+
+/// `xfer options`：全局选项（JSON，便于脚本读取/对照）。
+fn cmd_options(args: &[String]) -> i32 {
+    match rpc_call(&connect_url(args), "engine.getOptions", with_token(json!({}), args)) {
+        Ok(v) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("{}: {e}", tr("失败", "Failed"));
+            1
+        }
+    }
+}
+
 // ----------------------------------------------------------------------
 // WS 客户端与工具函数
 // ----------------------------------------------------------------------
@@ -5058,6 +6295,26 @@ mod tests {
             bt_port_mapping: true,
             max_conn_per_server: 0,
             min_split_size: 0,
+            all_proxy: String::new(),
+            no_proxy: String::new(),
+            user_agent: String::new(),
+            http_adaptive: true,
+            disk_cache: String::new(),
+            continue_enabled: true,
+            bt_seed_time_min: 0,
+            bt_save_metadata: false,
+            bt_load_saved_metadata: false,
+            hls_concurrency: 16,
+            hls_variant: "best".to_string(),
+            hls_probe_size: true,
+            hls_segment_retries: 3,
+            hls_write_mode: "unordered".to_string(),
+            detail_conns: Vec::new(),
+            detail_uris: Vec::new(),
+            detail_focus_conns: true,
+            conn_scroll: (0, 0),
+            uri_scroll: (0, 0),
+            verify_rx: None,
             add_task: None,
         }
     }
@@ -5428,10 +6685,11 @@ mod tests {
         set_lang(Lang::Zh);
     }
 
-    /// 设置页向下导航必须能到末项（界面语言），且不越过末项。
-    /// 回归：导航上限曾落后于实际行数，导致「界面语言」行永远选不中。
+    /// 设置页向下导航必须能到末项（追加设置项的最后一行），且不越过末项。
+    /// 回归：导航上限曾落后于实际行数，导致「界面语言」行永远选不中；
+    /// 追加 13 项后上限同样要跟着走（否则新增项选不中）。
     #[test]
-    fn settings_down_reaches_language_row() {
+    fn settings_down_reaches_last_row() {
         let mut app = app_with_peers(vec![]);
         app.view = MainView::Settings;
         app.settings_area = 0;
@@ -5442,20 +6700,20 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         );
 
+        let last = BASE_SETTINGS_ROWS + EXTRA_ROWS.len() - 1;
+        // 界面语言行（17）仍可选中
         for _ in 0..17 {
             assert!(handle_key(&mut app, &down));
         }
-        assert_eq!(
-            app.settings_sel, 17,
-            "连续下移 17 次应选中末项（界面语言）"
-        );
-
+        assert_eq!(app.settings_sel, 17, "界面语言行应可选中");
+        // 继续下移进入追加设置项，直到末项
+        for _ in 17..last {
+            assert!(handle_key(&mut app, &down));
+        }
+        assert_eq!(app.settings_sel, last, "连续下移应到追加项末行");
         // 已在末项，再下移不应越界
         assert!(handle_key(&mut app, &down));
-        assert_eq!(
-            app.settings_sel, 17,
-            "末项之后继续下移应保持在界面语言行"
-        );
+        assert_eq!(app.settings_sel, last, "末项之后继续下移应保持不动");
     }
 
     fn render_list(app: &App, w: u16, h: u16) -> Vec<String> {
@@ -5995,5 +7253,293 @@ mod tests {
             .expect("任务应已创建");
         assert_eq!(t["dir"].as_str(), Some(dir.as_str()));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 追加设置项：开关直切 / 枚举循环都写进引擎全局选项，文本项不作步进。
+    #[test]
+    fn extra_settings_adjust_writes_engine_options() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+
+        // HLS 选流：best → worst（枚举循环）
+        assert_eq!(app.hls_variant, "best");
+        let idx = BASE_SETTINGS_ROWS
+            + EXTRA_ROWS
+                .iter()
+                .position(|r| extra_key_of(r) == ExtraKey::HlsVariant)
+                .unwrap();
+        let msg = adjust_extra(&mut app, idx, 1).expect("枚举行应可调整");
+        assert!(msg.contains("worst"), "反馈消息应包含新取值: {msg}");
+        let opts = app.mgr.get_global_option();
+        assert_eq!(opts["hls-variant"].as_str(), Some("worst"));
+
+        // HTTP 自适应：开关直切（true → false）
+        let idx = BASE_SETTINGS_ROWS
+            + EXTRA_ROWS
+                .iter()
+                .position(|r| extra_key_of(r) == ExtraKey::HttpAdaptive)
+                .unwrap();
+        adjust_extra(&mut app, idx, 1).expect("开关行应可调整");
+        assert_eq!(
+            app.mgr.get_global_option()["adaptive"].as_str(),
+            Some("false")
+        );
+
+        // 数值步进：HLS 并发 +1
+        let before = app.hls_concurrency;
+        let idx = BASE_SETTINGS_ROWS
+            + EXTRA_ROWS
+                .iter()
+                .position(|r| extra_key_of(r) == ExtraKey::HlsConcurrency)
+                .unwrap();
+        adjust_extra(&mut app, idx, 1).expect("数值行应可步进");
+        assert_eq!(
+            app.mgr.get_global_option()["hls-concurrency"].as_str(),
+            Some((before + 1).to_string().as_str())
+        );
+
+        // 文本行（代理）不作左右调整，且越界索引安全返回 None
+        let idx = BASE_SETTINGS_ROWS
+            + EXTRA_ROWS
+                .iter()
+                .position(|r| extra_key_of(r) == ExtraKey::AllProxy)
+                .unwrap();
+        assert!(adjust_extra(&mut app, idx, 1).is_none(), "文本行不应响应左右键");
+        assert!(adjust_extra(&mut app, 0, 1).is_none(), "基础行不归追加逻辑管");
+        assert!(adjust_extra(&mut app, BASE_SETTINGS_ROWS + EXTRA_ROWS.len() + 3, 1).is_none());
+    }
+
+    /// 追加行的显示值：未设置/关/不限等空状态要有可读文案。
+    #[test]
+    fn extra_settings_value_rendering() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+        app.all_proxy = String::new();
+        app.disk_cache = "0".into();
+        app.bt_seed_time_min = 0;
+        assert_eq!(extra_value(&app, ExtraKey::AllProxy), tr("直连", "direct"));
+        assert_eq!(extra_value(&app, ExtraKey::DiskCache), tr("关", "off"));
+        assert_eq!(extra_value(&app, ExtraKey::BtSeedTime), tr("不限", "unlimited"));
+        app.all_proxy = "http://127.0.0.1:7890".into();
+        assert_eq!(
+            extra_value(&app, ExtraKey::AllProxy),
+            "http://127.0.0.1:7890"
+        );
+        app.disk_cache = "512M".into();
+        assert_eq!(extra_value(&app, ExtraKey::DiskCache), "512M");
+    }
+
+    /// 磁盘缓存/大小后缀解析与引擎同口径。
+    #[test]
+    fn size_suffix_matches_engine_semantics() {
+        assert_eq!(parse_size_suffix("0"), Some(0));
+        assert_eq!(parse_size_suffix("512"), Some(512));
+        assert_eq!(parse_size_suffix("1K"), Some(1024));
+        assert_eq!(parse_size_suffix("2m"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_size_suffix("1G"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_size_suffix("abc"), None);
+        assert_eq!(parse_size_suffix(""), None);
+    }
+
+    /// URL 主机提取（连接表/地址表用）。
+    #[test]
+    fn uri_host_extraction() {
+        assert_eq!(host_of_uri("https://example.com/a/b?x=1"), "example.com");
+        assert_eq!(host_of_uri("http://192.168.1.2:8080/f"), "192.168.1.2");
+        assert_eq!(host_of_uri("http://user:pw@host.tld:99/f"), "host.tld");
+        assert_eq!(host_of_uri("http://[2001:db8::1]:8080/f"), "[2001:db8::1]");
+        assert_eq!(host_of_uri("-"), "-");
+    }
+
+    /// 设置页渲染冒烟：追加 13 行后参数卡片要在两种终端尺寸下都画得出来。
+    #[test]
+    fn settings_view_renders_with_extra_rows() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let app = app_with_peers(vec![]);
+        for (w, h) in [(80u16, 24u16), (120, 40)] {
+            let backend = TestBackend::new(w, h);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| draw_settings(f, &app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let text = (0..h)
+                .map(|y| {
+                    (0..w)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            // 引擎信息卡片新增的"能力"行与追加设置项都要出现
+            assert!(text.contains('能'), "缺少「能力」行:\n{text}");
+        }
+    }
+
+    /// 非 BT 详情：连接表与地址表能渲染出行（含表头）。
+    #[test]
+    fn detail_tables_render_for_http_task() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+        app.detail_conns = vec![
+            ConnRow {
+                host: "cdn.example.com".into(),
+                downloaded: 5 * 1024 * 1024,
+                speed: 1024 * 1024,
+                active: true,
+            },
+            ConnRow {
+                host: "cdn.example.com".into(),
+                downloaded: 1024,
+                speed: 0,
+                active: false,
+            },
+        ];
+        app.detail_uris = vec![UriRow {
+            uri: "https://cdn.example.com/file.bin".into(),
+            status: "used".into(),
+        }];
+        let backend = TestBackend::new(100, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            let half = ratatui::layout::Rect {
+                height: area.height / 2,
+                ..area
+            };
+            let rest = ratatui::layout::Rect {
+                y: area.y + half.height,
+                height: area.height - half.height,
+                ..area
+            };
+            draw_detail_conns(f, &app, half);
+            draw_detail_uris(f, &app, rest);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let text = (0..30)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("cdn.example.com"), "连接表应显示主机:\n{text}");
+        assert!(text.contains("file.bin"), "地址表应显示 URI:\n{text}");
+    }
+    /// 按键驱动：设置页对追加行按 ←→ 要真的写进引擎全局选项；
+    /// 文本行回车要弹输入框；开关行回车只提示。
+    #[test]
+    fn settings_keys_drive_extra_rows() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+        app.view = MainView::Settings;
+        app.settings_area = 0;
+        let key = |c: crossterm::event::KeyCode| {
+            crossterm::event::KeyEvent::new(c, crossterm::event::KeyModifiers::NONE)
+        };
+        let idx_of = |k: ExtraKey| {
+            BASE_SETTINGS_ROWS
+                + EXTRA_ROWS
+                    .iter()
+                    .position(|r| extra_key_of(r) == k)
+                    .unwrap()
+        };
+
+        // HLS 选流（枚举）：→ 切到 worst 并写引擎选项
+        app.settings_sel = idx_of(ExtraKey::HlsVariant);
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Right)));
+        assert_eq!(
+            app.mgr.get_global_option()["hls-variant"].as_str(),
+            Some("worst")
+        );
+
+        // 代理（文本）：回车弹输入框，初值为当前原始值
+        app.all_proxy = "http://127.0.0.1:1080".into();
+        app.settings_sel = idx_of(ExtraKey::AllProxy);
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Enter)));
+        match app.input.clone() {
+            Some((InputKind::EditSetting(SettingKey::AllProxy), init)) => {
+                assert_eq!(init, "http://127.0.0.1:1080")
+            }
+            other => panic!("应弹出代理输入框，实际: {other:?}", other = other.is_some()),
+        }
+
+        // 开关（自适应）：回车只提示，不改值
+        app.input = None;
+        app.settings_sel = idx_of(ExtraKey::HttpAdaptive);
+        let before = app.mgr.get_global_option()["adaptive"].clone();
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Enter)));
+        assert_eq!(app.mgr.get_global_option()["adaptive"], before);
+        assert!(app.message.is_some(), "开关行回车应给出提示消息");
+    }
+
+    /// 按键驱动：详情页 v/u/o 三个新动作分别落到校验、加镜像、单任务限速。
+    #[test]
+    fn detail_keys_drive_new_actions() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+        // 造一个 HTTP 任务（非 BT）
+        let gid = app
+            .mgr
+            .add_uri(
+                vec!["http://example.com/a.bin".to_string()],
+                &json!({"dir": std::env::temp_dir().to_string_lossy()}),
+                None,
+            )
+            .expect("addUri 应成功");
+        app.view = MainView::Detail(gid.clone());
+        let key = |c: crossterm::event::KeyCode| {
+            crossterm::event::KeyEvent::new(c, crossterm::event::KeyModifiers::NONE)
+        };
+
+        // u：追加镜像（HTTP 任务）→ 弹输入框
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Char('u'))));
+        match app.input.clone() {
+            Some((InputKind::AddUri(g), _)) => assert_eq!(g.0, gid.0),
+            _ => panic!("u 应弹出镜像地址输入框"),
+        }
+
+        // o：单任务限速 → 弹输入框
+        app.input = None;
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Char('o'))));
+        match app.input.clone() {
+            Some((InputKind::TaskLimit(g), _)) => assert_eq!(g.0, gid.0),
+            _ => panic!("o 应弹出限速输入框"),
+        }
+
+        // v：校验 → 起后台线程（结果由下一拍回收）
+        app.input = None;
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Char('v'))));
+        assert!(app.verify_rx.is_some(), "v 应启动后台校验");
+
+        // Tab / ↓：非 BT 任务在「连接表 / 地址表」间切焦点与滚动
+        assert!(app.detail_focus_conns);
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Tab)));
+        assert!(!app.detail_focus_conns, "Tab 应切到地址表");
+        let before = app.uri_scroll.0;
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Down)));
+        assert_eq!(app.uri_scroll.0, before + 1, "滚动应落在地址表");
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Tab)));
+        let before = app.conn_scroll.0;
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Down)));
+        assert_eq!(app.conn_scroll.0, before + 1, "滚动应落在连接表");
+
+        let _ = app.mgr.remove(&gid);
+    }
+
+    /// 回归：刷新快照不得 panic（空引擎也要能安全读取全部新增选项）。
+    #[test]
+    fn refresh_app_on_fresh_manager_does_not_panic() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+        refresh_app(&mut app);
+        refresh_app(&mut app);
+        // 默认值应落到引擎侧默认（未显式设置时）
+        assert_eq!(app.hls_concurrency, 16, "hls-concurrency 默认应为 16");
+        assert!(app.http_adaptive, "adaptive 默认开启");
+        assert!(app.continue_enabled, "continue 默认开启");
+        assert!(app.hls_probe_size, "hls-probe-size 默认开启");
     }
 }

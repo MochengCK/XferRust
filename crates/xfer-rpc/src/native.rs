@@ -16,6 +16,25 @@ use xfer_types::{Gid, ENGINE_NAME, ENGINE_VERSION};
 /// 原生方法命名空间前缀。
 pub const NATIVE_PREFIXES: [&str; 3] = ["task.", "engine.", "events."];
 
+/// 引擎能力清单（`engine.getVersion` 的 `features` 字段）。
+///
+/// 应用端"引擎信息"卡片与 TUI 都读它做能力展示——新增传输/协议能力
+/// （如 HLS）时必须同步到这里，否则引擎明明支持、界面上却看不到。
+pub const ENGINE_FEATURES: [&str; 12] = [
+    "http",
+    "resume",
+    "checksum",
+    "bt",
+    "hls",
+    "events",
+    "bitfield",
+    "wanted-bitfield",
+    "ban-peer",
+    "change-uri",
+    "get-servers",
+    "verify-files",
+];
+
 /// 原生协议分发器。
 pub struct NativeDispatcher {
     secret: Option<String>,
@@ -216,7 +235,7 @@ impl NativeDispatcher {
             "engine.getVersion" => Ok(json!({
                 "name": ENGINE_NAME,
                 "version": ENGINE_VERSION,
-                "features": ["http", "resume", "checksum", "bt", "hls", "events", "bitfield", "wanted-bitfield", "ban-peer", "change-uri", "get-servers", "verify-files"],
+                "features": ENGINE_FEATURES,
             })),
             "engine.globalStat" => Ok(e.global_stat_native()),
             "engine.getOptions" => Ok(e.get_global_option()),

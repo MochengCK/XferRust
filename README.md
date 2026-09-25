@@ -219,21 +219,43 @@ exited without confirmation re-open the table on the next launch.
 **Detail View**: a gauge (percentage, downloaded/total, speed, ETA, average
 speed) + a sparkline of recent speed samples (120 samples, roughly the last
 40 seconds). `ESC` / `Enter` returns to the list; `r` / `x` / `S` behave as in
-the list; `Tab` switches focus between the tracker and peer tables, arrow keys
-and `PgUp` / `PgDn` scroll, and `t` adds a tracker to a BT task.
+the list; `Tab` switches focus between the two tables, arrow keys and
+`PgUp` / `PgDn` scroll.
+
+- **BT tasks**: tracker table + peer table (with a GeoIP country column);
+  `t` adds a tracker.
+- **HTTP / HLS tasks**: a *Connections* table (the engine reports every
+  connection: host / downloaded / speed / active state — one row per
+  connection for split downloads, a single summary row for single-connection
+  and HLS tasks) plus a *URIs / mirrors* table (`used` marks the one in use).
+- Common actions: `v` verify files (sha256, runs on a background thread and
+  reports back), `o` per-task download limit, `u` append a mirror URI
+  (HTTP tasks; automatically pauses → changes the URI → resumes, keeping all
+  downloaded bytes).
 
 **Settings Page** (`s` key) — grouped into three tabs, `Tab` cycles the tabs,
 `↑` `↓` moves, `←` `→` adjusts (or `+` / `-`), `a` toggles / opens:
 
 - *Transfer*: max concurrent downloads, HTTP split connections
   (`split`), max connections per server, `min-split-size`, `bt-max-peers`,
-  BT adaptive scheduling, global download limit, global upload limit.
+  BT adaptive scheduling, global download limit, global upload limit,
+  HTTP adaptive scheduling (`adaptive`), disk cache (`disk-cache`),
+  resume (`continue`), proxy (`all-proxy`), no-proxy bypass list
+  (`no-proxy`) and the outgoing User-Agent (`user-agent`).
 - *BitTorrent*: encryption mode (`bt-encryption`), transport protocol
   (`bt-protocol`), BT listen port, DHT listen port, local peer discovery,
   port mapping (UPnP / NAT-PMP), completion behaviour (seed or stop),
-  seeding share ratio, default save directory.
+  seeding share ratio, seeding time (`bt-seed-time`, minutes),
+  save / load torrent metadata (`bt-save-metadata` /
+  `bt-load-saved-metadata`), default save directory.
+- *HLS (M3U8)*: segment concurrency (`hls-concurrency`), variant selection
+  (`hls-variant` = best / worst), segment size probing (`hls-probe-size`),
+  per-segment retries (`hls-segment-retries`), write mode (`hls-write-mode` =
+  unordered assembly / ordered write-through).
 - *Trackers & UI*: the global tracker list, tracker subscriptions, and the UI
   language (Simplified / Traditional / English, persisted to the session).
+  The *Engine* card below shows the version, uptime, feature list
+  (`engine.getVersion`'s `features`), proxy and session-file state.
 
 > The UI language can also be set at launch via an environment variable:
 > `XFER_LANG=zh|en|zh_tw xfer`.
@@ -326,6 +348,22 @@ xfer remove <gid>
 
 # Global stats (total speed + per-status task counts)
 xfer stat
+
+# Engine version + feature list
+xfer version
+
+# Per-connection detail (every connection of an HTTP multi-connection download)
+xfer servers <gid>
+
+# URIs / mirrors; append a mirror (auto pause → change URI → resume)
+xfer uris <gid>
+xfer add-uri <gid> <url>
+
+# Verify files (sha256 by default; pass `size` to compare sizes only)
+xfer verify <gid> [algo]
+
+# Global options (JSON, convenient for scripts)
+xfer options
 ```
 
 A complete session example:

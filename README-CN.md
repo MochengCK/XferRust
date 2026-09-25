@@ -191,19 +191,33 @@ xfer tui [-d dir] [-j max-concurrent]
 
 **详情视图**：Gauge 进度仪表（百分比、已下载/总大小、速度、剩余时间、平均速度）
 + 速度走势图（保留 120 个采样，约最近 40 秒）。`ESC` / `Enter` 返回列表；`r` / `x` /
-`S` 与列表中一致；`Tab` 在 tracker 表与 peer 表之间切换焦点，方向键与
-`PgUp` / `PgDn` 滚动，`t` 可为 BT 任务添加 tracker。
+`S` 与列表中一致；`Tab` 切换两张表的焦点，方向键与 `PgUp` / `PgDn` 滚动。
+
+- **BT 任务**：tracker 表 + peer 表（含 GeoIP 国家/地区列），`t` 添加 tracker；
+- **HTTP / HLS 任务**：*连接*表（引擎逐连接上报：主机 / 已下载 / 速率 / 活跃状态——
+  分片下载的每条连接一行，单连接与 HLS 任务为汇总单条）+ *地址 / 镜像*表
+  （`used` = 当前正在使用的那条）；
+- 通用动作：`v` 文件校验（sha256，后台线程执行、完成后回显结果）、`o` 单任务下载限速、
+  `u` 追加镜像地址（HTTP 任务；自动「暂停 → 改 URI → 恢复」，已下字节不丢）。
 
 **设置页**（`s` 键）——分三个页签，`Tab` 循环切换，`↑` `↓` 移动，`←` `→` 调整
 （也可用 `+` / `-`），`a` 切换 / 展开：
 
 - *传输*：最大并发数、HTTP 分片连接数（`split`）、单服务器最大连接数、
-  `min-split-size`、`bt-max-peers`、BT 智能调度、全局下载限速、全局上传限速。
+  `min-split-size`、`bt-max-peers`、BT 智能调度、全局下载限速、全局上传限速、
+  HTTP 自适应调度（`adaptive`）、磁盘缓存（`disk-cache`）、断点续传（`continue`）、
+  代理地址（`all-proxy`）、直连例外（`no-proxy`）与出站 User-Agent（`user-agent`）。
 - *BitTorrent*：加密模式（`bt-encryption`）、传输协议（`bt-protocol`）、
   BT 监听端口、DHT 监听端口、本地节点发现、端口映射（UPnP / NAT-PMP）、
-  完成行为（做种 / 完成即止）、做种分享率、默认保存目录。
+  完成行为（做种 / 完成即止）、做种分享率、做种时长（`bt-seed-time`，分钟）、
+  保存 / 加载种子元数据（`bt-save-metadata` / `bt-load-saved-metadata`）、
+  默认保存目录。
+- *HLS（M3U8）*：分片并发（`hls-concurrency`）、选流策略（`hls-variant` = 最高 /
+  最低码率）、分片大小预探测（`hls-probe-size`）、单分片重试次数
+  （`hls-segment-retries`）、落盘方式（`hls-write-mode` = 乱序拼接 / 边下边排）。
 - *Tracker 与界面*：全局 tracker 列表、tracker 订阅源、界面语言
-  （简体 / 繁体 / English，写入会话持久化）。
+  （简体 / 繁体 / English，写入会话持久化）。下方「引擎」卡片显示引擎版本、
+  运行时间、能力清单（`engine.getVersion` 的 `features`）、代理与会话文件状态。
 
 > 界面语言也可在启动时用环境变量指定：`XFER_LANG=zh|en|zh_tw xfer`。
 
@@ -289,6 +303,22 @@ xfer remove <gid>
 
 # 全局统计（总速度 + 各状态任务计数）
 xfer stat
+
+# 引擎版本与能力清单
+xfer version
+
+# 逐连接明细（HTTP 多连接下载的每条连接：主机 / 已下载 / 速率 / 状态）
+xfer servers <gid>
+
+# 地址 / 镜像列表；追加镜像（自动「暂停 → 改 URI → 恢复」）
+xfer uris <gid>
+xfer add-uri <gid> <url>
+
+# 文件校验（默认 sha256；算法传 size 只比大小）
+xfer verify <gid> [算法]
+
+# 全局选项（JSON，便于脚本读取）
+xfer options
 ```
 
 一次完整会话：

@@ -11,6 +11,7 @@ mod native;
 mod router;
 mod transport;
 
+pub use native::ENGINE_FEATURES;
 pub use router::{Proto, Router};
 pub use transport::serve;
 
