@@ -3,13 +3,15 @@
 //! - `message`：peer wire 握手/消息编解码（BEP 3）；
 //! - `mse`：MSE 加密协议协商（BEP 8）；
 //! - `tracker`：HTTP tracker announce（compact/非 compact）；
-//! - `engine`：下载控制器（tracker + 多 peer 并行 + rarest-first + 校验落盘）。
+//! - `engine`：下载控制器（tracker + 多 peer 并行 + rarest-first + 校验落盘）；
+//! - `playhead`：边下边播的排片档位（播放头窗口内按片号升序，其余 rarest-first）。
 //!
 //! M4 新增：MSE（BEP 8）与 uTP（BEP 29）传输层。
 
 pub mod engine;
 pub mod message;
 pub mod mse;
+pub mod playhead;
 pub mod resume;
 pub mod scheduler;
 pub mod tracker;

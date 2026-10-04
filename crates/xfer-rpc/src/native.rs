@@ -20,7 +20,7 @@ pub const NATIVE_PREFIXES: [&str; 3] = ["task.", "engine.", "events."];
 ///
 /// 应用端"引擎信息"卡片与 TUI 都读它做能力展示——新增传输/协议能力
 /// （如 HLS）时必须同步到这里，否则引擎明明支持、界面上却看不到。
-pub const ENGINE_FEATURES: [&str; 12] = [
+pub const ENGINE_FEATURES: [&str; 13] = [
     "http",
     "resume",
     "checksum",
@@ -33,6 +33,8 @@ pub const ENGINE_FEATURES: [&str; 12] = [
     "change-uri",
     "get-servers",
     "verify-files",
+    // 边下边播：task.setPlayhead（播放头附近的片优先下载）
+    "playhead",
 ];
 
 /// 原生协议分发器。
@@ -166,6 +168,16 @@ impl NativeDispatcher {
             "task.getPeers" => e.get_peers(&gid("gid")?),
             "task.getTrackers" => e.get_trackers(&gid("gid")?),
             "task.getServers" => e.get_servers(&gid("gid")?),
+            // 边下边播：宿主把播放头（媒体引擎上报的字节位置）转达给下载引擎，
+            // 选片随即把这一带提到最前。`offset` = -1 表示停止播放（退回 rarest-first）。
+            // 尽力而为：作用不到引擎时返回 applied=false，不是调用失败。
+            "task.setPlayhead" => {
+                let off = obj.get("offset").and_then(Value::as_i64).ok_or_else(|| {
+                    "参数 offset（字节偏移，-1 = 停止播放）缺失".to_string()
+                })?;
+                let offset = if off < 0 { None } else { Some(off as u64) };
+                e.set_playhead(&gid("gid")?, offset)
+            }
             "task.changeUri" => {
                 let gid = gid("gid")?;
                 let file_index = obj

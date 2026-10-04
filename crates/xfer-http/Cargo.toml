@@ -16,10 +16,13 @@ hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-# HLS（M3U8）播放列表：相对地址解析 + AES-128 分片解密
+# HLS（M3U8）播放列表：相对地址解析 + 分片解密（AES-CBC/CTR、SAMPLE-AES）
 url = "2"
 aes = "0.8"
 cbc = "0.1"
+# 密钥可能是裸字节 / 十六进制文本 / Base64 文本（见 playlist::crypto），
+# 内联在 `data:` URI 里的密钥也是 Base64
+base64 = { workspace = true }
 xfer-types = { path = "../xfer-types" }
 xfer-storage = { path = "../xfer-storage" }
 

@@ -2,10 +2,7 @@
 //!
 //! 设计要点：
 //!
-//! - **清单解析**：主清单（`#EXT-X-STREAM-INF`）自动选流；媒体清单读取
-//!   `#EXTINF` 分片、`#EXT-X-MAP` 初始化段（fMP4 的 `init.mp4`）、
-//!   `#EXT-X-BYTERANGE` 区间分片、`#EXT-X-KEY` AES-128 加密（支持密钥
-//!   轮换与 `IV` 缺省时按媒体序号推导）。
+//! - **清单解析**：按 RFC 8216 全量解析，并容忍线上各种方言（见下）。
 //! - **顺序拼接**：分片在网络上并发获取，写盘严格按清单顺序串行追加，
 //!   产物即最终文件，无需二次合并。`futures::buffered` 保证"最多 N 个
 //!   在飞、按序产出"。
@@ -16,9 +13,39 @@
 //!   字节数）与清单指纹。清单变化（直播滑窗）指纹不匹配即重新开始，
 //!   绝不把两个不同清单的字节拼在一起。
 //!
-//! 明确不支持：`SAMPLE-AES`（报错，不做静默降级）；直播清单
-//! （无 `#EXT-X-ENDLIST`）按"当前窗口快照"一次性下载；`#EXT-X-MEDIA`
-//! 的独立音轨组不会被打包进产物。
+//! ## 解析覆盖面（"市面上大部分 HLS"这句话的落点）
+//!
+//! 标签层面：`EXT-X-MEDIA-SEQUENCE` / `DISCONTINUITY-SEQUENCE` / `TARGETDURATION` /
+//! `PLAYLIST-TYPE` / `I-FRAMES-ONLY` / `EXTINF` / `EXT-X-BYTERANGE` /
+//! `EXT-X-DISCONTINUITY` / `EXT-X-KEY` / `EXT-X-MAP`（含中途换初始化段）/
+//! `EXT-X-PROGRAM-DATE-TIME` / `EXT-X-DATERANGE` / `EXT-X-GAP` / `EXT-X-BITRATE` /
+//! `EXT-X-ENDLIST`；低延迟（LL-HLS）的 `EXT-X-PART` / `PART-INF` / `PRELOAD-HINT` /
+//! `SERVER-CONTROL` / `SKIP` / `RENDITION-REPORT` 一律**认得并跳过**，
+//! 且在"整段分片一个都没有"时退回用 `EXT-X-PART` 当分片。
+//!
+//! 主清单层面：`EXT-X-STREAM-INF`（`BANDWIDTH` / `AVERAGE-BANDWIDTH` / `RESOLUTION` /
+//! `CODECS` / `FRAME-RATE` / `AUDIO` / `SUBTITLES`）、`EXT-X-I-FRAME-STREAM-INF`、
+//! `EXT-X-MEDIA`（`AUDIO` / `VIDEO` / `SUBTITLES` / `CLOSED-CAPTIONS` 各组的
+//! `DEFAULT` / `AUTOSELECT` / `LANGUAGE` / `NAME` / `CHANNELS` / `URI`）、
+//! `EXT-X-SESSION-KEY`、`EXT-X-INDEPENDENT-SEGMENTS`、`EXT-X-START`。
+//!
+//! 加密层面：见 [`crypto`]（AES-128 / AES-256 / AES-CTR / SAMPLE-AES(TS)，
+//! 以及 DRM 的识别与拒绝）。
+//!
+//! ## 明确不支持（都会给出可读的原因，不做静默降级）
+//!
+//! - fMP4（CMAF）的 SAMPLE-AES / cenc / cbcs：需要按 `moof`/`senc` 逐样本解，
+//!   本版只做识别与报错；
+//! - DRM（FairPlay / Widevine / PlayReady）：密钥在授权服务器上，原理上拿不到；
+//! - 直播清单（无 `#EXT-X-ENDLIST`）：按"当前窗口快照"一次性下载；
+//! - `#EXT-X-MEDIA` 的**独立音轨组**：见 [`choose_variant`] 的说明。
+
+mod crypto;
+mod ts;
+
+pub use crypto::{KeyFormat, KeyMethod, SegmentKey};
+
+use base64::Engine as _;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -92,15 +119,6 @@ const SEGMENT_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
 /// 缓冲，既不让缓冲长到一次刷出几百 MB（写放大），也不至于每写几 KB 就刷。
 const SPLICE_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 
-/// `#EXT-X-KEY` 描述的分片密钥（AES-128 整段加密）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SegmentKey {
-    /// 密钥地址（已相对清单 URL 解析为绝对地址）。
-    pub url: String,
-    /// 初始向量（`IV` 缺省时按媒体序号大端 16 字节推导）。
-    pub iv: [u8; 16],
-}
-
 /// 一个待下载的分片（含 fMP4 初始化段）。
 #[derive(Debug, Clone)]
 pub struct Segment {
@@ -152,6 +170,12 @@ pub struct PlaylistPlan {
     /// 平均码率，与「总字节 ÷ 总时长」同义。注意这只是**初值**：后台探测
     /// （[`PlaylistStats::exact_total`]）会把它替换成精确值。
     pub bitrate: Option<u64>,
+    /// 选中的这一路的**音轨在另一个清单里**（主清单的 `AUDIO="…"` 分组）。
+    ///
+    /// 引擎不依赖 ffmpeg，没有封装器，独立音轨合不进产物 —— 这种任务的产物是
+    /// **没有声音的视频**。置这一位是为了让上层能把话说清楚（日志 / 界面提示），
+    /// 而不是让用户拿到一个静音文件还以为下载器坏了。
+    pub separate_audio: bool,
 }
 
 impl PlaylistPlan {
@@ -417,7 +441,7 @@ pub struct PlaylistDone {
 // 清单解析
 // ---------------------------------------------------------------------------
 
-/// 主清单中的一个码率变体。
+/// 主清单中的一个码率变体（`#EXT-X-STREAM-INF` + 紧跟的 URI 行）。
 #[derive(Debug, Clone)]
 struct Variant {
     url: String,
@@ -428,6 +452,34 @@ struct Variant {
     /// 换算依据。清单没写时为 0（此时退回 `bandwidth` 并接受偏高）。
     avg_bandwidth: u64,
     area: u64,
+    /// `AUDIO="组名"`：这一路的音轨在**另一个清单**里（`#EXT-X-MEDIA` 的 AUDIO 组）。
+    /// 为 `None` 表示音视频同在一个清单 —— 产物自带声音。
+    audio_group: Option<String>,
+    /// `CODECS="…"`（只用于诊断日志：线上大量清单写错它，不能拿它做判断）。
+    codecs: Option<String>,
+}
+
+/// 主清单里的一条 `#EXT-X-MEDIA` 备用 rendition（音轨 / 字幕 / 备用机位）。
+#[derive(Debug, Clone)]
+struct Rendition {
+    /// `TYPE`：`AUDIO` / `VIDEO` / `SUBTITLES` / `CLOSED-CAPTIONS`。
+    kind: String,
+    /// `GROUP-ID`：被 `#EXT-X-STREAM-INF` 的 `AUDIO="…"` 引用的组名。
+    group_id: String,
+    name: String,
+    language: Option<String>,
+    default: bool,
+    autoselect: bool,
+    channels: Option<String>,
+    /// `URI`（已解析为绝对地址）。`CLOSED-CAPTIONS` 没有 URI（它在 TS 里内嵌）。
+    uri: Option<String>,
+}
+
+/// 主清单解析结果。
+#[derive(Debug, Default, Clone)]
+struct Master {
+    variants: Vec<Variant>,
+    renditions: Vec<Rendition>,
 }
 
 /// 解析 `KEY=VALUE,KEY=VALUE` 属性串（尊重引号内的逗号）。
@@ -474,6 +526,13 @@ fn attr<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+/// `YES` / `NO` 属性（`DEFAULT` / `AUTOSELECT`）。
+fn attr_bool(attrs: &[(String, String)], key: &str) -> bool {
+    attr(attrs, key)
+        .map(|v| v.trim().eq_ignore_ascii_case("YES"))
+        .unwrap_or(false)
+}
+
 /// 去掉 UTF-8 BOM 与首尾空白。
 fn clean_text(s: &str) -> &str {
     s.trim_start_matches('\u{feff}').trim()
@@ -485,20 +544,42 @@ fn looks_like_manifest(text: &str) -> bool {
 }
 
 /// 是否为主清单（含码率变体声明）。
+///
+/// `#EXT-X-I-FRAME-STREAM-INF` **不算**主清单的标志：只有它（纯 I 帧索引清单）
+/// 的清单不是可播放的多码率主清单，按媒体清单处理会得到"没有分片"的正确报错。
 fn is_master(text: &str) -> bool {
     clean_text(text)
         .lines()
-        .any(|l| l.trim_start().starts_with("#EXT-X-STREAM-INF"))
+        .any(|l| l.trim_start().starts_with("#EXT-X-STREAM-INF:"))
 }
 
-/// 解析主清单中的码率变体（不含独立音轨组）。
-fn parse_variants(text: &str, base: &Url) -> Vec<Variant> {
+/// 解析主清单：码率变体 + `#EXT-X-MEDIA` 备用 rendition。
+fn parse_master(text: &str, base: &Url) -> Master {
     let text = clean_text(text);
-    let mut out = Vec::new();
-    let mut pending: Option<(u64, u64, u64)> = None;
+    let mut out = Master::default();
+    let mut pending: Option<(u64, u64, u64, Option<String>, Option<String>)> = None;
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#EXT-X-MEDIA:") {
+            let attrs = parse_attributes(rest);
+            let kind = attr(&attrs, "TYPE").unwrap_or("").trim().to_ascii_uppercase();
+            let group_id = attr(&attrs, "GROUP-ID").unwrap_or("").trim().to_string();
+            if kind.is_empty() || group_id.is_empty() {
+                continue;
+            }
+            out.renditions.push(Rendition {
+                kind,
+                group_id,
+                name: attr(&attrs, "NAME").unwrap_or("").trim().to_string(),
+                language: attr(&attrs, "LANGUAGE").map(|s| s.trim().to_string()),
+                default: attr_bool(&attrs, "DEFAULT"),
+                autoselect: attr_bool(&attrs, "AUTOSELECT"),
+                channels: attr(&attrs, "CHANNELS").map(|s| s.trim().to_string()),
+                uri: attr(&attrs, "URI").and_then(|u| resolve_url(base, u)),
+            });
             continue;
         }
         if let Some(rest) = line.strip_prefix("#EXT-X-STREAM-INF:") {
@@ -517,19 +598,26 @@ fn parse_variants(text: &str, base: &Url) -> Vec<Variant> {
                     Some(w.trim().parse::<u64>().ok()? * h.trim().parse::<u64>().ok()?)
                 })
                 .unwrap_or(0);
-            pending = Some((bandwidth, avg_bandwidth, area));
+            // 线上 `AUDIO` 偶尔写成 `AUDIO=`（空值）：当没有，别去认一个空组名
+            let audio_group = attr(&attrs, "AUDIO")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let codecs = attr(&attrs, "CODECS").map(|s| s.trim().to_string());
+            pending = Some((bandwidth, avg_bandwidth, area, audio_group, codecs));
             continue;
         }
         if line.starts_with('#') {
             continue;
         }
-        if let Some((bandwidth, avg_bandwidth, area)) = pending.take() {
+        if let Some((bandwidth, avg_bandwidth, area, audio_group, codecs)) = pending.take() {
             if let Some(url) = resolve_url(base, line) {
-                out.push(Variant {
+                out.variants.push(Variant {
                     url,
                     bandwidth,
                     avg_bandwidth,
                     area,
+                    audio_group,
+                    codecs,
                 });
             }
         }
@@ -537,9 +625,23 @@ fn parse_variants(text: &str, base: &Url) -> Vec<Variant> {
     out
 }
 
-/// 选流：默认取码率最高（同码率取分辨率最大），`worst` 时取最低。
+/// 选流。
+///
+/// 排序口径与各家播放器一致：默认取码率最高（同码率取分辨率最大），
+/// `worst` 时取最低。
+///
+/// **但有一个例外，而且是这一版新加的**：若主清单里既有"音视频同清单"的变体、
+/// 又有"音轨在另一个清单"的变体（`AUDIO="…"`），则**只在同清单的那批里选**。
+/// 原因很实在 —— 引擎没有封装器（不依赖 ffmpeg），独立音轨**没法合进产物**，
+/// 选它只能得到一个没声音的文件。宁可降一档画质，也要给用户一个完整的片子。
 fn choose_variant<'a>(variants: &'a [Variant], prefer_worst: bool) -> Option<&'a Variant> {
-    variants.iter().max_by_key(|v| {
+    let muxed: Vec<&Variant> = variants.iter().filter(|v| v.audio_group.is_none()).collect();
+    let pool: Vec<&Variant> = if muxed.is_empty() {
+        variants.iter().collect()
+    } else {
+        muxed
+    };
+    pool.into_iter().max_by_key(|v| {
         let key = (v.bandwidth, v.area);
         if prefer_worst {
             (u64::MAX - key.0, u64::MAX - key.1)
@@ -549,11 +651,37 @@ fn choose_variant<'a>(variants: &'a [Variant], prefer_worst: bool) -> Option<&'a
     })
 }
 
+/// 主清单里"选中的这一路需要外部音轨组"时，挑一条最合适的音轨（诊断用）。
+///
+/// 只用于把话说清楚（日志里告诉用户产物为什么没有声音），不参与下载。
+fn pick_audio_rendition<'a>(
+    renditions: &'a [Rendition],
+    group: &str,
+) -> Option<&'a Rendition> {
+    let candidates: Vec<&Rendition> = renditions
+        .iter()
+        .filter(|r| r.kind == "AUDIO" && r.group_id == group && r.uri.is_some())
+        .collect();
+    // 优先 DEFAULT，其次 AUTOSELECT，最后任意一条
+    candidates
+        .iter()
+        .find(|r| r.default)
+        .or_else(|| candidates.iter().find(|r| r.autoselect))
+        .copied()
+        .or_else(|| candidates.first().copied())
+}
+
 /// 相对地址解析（失败时原样返回 None，交由调用方报错）。
+///
+/// `data:` 原样放行：少数清单把密钥**内联**在 `URI="data:…;base64,…"` 里，
+/// 那不是"地址无法解析"，而是一份自带的内容（见 [`fetch_key`]）。
 fn resolve_url(base: &Url, uri: &str) -> Option<String> {
     let uri = uri.trim();
     if uri.is_empty() {
         return None;
+    }
+    if uri.len() > 5 && uri[..5].eq_ignore_ascii_case("data:") {
+        return Some(uri.to_string());
     }
     match base.join(uri) {
         Ok(u) => Some(u.to_string()),
@@ -567,6 +695,13 @@ struct MediaPlaylist {
     segments: Vec<Segment>,
     init: Option<Segment>,
     live: bool,
+    /// 清单里出现过 `#EXT-X-MAP`（fMP4/CMAF 的初始化段）。
+    fmp4: bool,
+    /// 解不出来的原因（DRM / 未知加密方式）：由调用方决定怎么报。
+    ///
+    /// 不在解析中途直接 `Err`：解析器要能把整条清单读完，才能给出**完整**的
+    /// 诊断（比如"第 3 个 KEY 标签是 Widevine"比"某处有 DRM"有用得多）。
+    fatal: Option<String>,
 }
 
 /// `#EXT-X-BYTERANGE:<len>[@<offset>]`。
@@ -579,13 +714,28 @@ fn parse_byterange(v: &str) -> Option<(u64, Option<u64>)> {
 }
 
 /// 十六进制 IV → 16 字节（右侧对齐，缺位左补 0）。
+///
+/// 线上 IV 的写法很随意：带不带 `0x`、奇数位（少一个前导 0）、大小写混排都有。
+/// 奇数位**左补一个 0** 而不是判非法 —— 这种清单在别家播放器上能放，在下载器上
+/// 报"IV 非法"没有任何道理。
 fn parse_iv(v: &str) -> Option<[u8; 16]> {
-    let hex = v.trim().trim_start_matches("0x").trim_start_matches("0X");
-    if hex.is_empty() || hex.len() > 32 || hex.len() % 2 != 0 {
+    let mut hex = v.trim();
+    if hex.len() > 2 && (hex[..2].eq_ignore_ascii_case("0x")) {
+        hex = &hex[2..];
+    }
+    let hex = hex.trim();
+    if hex.is_empty() || hex.len() > 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let mut out = [0u8; 16];
+    let owned;
+    let hex = if hex.len() % 2 != 0 {
+        owned = format!("0{hex}");
+        owned.as_str()
+    } else {
+        hex
+    };
     let bytes = hex.as_bytes();
+    let mut out = [0u8; 16];
     for i in 0..hex.len() / 2 {
         let hi = (bytes[i * 2] as char).to_digit(16)?;
         let lo = (bytes[i * 2 + 1] as char).to_digit(16)?;
@@ -607,9 +757,25 @@ fn iv_from_sequence(seq: u64) -> [u8; 16] {
 struct PendingKey {
     url: String,
     iv: Option<[u8; 16]>,
+    method: KeyMethod,
+    key_format: KeyFormat,
+}
+
+impl PendingKey {
+    /// 落成某个分片用的密钥（`IV` 缺省时按该分片的媒体序号推导）。
+    fn resolve(&self, sequence: u64) -> SegmentKey {
+        SegmentKey {
+            url: self.url.clone(),
+            iv: self.iv.unwrap_or_else(|| iv_from_sequence(sequence)),
+            method: self.method.clone(),
+            key_format: self.key_format.clone(),
+        }
+    }
 }
 
 /// 解析媒体清单。
+///
+/// 只解析、不下载：产物是一串 [`Segment`]（含中途更换的初始化段）与若干元信息。
 fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
     // BOM 必须先去：带 BOM 的首行 `\u{feff}#EXTM3U` 不以 '#' 开头，
     // 会被当成一个分片地址混进清单。
@@ -623,6 +789,12 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
     // BYTERANGE 省略 offset 时接续同地址的上一段末尾
     let mut last_range_end: Option<(String, u64)> = None;
     let mut endlist = false;
+    // 当前生效的初始化段（`#EXT-X-MAP`）：中途换 MAP 时要把它**插在换的那一处**
+    let mut current_map: Option<Segment> = None;
+    // 下一条 URI 行是 `#EXT-X-GAP` 标出的空洞（拉不到、也不该拉）
+    let mut next_is_gap = false;
+    // LL-HLS 的部分分片：整段分片一个都没有时才拿它顶（见下面收尾那一段）
+    let mut parts: Vec<Segment> = Vec::new();
 
     for raw in text.lines() {
         let line = raw.trim();
@@ -633,50 +805,120 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
             sequence = rest.trim().parse().unwrap_or(0);
             continue;
         }
+        if let Some(rest) = line.strip_prefix("#EXT-X-DISCONTINUITY-SEQUENCE:") {
+            // 只影响 IV 推导的起点（已在 MEDIA-SEQUENCE 里体现），这里认得即可
+            let _ = rest;
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("#EXT-X-KEY:") {
             let attrs = parse_attributes(rest);
-            let method = attr(&attrs, "METHOD").unwrap_or("NONE").trim().to_ascii_uppercase();
-            match method.as_str() {
-                "NONE" => key = None,
-                "AES-128" => {
-                    let uri = attr(&attrs, "URI")
-                        .ok_or_else(|| "EXT-X-KEY(AES-128) 缺少 URI".to_string())?;
-                    let url = resolve_url(base, uri).ok_or_else(|| "密钥地址无法解析".to_string())?;
-                    // IV 缺省时**不能在解析 KEY 标签时定值**：规范要求按
-                    // 该分片自己的媒体序号推导，而序号随分片推进。
-                    let iv = match attr(&attrs, "IV") {
-                        Some(v) => Some(parse_iv(v).ok_or_else(|| "EXT-X-KEY 的 IV 非法".to_string())?),
-                        None => None,
-                    };
-                    key = Some(PendingKey { url, iv });
-                }
-                other => {
-                    return Err(format!(
-                        "暂不支持 {other} 加密的播放列表（仅支持 AES-128 与明文）"
-                    ))
-                }
+            let raw_method = attr(&attrs, "METHOD").unwrap_or("NONE");
+            let (method, known) = KeyMethod::parse(raw_method);
+            if !known {
+                out.fatal = Some(format!(
+                    "清单用了无法识别的加密方式 METHOD={raw_method}（既不是标准取值，\
+                     也不是已知的方言），无法解密"
+                ));
+                continue;
             }
+            if !method.needs_key() {
+                key = None;
+                continue;
+            }
+            let key_format = KeyFormat::parse(attr(&attrs, "KEYFORMAT"));
+            if let Some(drm) = key_format.drm_reason() {
+                out.fatal = Some(format!(
+                    "该视频使用 {drm} 数字版权保护（DRM）：密钥由授权服务器下发，\
+                     不登录、没有设备证书就换不到，无法解密。请改用能正常播放它的官方客户端。"
+                ));
+                continue;
+            }
+            let uri = match attr(&attrs, "URI") {
+                Some(u) if !u.trim().is_empty() => u,
+                // `METHOD` 非 NONE 却没有 URI：不合规，但别让整条任务挂掉，
+                // 按"这一段没密钥"处理更接近线上其它播放器的行为
+                _ => {
+                    tracing::warn!("EXT-X-KEY 缺少 URI，该段按明文处理");
+                    key = None;
+                    continue;
+                }
+            };
+            let url = match resolve_url(base, uri) {
+                Some(u) => u,
+                None => {
+                    out.fatal = Some(format!("密钥地址无法解析：{uri}"));
+                    continue;
+                }
+            };
+            // IV 缺省时**不能在解析 KEY 标签时定值**：规范要求按该分片自己的
+            // 媒体序号推导，而序号随分片推进。
+            let iv = match attr(&attrs, "IV") {
+                Some(v) if !v.trim().is_empty() => match parse_iv(v) {
+                    Some(iv) => Some(iv),
+                    None => {
+                        out.fatal = Some(format!("EXT-X-KEY 的 IV 不是合法十六进制：{v}"));
+                        continue;
+                    }
+                },
+                _ => None,
+            };
+            key = Some(PendingKey {
+                url,
+                iv,
+                method,
+                key_format,
+            });
             continue;
         }
         if let Some(rest) = line.strip_prefix("#EXT-X-MAP:") {
             let attrs = parse_attributes(rest);
-            let uri = attr(&attrs, "URI").ok_or_else(|| "EXT-X-MAP 缺少 URI".to_string())?;
-            let url = resolve_url(base, uri).ok_or_else(|| "初始化段地址无法解析".to_string())?;
-            let range = match attr(&attrs, "BYTERANGE") {
-                Some(v) => {
-                    let (len, off) = parse_byterange(v).ok_or_else(|| "EXT-X-MAP BYTERANGE 非法".to_string())?;
-                    Some((off.unwrap_or(0), len))
+            let uri = match attr(&attrs, "URI") {
+                Some(u) => u,
+                None => {
+                    out.fatal = Some("EXT-X-MAP 缺少 URI".into());
+                    continue;
                 }
+            };
+            let url = match resolve_url(base, uri) {
+                Some(u) => u,
+                None => {
+                    out.fatal = Some(format!("初始化段地址无法解析：{uri}"));
+                    continue;
+                }
+            };
+            let range = match attr(&attrs, "BYTERANGE") {
+                Some(v) => match parse_byterange(v) {
+                    Some((len, off)) => Some((off.unwrap_or(0), len)),
+                    None => {
+                        out.fatal = Some(format!("EXT-X-MAP 的 BYTERANGE 非法：{v}"));
+                        continue;
+                    }
+                },
                 None => None,
             };
             // 初始化段按规范不受 AES-128 影响（只有 SAMPLE-AES 才作用于它）
-            out.init = Some(Segment {
+            let seg = Segment {
                 url,
                 range,
                 key: None,
                 size: range.map(|(_, len)| len),
                 duration: 0.0,
-            });
+            };
+            out.fmp4 = true;
+            match &current_map {
+                // 与当前生效的那一个相同：重复声明，忽略（不少站点每个分片前都写一遍）
+                Some(prev) if prev.url == seg.url && prev.range == seg.range => {}
+                Some(_) => {
+                    // **中途换了初始化段**（插入广告、切换 DRM 周期都会这样）：
+                    // 把新的那一个**就地**插进分片序列，下载时自然落在正确的位置
+                    current_map = Some(seg.clone());
+                    out.segments.push(seg);
+                }
+                None => {
+                    current_map = Some(seg.clone());
+                    out.init = Some(seg);
+                }
+            }
             continue;
         }
         if let Some(rest) = line.strip_prefix("#EXTINF:") {
@@ -687,23 +929,63 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("#EXT-X-BYTERANGE:") {
-            let (len, off) = parse_byterange(rest)
-                .ok_or_else(|| "EXT-X-BYTERANGE 非法".to_string())?;
+            let (len, off) = match parse_byterange(rest) {
+                Some(v) => v,
+                None => {
+                    out.fatal = Some(format!("EXT-X-BYTERANGE 非法：{rest}"));
+                    continue;
+                }
+            };
             next_range = Some((len, off.unwrap_or(u64::MAX)));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("#EXT-X-PART:") {
+            // LL-HLS 的部分分片。整段分片存在时它只是"更细的切片"，不必单独下；
+            // 一个整段都没有（纯低延迟直播）才拿它顶（见函数末尾）。
+            let attrs = parse_attributes(rest);
+            let duration = attr(&attrs, "DURATION")
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(0.0)
+                .max(0.0);
+            if let Some(url) = attr(&attrs, "URI").and_then(|u| resolve_url(base, u)) {
+                parts.push(Segment {
+                    url,
+                    range: None,
+                    key: key.as_ref().map(|k| k.resolve(sequence)),
+                    size: None,
+                    duration,
+                });
+            }
             continue;
         }
         if line == "#EXT-X-ENDLIST" {
             endlist = true;
             continue;
         }
+        if line == "#EXT-X-GAP" {
+            next_is_gap = true;
+            continue;
+        }
         if line.starts_with('#') {
+            // 其余标签（VERSION / TARGETDURATION / PLAYLIST-TYPE / DATERANGE /
+            // PROGRAM-DATE-TIME / I-FRAMES-ONLY / BITRATE / START / SERVER-CONTROL /
+            // PRELOAD-HINT / RENDITION-REPORT / SKIP / PART-INF / SESSION-KEY …）
+            // 都不影响"下哪些分片"，认得即可
             continue;
         }
         // URI 行 = 一个分片（非 URI 行之外的 #EXTINF 只是元数据）
         let Some(url) = resolve_url(base, line) else {
-            return Err(format!("分片地址无法解析: {line}"));
+            out.fatal = Some(format!("分片地址无法解析：{line}"));
+            continue;
         };
         let duration = std::mem::take(&mut next_duration);
+        if next_is_gap {
+            // 空洞段：地址在清单里但内容不可得，跳过它（序号照常推进）
+            next_is_gap = false;
+            next_range = None;
+            sequence += 1;
+            continue;
+        }
         let range = next_range.take().map(|(len, off)| {
             let start = if off == u64::MAX {
                 match &last_range_end {
@@ -719,16 +1001,22 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
         out.segments.push(Segment {
             url,
             range,
-            key: key.as_ref().map(|k| SegmentKey {
-                url: k.url.clone(),
-                iv: k.iv.unwrap_or_else(|| iv_from_sequence(sequence)),
-            }),
+            key: key.as_ref().map(|k| k.resolve(sequence)),
             size: range.map(|(_, len)| len),
             duration,
         });
         sequence += 1;
     }
     out.live = !endlist;
+    // 纯 LL-HLS（只有 #EXT-X-PART、没有整段）：用部分分片顶。
+    // 这些分片本身就是合法的 CMAF 分片，顺序拼接同样能播。
+    if out.segments.is_empty() && !parts.is_empty() {
+        tracing::info!(
+            parts = parts.len(),
+            "清单只有 #EXT-X-PART（纯低延迟），按部分分片下载"
+        );
+        out.segments = parts;
+    }
     Ok(out)
 }
 
@@ -787,6 +1075,8 @@ pub async fn fetch_plan(
     let mut chain: Vec<String> = Vec::new();
     // 选中变体的声明码率（主清单才有）：用于"下载一开始就有总长"
     let mut bitrate: Option<u64> = None;
+    // 选中的这一路是否需要**独立的音轨清单**（见 choose_variant 的说明）
+    let mut separate_audio = false;
     for _ in 0..MAX_VARIANT_HOPS {
         let (text, final_url) = fetch_manifest(client, &cur, cancel, headers).await?;
         if !looks_like_manifest(&text) {
@@ -798,17 +1088,35 @@ pub async fn fetch_plan(
             .map_err(|e| HttpError::Protocol(format!("清单地址非法: {e}")))?;
 
         if is_master(&text) {
-            let variants = parse_variants(&text, &base);
-            if variants.is_empty() {
+            let master = parse_master(&text, &base);
+            if master.variants.is_empty() {
                 return Err(HttpError::Protocol("主清单中没有可用的码率变体".into()));
             }
-            let chosen = choose_variant(&variants, opts.prefer_worst)
+            let chosen = choose_variant(&master.variants, opts.prefer_worst)
                 .expect("变体列表非空")
                 .clone();
             tracing::debug!(
                 variant = %chosen.url, bandwidth = chosen.bandwidth,
-                avg_bandwidth = chosen.avg_bandwidth, "主清单选流"
+                avg_bandwidth = chosen.avg_bandwidth, codecs = ?chosen.codecs,
+                renditions = master.renditions.len(),
+                "主清单选流"
             );
+            // 选中的这一路音轨在**另一个清单**里：引擎没有封装器，产物只能是
+            // 无声音的视频。这是"能下但会缺东西"的情况，必须**说出来** ——
+            // 闷声给一个静音文件，用户只会以为下载器坏了。
+            if let Some(group) = &chosen.audio_group {
+                let audio = pick_audio_rendition(&master.renditions, group);
+                tracing::warn!(
+                    group = %group,
+                    audio_uri = ?audio.and_then(|a| a.uri.clone()),
+                    audio_name = ?audio.map(|a| a.name.clone()),
+                    audio_lang = ?audio.and_then(|a| a.language.clone()),
+                    audio_channels = ?audio.and_then(|a| a.channels.clone()),
+                    "该码率变体的音轨在独立的 #EXT-X-MEDIA 组里，产物将不含声音\
+                     （引擎不依赖 ffmpeg，无法在下载后封装）"
+                );
+                separate_audio = true;
+            }
             // 总长换算优先用平均码率（BANDWIDTH 是峰值，会偏高）
             bitrate = Some(if chosen.avg_bandwidth > 0 {
                 chosen.avg_bandwidth
@@ -822,11 +1130,18 @@ pub async fn fetch_plan(
         }
 
         let media = parse_media(&text, &base).map_err(HttpError::Protocol)?;
+        // DRM / 未知加密方式：解析器把原因攒在 `fatal` 里，这里统一报出去。
+        // 放在"有分片"判断之前：一份全 DRM 的清单可能连分片都解析不全，
+        // 报"没有分片"会把用户引到完全错误的方向
+        if let Some(reason) = media.fatal {
+            return Err(HttpError::Protocol(reason));
+        }
         let duration_secs: f64 = media.segments.iter().map(|s| s.duration).sum();
         let mut plan = PlaylistPlan {
             source: final_url,
             chain,
-            fmp4: media.init.is_some()
+            fmp4: media.fmp4
+                || media.init.is_some()
                 || media
                     .segments
                     .iter()
@@ -837,6 +1152,7 @@ pub async fn fetch_plan(
             total: None,
             duration_secs,
             bitrate,
+            separate_audio,
         };
         if plan.segment_count() == 0 {
             return Err(HttpError::Protocol("播放列表中没有可下载的分片".into()));
@@ -1045,6 +1361,16 @@ struct PlaylistCtrl {
     v: u32,
     /// 清单指纹（分片地址集合）
     fp: String,
+    /// **稳定**指纹：与 `fp` 同形，但每个地址先过 [`stable_url`]（剔除易变的
+    /// 凭证类查询参数）。两个指纹都记，是为了让续传判据分两档 —— 见 [`load_ctrl`]。
+    ///
+    /// 为什么需要它：带防盗链的站点**每次拉清单都会换一批 token**（`?sign=…&t=…`），
+    /// 只认 `fp` 的话，任务一旦失败（或用户点重新下载），重新拉到的清单必然对不上
+    /// 旧指纹 → 段目录被整个丢弃 → **从头下**。用户看到的就是"一出错就得从零开始，
+    /// 明明有断点续传"。老控制文件没有这个字段 → 空串，只走 `fp` 那一档，
+    /// 语义与从前完全一致。
+    #[serde(default)]
+    fps: String,
     /// 最终清单地址
     url: String,
     /// 段总数
@@ -1167,13 +1493,160 @@ fn fingerprint(plan: &PlaylistPlan) -> String {
     hex::encode(&h.finalize()[..8])
 }
 
+/// **名字本身**就说明取值不参与段身份的参数（一律剔除，不看取值）。
+///
+/// 这些名字在线上只有一个含义：一次性凭证 / 签名 / 有效期。它们的取值每次请求
+/// 都可能不同，但同一个路径上还是同一段内容。
+const VOLATILE_QUERY_KEYS: [&str; 26] = [
+    "token",
+    "access_token",
+    "accesstoken",
+    "auth",
+    "authorization",
+    "auth_key",
+    "authkey",
+    "sign",
+    "sig",
+    "signature",
+    "signed",
+    "ssign",
+    "psign",
+    "wssign",
+    "wskey",
+    "wssecret",
+    "ws_secret",
+    "expires",
+    "expire",
+    "deadline",
+    "nonce",
+    "hdnts",
+    "txsecret",
+    "txtime",
+    "playauth",
+    "sessionid",
+];
+
+/// **名字含糊**的参数：只有在取值"看起来像一次性凭证"时才剔除。
+///
+/// `?t=1712345678` 是时间戳（剔除），`?t=2` 却可能真的是"第 2 段"（保留）——
+/// 按名字一刀切会把后者的段身份抹掉，那是最坏的结果：不同的段被判成同一段，
+/// 产物会错位。所以这一类**必须**看取值。
+const AMBIGUOUS_QUERY_KEYS: [&str; 14] = [
+    "t", "e", "ts", "time", "timestamp", "_t", "_time", "r", "rand", "key", "k", "sid", "session",
+    "sn",
+];
+
+/// 取值是否"看起来像一次性凭证"（时间戳 / 十六进制摘要 / 长随机串）。
+///
+/// 阈值刻意偏保守：判错成"易变"会让指纹变松（可能误认另一条清单），判错成
+/// "稳定"最多是退回旧行为（从零下载）。两头都不可取，所以只认三种很明确的形状。
+fn looks_like_opaque_value(v: &str) -> bool {
+    if v.len() >= 8 && v.bytes().all(|b| b.is_ascii_digit()) {
+        return true; // 秒/毫秒时间戳、长序号
+    }
+    if v.len() >= 16 && v.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return true; // 十六进制摘要
+    }
+    // 长且"字母数字混排"的串：base64url / 自制 token
+    v.len() >= 20
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && v.bytes().any(|b| b.is_ascii_alphabetic())
+        && v.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// 这个查询参数是不是"易变"的（取值不参与段身份判定）。
+fn is_volatile_param(k: &str, v: &str) -> bool {
+    let k = k.to_ascii_lowercase();
+    if VOLATILE_QUERY_KEYS.contains(&k.as_str()) {
+        return true;
+    }
+    AMBIGUOUS_QUERY_KEYS.contains(&k.as_str()) && looks_like_opaque_value(v)
+}
+
+/// 地址的**稳定形态**：只保留 `路径` + `有语义的查询参数`，丢掉 scheme / host /
+/// port / fragment 与易变参数。
+///
+/// 为什么连 host 一起丢：同一批段在多个 CDN 域名上是**同一份内容**（引擎本来就
+/// 支持多 URI 故障转移，切镜像后清单里的段地址只是换了域名）。段身份落在路径上。
+///
+/// 为什么可以丢这么多还安全：这个形态只用于**已经过一次严格比对（段数相同）**
+/// 之后的第二档判据，而且比对的是**有序**的稳定地址序列 —— 两条不同的清单要同时
+/// 满足"路径序列逐项相同 + 语义参数逐项相同 + 段数相同"才会被认成同一条，
+/// 概率低到可以接受；而它换来的收益是"签名轮换/换镜像都不再从零下载"。
+fn stable_url(raw: &str) -> String {
+    let Ok(u) = Url::parse(raw) else {
+        // 解析不了（畸形串）时退回"原文去 fragment"：宁可判成"不同"（退回旧行为），
+        // 也不要拿一个猜出来的形态去匹配续传现场。
+        return raw.split('#').next().unwrap_or(raw).to_string();
+    };
+    let mut pairs: Vec<(String, String)> = u
+        .query_pairs()
+        .filter(|(k, v)| !is_volatile_param(k, v))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    // 查询串的拼接顺序不保证稳定（同一条清单两次拿到的顺序可以不同），排序后才可比对
+    pairs.sort();
+    let mut out = String::with_capacity(raw.len());
+    out.push_str(u.path());
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        out.push(if i == 0 { '?' } else { '&' });
+        out.push_str(k);
+        out.push('=');
+        out.push_str(v);
+    }
+    out
+}
+
+/// **稳定**清单指纹：与 [`fingerprint`] 同形，但每个地址先过 [`stable_url`]。
+fn stable_fingerprint(plan: &PlaylistPlan) -> String {
+    let mut h = Sha256::new();
+    if let Some(i) = &plan.init {
+        h.update(stable_url(&i.url).as_bytes());
+        if let Some((o, l)) = i.range {
+            h.update(format!("{o}:{l}").as_bytes());
+        }
+    }
+    for s in &plan.segments {
+        h.update(stable_url(&s.url).as_bytes());
+        if let Some((o, l)) = s.range {
+            h.update(format!("{o}:{l}").as_bytes());
+        }
+        if let Some(k) = &s.key {
+            h.update(stable_url(&k.url).as_bytes());
+        }
+    }
+    hex::encode(&h.finalize()[..8])
+}
+
+/// 读取并校验控制文件；不认（文件损坏 / 种类不符 / 不是同一条清单）时返回 `None`。
+///
+/// 判据分两档，任一成立即认：
+///
+/// 1. **完全一致** —— 分片地址、区间、密钥地址与清单地址**逐字**相同。
+///    老的控制文件没有 `fps` 字段，走的也是这一档，语义与从前一致。
+/// 2. **稳定形态一致** —— 只差易变的凭证参数（签名轮换）或换了 CDN 域名
+///    （见 [`stable_url`]）。**段数必须相同**，且有序的稳定地址序列必须逐项相同。
+///
+/// 第 2 档是"任务一出错、重新下载就从零开始"的修复：带防盗链的站点每次拉清单都
+/// 换一批 token，只认第 1 档的话每次重试都把段目录整个丢掉。
+///
+/// 两条都要求 `segs` 相同 —— 直播滑窗（段数会变）因此仍然被判为"不是同一条清单"，
+/// 不会拿旧窗口的数据去凑新窗口。
 fn load_ctrl(path: &Path, plan: &PlaylistPlan) -> Option<PlaylistCtrl> {
     let raw = std::fs::read_to_string(path).ok()?;
     let c: PlaylistCtrl = serde_json::from_str(&raw).ok()?;
     if c.kind != CTRL_KIND || c.v != 1 {
         return None;
     }
-    if c.fp != fingerprint(plan) || c.url != plan.source || c.segs != plan.segment_count() {
+    if c.segs != plan.segment_count() {
+        return None;
+    }
+    let exact = c.fp == fingerprint(plan) && c.url == plan.source;
+    let stable = !c.fps.is_empty()
+        && c.fps == stable_fingerprint(plan)
+        && stable_url(&c.url) == stable_url(&plan.source);
+    if !exact && !stable {
         return None;
     }
     Some(c)
@@ -1337,58 +1810,159 @@ impl Ctx<'_> {
     }
 }
 
-/// 取密钥（同一地址只下一次）。
+/// 取密钥（同一地址只下一次）。**返回的是服务器给的原始字节**，长度与形态的
+/// 归一化交给 [`crypto::decode_key_body`]（它知道这一路需要 16 还是 32 字节）。
 async fn fetch_key(ctx: &Ctx<'_>, url: &str) -> Result<Arc<Vec<u8>>, HttpError> {
     if let Some(k) = ctx.keys.lock().unwrap().get(url).cloned() {
         return Ok(k);
     }
-    let resp = tokio::select! {
-        biased;
-        _ = ctx.cancel.cancelled() => return Err(HttpError::Cancelled),
-        r = apply_headers(ctx.client.get(url), ctx.headers).send() => {
-            r.map_err(|e| HttpError::from_reqwest(&e))?
+    let bytes: Vec<u8> = if is_data_uri(url) {
+        // 少数清单把密钥内联成 `data:` URI（离线包、自签站点）
+        decode_data_uri(url)?
+    } else {
+        let resp = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return Err(HttpError::Cancelled),
+            r = apply_headers(ctx.client.get(url), ctx.headers).send() => {
+                r.map_err(|e| HttpError::from_reqwest(&e))?
+            }
+        };
+        if !resp.status().is_success() {
+            return Err(HttpError::Http(resp.status().as_u16()));
         }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| HttpError::from_reqwest(&e))?;
+        if bytes.is_empty() {
+            return Err(HttpError::Protocol("密钥内容为空".into()));
+        }
+        bytes.to_vec()
     };
-    if !resp.status().is_success() {
-        return Err(HttpError::Http(resp.status().as_u16()));
-    }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| HttpError::from_reqwest(&e))?;
-    if bytes.is_empty() {
-        return Err(HttpError::Protocol("密钥内容为空".into()));
-    }
-    let arc = Arc::new(bytes.to_vec());
+    let arc = Arc::new(bytes);
     ctx.keys.lock().unwrap().insert(url.to_string(), arc.clone());
     Ok(arc)
 }
 
-/// AES-128-CBC + PKCS7 解密。
-fn decrypt_segment(key: &[u8], iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>, HttpError> {
-    use aes::cipher::{BlockDecryptMut, KeyIvInit};
-    type Dec = cbc::Decryptor<aes::Aes128>;
-    if key.len() != 16 {
+/// 是不是 `data:` URI。
+fn is_data_uri(s: &str) -> bool {
+    s.len() > 5 && s[..5].eq_ignore_ascii_case("data:")
+}
+
+/// 解一份 `data:` URI（密钥内联时用）。只支持 `;base64,` 与纯文本两种。
+fn decode_data_uri(uri: &str) -> Result<Vec<u8>, HttpError> {
+    let rest = &uri[5..];
+    let (meta, payload) = rest
+        .split_once(',')
+        .ok_or_else(|| HttpError::Protocol("内联密钥的 data: URI 格式不对（缺少逗号）".into()))?;
+    let is_b64 = meta.split(';').any(|p| p.trim().eq_ignore_ascii_case("base64"));
+    if is_b64 {
+        base64::engine::general_purpose::STANDARD
+            .decode(payload.trim())
+            .map_err(|e| HttpError::Protocol(format!("内联密钥 Base64 解码失败：{e}")))
+    } else {
+        Ok(percent_decode(payload))
+    }
+}
+
+/// 极简百分号解码（`data:` URI 的非 base64 形态用）。
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hi = (b[i + 1] as char).to_digit(16);
+            let lo = (b[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+/// 按加密方式解密一个分片。
+///
+/// 这是"能解的都解"这句话的落点：方式 → 密钥长度 → 解密算法，全部在这里分派；
+/// 不支持的形态（fMP4 的样本级加密、DRM）在这里给出**可读的原因**。
+fn decrypt_segment_with(raw_key: &[u8], sk: &SegmentKey, data: &[u8]) -> Result<Vec<u8>, HttpError> {
+    if let Some(reason) = sk.unsupported_reason() {
+        return Err(HttpError::Protocol(reason));
+    }
+    // 明文先出：`METHOD=NONE` 的分片**根本不该来取密钥**（调用方在 `seg.key` 为 None
+    // 时就跳过了），但真要走到这里，也不该因为"没有密钥"而失败
+    if sk.method == KeyMethod::None {
+        return Ok(data.to_vec());
+    }
+    let need = match sk.method {
+        KeyMethod::Aes256 => 32,
+        _ => 16,
+    };
+    let key = crypto::decode_key_body(raw_key, need).map_err(HttpError::Protocol)?;
+    match sk.method {
+        KeyMethod::None => Ok(data.to_vec()),
+        KeyMethod::Aes128 | KeyMethod::Aes256 => {
+            crypto::decrypt_cbc(&key, &sk.iv, data).map_err(HttpError::Protocol)
+        }
+        KeyMethod::Aes128Ctr => {
+            crypto::decrypt_ctr(&key, &sk.iv, data).map_err(HttpError::Protocol)
+        }
+        KeyMethod::SampleAes | KeyMethod::SampleAesCtr => {
+            decrypt_sample_level(&key, sk, data)
+        }
+    }
+}
+
+/// 样本级加密：先认容器（TS / fMP4），再分派到对应的逐样本解密。
+fn decrypt_sample_level(key: &[u8], sk: &SegmentKey, data: &[u8]) -> Result<Vec<u8>, HttpError> {
+    if looks_like_ts(data) {
+        if sk.method == KeyMethod::SampleAesCtr {
+            return Err(HttpError::Protocol(
+                "分片是 MPEG-TS，却声明了 SAMPLE-AES-CTR（那是 fMP4/cenc 的形态）：\
+                 清单与实际内容不一致，无法解密"
+                    .into(),
+            ));
+        }
+        return ts::decrypt_sample_aes_ts(data, key, &sk.iv).map_err(HttpError::Protocol);
+    }
+    if looks_like_mp4(data) {
+        let scheme = if sk.method == KeyMethod::SampleAesCtr {
+            "cenc（SAMPLE-AES-CTR）"
+        } else {
+            "cbcs（SAMPLE-AES）"
+        };
         return Err(HttpError::Protocol(format!(
-            "AES-128 密钥长度应为 16 字节，实际 {}",
-            key.len()
+            "这一路是 fMP4(CMAF) 的 {scheme} 样本级加密，本版还不支持逐样本解密。\
+             它不是 DRM，只是引擎这一侧还没实现按 moof/senc 解样本；\
+             可以先在别处取到明文分片，或换一个非加密/整段 AES-128 的来源。"
         )));
     }
-    if data.is_empty() {
-        return Ok(Vec::new());
+    Err(HttpError::Protocol(
+        "SAMPLE-AES 分片既不是 MPEG-TS 也不是 fMP4，认不出容器，无法解密".into(),
+    ))
+}
+
+/// 是不是 MPEG-TS：首个字节是同步字节，且长度是 188 的整数倍。
+///
+/// 两个条件一起用：单看 `0x47` 会把偶然撞上的 fMP4 认成 TS，单看长度倍数又太弱。
+fn looks_like_ts(data: &[u8]) -> bool {
+    data.len() >= 188 * 2 && data.len() % 188 == 0 && data[0] == 0x47 && data[188] == 0x47
+}
+
+/// 是不是 ISO BMFF（fMP4 / CMAF）：第 4~8 字节是顶层 box 类型。
+fn looks_like_mp4(data: &[u8]) -> bool {
+    if data.len() < 8 {
+        return false;
     }
-    if data.len() % 16 != 0 {
-        return Err(HttpError::Protocol(format!(
-            "加密分片长度 {} 不是 16 的整数倍",
-            data.len()
-        )));
-    }
-    let mut buf = data.to_vec();
-    let dec = Dec::new(key.into(), iv.into());
-    let plain = dec
-        .decrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buf)
-        .map_err(|e| HttpError::Protocol(format!("AES-128 解密失败: {e}")))?;
-    Ok(plain.to_vec())
+    matches!(
+        &data[4..8],
+        b"ftyp" | b"styp" | b"moof" | b"moov" | b"sidx" | b"free"
+    )
 }
 
 /// 在飞分片计数守卫：分片 future 被丢弃（取消/失败提前收尾）时也要
@@ -1788,7 +2362,7 @@ async fn fetch_segment(
             let body = fetch_body(ctx, seg, target, resume_from, slot).await?;
             match (&key, &seg.key) {
                 // 加密段一律走内存目标（调用方保证）：解密要整段，没法边收边写
-                (Some(k), Some(sk)) => decrypt_segment(k, &sk.iv, &body.data).map(|d| {
+                (Some(k), Some(sk)) => decrypt_segment_with(k, sk, &body.data).map(|d| {
                     // 真值取**解密后的明文长度**，不是服务器声明的密文长度：
                     // 产物里存的是明文，密文比它多 1~16 字节的 PKCS7 填充。
                     // 沿用密文长度会让 `exact_total` 系统性偏大（每片多算一截），
@@ -1803,7 +2377,10 @@ async fn fetch_segment(
         match r {
             Ok(body) => return Ok(body),
             Err(e) => {
-                if e.is_retryable() && attempt < ctx.retries.max(1) {
+                // `is_retryable_segment` 比通用的 `is_retryable` 宽：把 408/425/429
+                // 也算"过一会儿再来就好"（站点限流时原地退避重试是对的），
+                // 但**不含** 401/403/410 —— 那些要换地址，交给清单级重试。
+                if e.is_retryable_segment() && attempt < ctx.retries.max(1) {
                     let backoff = Duration::from_millis(400 * u64::from(attempt));
                     tokio::select! {
                         biased;
@@ -1921,6 +2498,7 @@ async fn download_playlist_unordered(
 
     let ctrl_path = xfer_storage::ctrl_path(path);
     let fp = fingerprint(plan);
+    let fps = stable_fingerprint(plan);
     let dir = seg_dir(path);
 
     // 续传：只有"本模式 + 清单指纹"都吻合的控制文件才认；否则段目录整个丢掉
@@ -1988,6 +2566,7 @@ async fn download_playlist_unordered(
         kind: CTRL_KIND.to_string(),
         v: 1,
         fp: fp.clone(),
+        fps: fps.clone(),
         url: plan.source.clone(),
         segs: total_segments,
         prefix: written,
@@ -2041,6 +2620,12 @@ async fn download_playlist_unordered(
     let mut futs: FuturesUnordered<BoxFuture<'_, (usize, Result<SegBody, HttpError>)>> =
         FuturesUnordered::new();
     let mut failure: Option<HttpError> = None;
+    // 下载失败、被跳过的分片下标（**不是**立即放弃的失败，见下面的 Err 分支）。
+    let mut failed: Vec<usize> = Vec::new();
+    // 第一个"分片级失败"的错误。收尾时优先上抛它，而不是笼统的"未下载完整" ——
+    // 前者带着真实原因（如 `Http(403)`），引擎据此判断要不要重取清单再来一轮；
+    // 后者是协议错，会被当成"不值得重试"。
+    let mut seg_err: Option<HttpError> = None;
 
     loop {
         // 1) 把连续前缀拼进产物（拼一段删一段，磁盘不翻倍）
@@ -2178,12 +2763,35 @@ async fn download_playlist_unordered(
                     last_save = std::time::Instant::now();
                 }
             }
-            Some((_, Err(e))) => {
-                failure = Some(e);
-                break;
+            Some((i, Err(e))) => {
+                in_flight -= 1;
+                handles.remove(&i);
+                // 单个分片失败**不能**一票否决整条任务。
+                //
+                // 旧行为是 `failure = Some(e); break;` —— 一条 2000 段的流里有一段
+                // 连撞三次 5xx，整条任务立刻失败，而它前面已经下好的几百段在
+                // 界面上的意义全没了（用户报的"下一会它就报错"）。现在的做法：
+                // 把这个分片记下来、**继续下其余分片**，跑完再上抛真实错误。
+                // 收益是"失败时进度最大化"—— 其余分片都落在段文件里（乱序落盘，
+                // 取消/失败都不丢），重试时一个字节都不用重下。
+                //
+                // 仍然立即中止的只有"继续下去没有意义"的两类：本地 IO 失败
+                // （磁盘满了/没权限，再下也是白费）与取消。
+                if matches!(e, HttpError::Io(_) | HttpError::Cancelled) {
+                    failure = Some(e);
+                    break;
+                }
+                tracing::warn!(
+                    seg = i, total = all.len(), err = %e,
+                    "分片下载失败，先跳过并继续其余分片（进度保留，收尾再上抛）"
+                );
+                if seg_err.is_none() {
+                    seg_err = Some(e);
+                }
+                failed.push(i);
             }
             None => {
-                if failure.is_none() && written < all.len() {
+                if failure.is_none() && seg_err.is_none() && written < all.len() {
                     failure = Some(HttpError::Protocol(format!(
                         "播放列表未下载完整: {written}/{total_segments} 段"
                     )));
@@ -2246,9 +2854,16 @@ async fn download_playlist_unordered(
         }
         (None, false) => {
             save_ctrl(&ctrl_path, &ctrl_of(written, sink.position(), &done));
-            Err(HttpError::Protocol(format!(
-                "播放列表未下载完整: {written}/{total_segments} 段"
-            )))
+            // 有分片是"下载失败被跳过"的：上抛**那个真实错误**。带上真实原因很关键 ——
+            // `Http(403)` / `Http(410)` 会被引擎的清单级重试接住（重取清单换一批新
+            // 地址、按控制文件续传），而笼统的 `Protocol("未下载完整")` 是不可重试的
+            // 协议错，会把"签名过期"这类可恢复现场直接判死。
+            Err(seg_err.unwrap_or_else(|| {
+                HttpError::Protocol(format!(
+                    "播放列表未下载完整: {written}/{total_segments} 段（失败 {} 段）",
+                    failed.len()
+                ))
+            }))
         }
     }
 }
@@ -2281,6 +2896,7 @@ async fn download_playlist_ordered(
 
     let ctrl_path = xfer_storage::ctrl_path(path);
     let fp = fingerprint(plan);
+    let fps = stable_fingerprint(plan);
 
     // 续传现场：文件 = 「完整前缀」+ 「第 prefix 段的开头 part 字节」
     let st = resume_state(path, plan);
@@ -2385,6 +3001,7 @@ async fn download_playlist_ordered(
         kind: CTRL_KIND.to_string(),
         v: 1,
         fp: fp.clone(),
+        fps: fps.clone(),
         url: plan.source.clone(),
         segs: total_segments,
         prefix,
@@ -2684,6 +3301,7 @@ mod tests {
         let k0 = m.segments[0].key.clone().unwrap();
         assert_eq!(k0.url, "https://cdn.example.com/videos/abc/key.bin");
         assert_eq!(k0.iv, iv_from_sequence(7));
+        assert_eq!(k0.method, KeyMethod::Aes128);
         // 第二个密钥无 IV：按该分片的媒体序号推导（序号 8）
         let k1 = m.segments[1].key.clone().unwrap();
         assert_eq!(k1.url, "https://cdn.example.com/videos/k2.bin");
@@ -2693,9 +3311,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_sample_aes() {
+    fn accepts_sample_aes_and_records_the_method() {
+        // SAMPLE-AES 现在**能解析**（TS 走逐样本解密，见 ts 模块）；
+        // 早先这里是一句"暂不支持"直接失败
         let text = "#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"k\"\n#EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n";
-        assert!(parse_media(text, &base()).is_err());
+        let m = parse_media(text, &base()).unwrap();
+        assert!(m.fatal.is_none(), "SAMPLE-AES 不该在解析期失败");
+        assert_eq!(m.segments[0].key.as_ref().unwrap().method, KeyMethod::SampleAes);
+    }
+
+    #[test]
+    fn drm_key_is_rejected_with_a_readable_reason() {
+        // FairPlay：密钥在授权服务器上，必须给出**能看懂**的原因
+        let text = "#EXTM3U\n\
+                    #EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://asset-1\",\
+                    KEYFORMAT=\"com.apple.streamingkeydelivery\"\n\
+                    #EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n";
+        let m = parse_media(text, &base()).unwrap();
+        let reason = m.fatal.expect("DRM 必须被识别出来");
+        assert!(reason.contains("FairPlay"), "原因里要点明 DRM 类型: {reason}");
+        assert!(reason.contains("授权服务器"), "要说明为什么拿不到: {reason}");
+    }
+
+    #[test]
+    fn unknown_method_is_rejected() {
+        let text = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-192,URI=\"k\"\n#EXTINF:4,\na.ts\n#EXT-X-ENDLIST\n";
+        let m = parse_media(text, &base()).unwrap();
+        assert!(m.fatal.unwrap().contains("AES-192"));
     }
 
     #[test]
@@ -2705,12 +3347,44 @@ mod tests {
             #EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080\nhigh.m3u8\n\
             #EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720\nmid.m3u8\n";
         assert!(is_master(text));
-        let v = parse_variants(text, &base());
-        assert_eq!(v.len(), 3);
-        let best = choose_variant(&v, false).unwrap();
+        let m = parse_master(text, &base());
+        assert_eq!(m.variants.len(), 3);
+        let best = choose_variant(&m.variants, false).unwrap();
         assert!(best.url.ends_with("high.m3u8"));
-        let worst = choose_variant(&v, true).unwrap();
+        let worst = choose_variant(&m.variants, true).unwrap();
         assert!(worst.url.ends_with("low.m3u8"));
+    }
+
+    #[test]
+    fn master_prefers_muxed_audio_over_separate_rendition() {
+        // 最高码率那一路的音轨在独立组里：没有封装器就合不进产物，
+        // 所以宁可降一档，也要选"音视频同清单"的那一路
+        let text = "#EXTM3U\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"中文\",LANGUAGE=\"zh\",\
+            DEFAULT=YES,AUTOSELECT=YES,URI=\"audio_zh.m3u8\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=4000000,AUDIO=\"aud\"\nvideo_only.m3u8\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1500000\nmuxed.m3u8\n";
+        let m = parse_master(text, &base());
+        assert_eq!(m.renditions.len(), 1);
+        assert_eq!(m.renditions[0].language.as_deref(), Some("zh"));
+        assert!(m.renditions[0].default);
+        assert_eq!(m.renditions[0].uri.as_deref(), Some("https://cdn.example.com/videos/abc/audio_zh.m3u8"));
+        let chosen = choose_variant(&m.variants, false).unwrap();
+        assert!(chosen.url.ends_with("muxed.m3u8"), "应避开需要外部音轨的那一路");
+        // 独立音轨组能挑出来（诊断日志用）
+        let audio = pick_audio_rendition(&m.renditions, "aud").unwrap();
+        assert!(audio.uri.as_deref().unwrap().ends_with("audio_zh.m3u8"));
+    }
+
+    #[test]
+    fn master_with_only_separate_audio_still_picks_one() {
+        let text = "#EXTM3U\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"a\",URI=\"a.m3u8\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"aud\"\nv1.m3u8\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=3000000,AUDIO=\"aud\"\nv2.m3u8\n";
+        let m = parse_master(text, &base());
+        let chosen = choose_variant(&m.variants, false).unwrap();
+        assert!(chosen.url.ends_with("v2.m3u8"), "全都要外部音轨时仍取最高码率");
     }
 
     #[test]
@@ -2747,6 +3421,7 @@ mod tests {
             fmp4: false,
             total: None,
             duration_secs: 4.0,
+            separate_audio: false,
         };
         assert_eq!(fingerprint(&mk("a.ts")), fingerprint(&mk("a.ts")));
         assert_ne!(fingerprint(&mk("a.ts")), fingerprint(&mk("b.ts")));
@@ -2760,8 +3435,20 @@ mod tests {
             v[15] = 0xff;
             v
         }));
-        assert_eq!(parse_iv("0xabc"), None); // 奇数长度非法
+        // 奇数位：左补一个 0（线上确实有这种写法，别判非法）
+        assert_eq!(parse_iv("0xabc"), Some({
+            let mut v = [0u8; 16];
+            v[14] = 0x0a;
+            v[15] = 0xbc;
+            v
+        }));
+        // 大写与不带 0x 前缀都要认
+        assert_eq!(parse_iv("0XFF"), parse_iv("ff"));
         assert_eq!(parse_iv(""), None);
+        // 超过 32 位十六进制不是合法 IV
+        assert_eq!(parse_iv("0000000000000000000000000000000000"), None);
+        // 非十六进制字符
+        assert_eq!(parse_iv("zz"), None);
     }
 
     #[test]
@@ -2780,9 +3467,10 @@ mod tests {
             .unwrap()
             .to_vec();
         assert_ne!(ct, plain);
-        assert_eq!(decrypt_segment(&key, &iv, &ct).unwrap(), plain);
-        // 非法密文长度必须报错而不是静默截断
-        assert!(decrypt_segment(&key, &iv, &ct[..ct.len() - 1]).is_err());
+        assert_eq!(crypto::decrypt_cbc(&key, &iv, &ct).unwrap(), plain);
+        // 长度不是 16 整数倍：完整分组解出来，尾字节原样保留（不静默丢数据）
+        let tail = crypto::decrypt_cbc(&key, &iv, &ct[..ct.len() - 1]).unwrap();
+        assert_eq!(tail.len(), ct.len() - 1);
     }
 
     #[test]
@@ -3224,6 +3912,251 @@ mod tests {
         assert_eq!(resume_point(&path, &plan_b), (0, 0));
     }
 
+    /// 只用来构造指纹用例的最小计划（不经网络）。
+    fn plan_with(source: &str, urls: &[&str]) -> PlaylistPlan {
+        PlaylistPlan {
+            source: source.to_string(),
+            chain: Vec::new(),
+            init: None,
+            segments: urls
+                .iter()
+                .map(|u| Segment {
+                    url: (*u).to_string(),
+                    range: None,
+                    key: None,
+                    size: None,
+                    duration: 4.0,
+                })
+                .collect(),
+            live: false,
+            fmp4: false,
+            total: None,
+            duration_secs: 4.0 * urls.len() as f64,
+            bitrate: None,
+            separate_audio: false,
+        }
+    }
+
+    /// **稳定指纹免疫签名轮换**（这是"失败后重新下载不再从零"的判据）。
+    ///
+    /// 站点每次拉清单都会换一批 `?sign=…&t=…`，也可能换 CDN 域名。段的身份在
+    /// 路径上，所以这些变化不该让续传现场作废；而**路径**或**有语义的参数**
+    /// 变了就必须判成"另一条清单"。
+    #[test]
+    fn stable_fingerprint_survives_token_rotation_but_not_real_changes() {
+        let before = plan_with(
+            "https://cdn1.example.com/hls/index.m3u8?token=old&deadline=1712000000",
+            &[
+                "https://cdn1.example.com/hls/s1.ts?sign=aaa111&t=1712000000",
+                "https://cdn1.example.com/hls/s2.ts?sign=aaa222&t=1712000000",
+            ],
+        );
+        // 同一批段：签名/时间戳换了，CDN 也换了域名
+        let after = plan_with(
+            "https://cdn2.example.com/hls/index.m3u8?token=new&deadline=1712999999",
+            &[
+                "https://cdn2.example.com/hls/s1.ts?sign=bbb999&t=1712999999",
+                "https://cdn2.example.com/hls/s2.ts?sign=bbb888&t=1712999999",
+            ],
+        );
+        assert_ne!(
+            fingerprint(&before),
+            fingerprint(&after),
+            "严格指纹本来就该不同（这是它存在的意义）"
+        );
+        assert_eq!(
+            stable_fingerprint(&before),
+            stable_fingerprint(&after),
+            "稳定指纹必须认为这是同一批段"
+        );
+        assert_eq!(
+            stable_url(&before.source),
+            stable_url(&after.source),
+            "清单地址的稳定形态也必须一致"
+        );
+
+        // 分片路径真的换了 → 稳定指纹也必须不同（否则会拿旧段拼进新流）
+        let renamed = plan_with(
+            "https://cdn1.example.com/hls/index.m3u8",
+            &[
+                "https://cdn1.example.com/hls/a1.ts",
+                "https://cdn1.example.com/hls/a2.ts",
+            ],
+        );
+        assert_ne!(stable_fingerprint(&before), stable_fingerprint(&renamed));
+    }
+
+    /// **含糊名字的短参数要按取值判**：`?t=2` 可能是"第 2 段"（保留），
+    /// `?t=1712345678` 是时间戳（剔除）。
+    ///
+    /// 一刀切按名字剔除会把段身份抹掉 —— 不同的段被判成同一段，产物错位，
+    /// 比"多下一次"严重得多。
+    #[test]
+    fn ambiguous_short_params_are_kept_unless_they_look_like_credentials() {
+        assert!(is_volatile_param("t", "1712345678"), "10 位纯数字=时间戳");
+        assert!(is_volatile_param("sign", "2"), "名字明确的参数不看取值");
+        assert!(
+            is_volatile_param("k", "9f2c1ab77de405a1b3c8d9e0f1a2b3c4"),
+            "长十六进制串=摘要"
+        );
+        assert!(!is_volatile_param("t", "2"), "短序号是段身份，必须保留");
+        assert!(!is_volatile_param("seg", "2"), "这一组名字根本不在名单里");
+        assert!(
+            !is_volatile_param("id", "12345678"),
+            "名单外的参数一律保留，宁可退回旧行为"
+        );
+        // 查询串顺序不同不该改变指纹
+        assert_eq!(
+            stable_url("https://c.example/m/s.ts?b=2&a=1"),
+            stable_url("https://c.example/m/s.ts?a=1&b=2")
+        );
+        // 解析不了的地址：退回"原文去 fragment"，不猜
+        assert_eq!(stable_url("not a url#frag"), "not a url");
+    }
+
+    /// **任务失败后重新下载不再从零**（用户报的现场）。
+    ///
+    /// 第一趟在 s3 上失败：s1/s2 已经拼进产物、s4 已经落在自己的段文件里。
+    /// 第二趟拿到的清单**只差签名**（站点真实行为），续传必须认这是同一批段 ——
+    /// 一个字节都不重下、产物逐字节正确。旧实现只认"逐字相同"的指纹，
+    /// 这一趟必然把段目录整个丢掉、从头下。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resumes_across_token_rotation_without_redownloading_prefix() {
+        let dir = tmpdir("hls-token-rotate");
+        let segs: Vec<Vec<u8>> = (1..=4).map(|i| sample(i, 20 * 1024)).collect();
+        let expected: Vec<u8> = segs.iter().flatten().copied().collect();
+        let mut files = HashMap::new();
+        files.insert(
+            "/m/index.m3u8".to_string(),
+            media_playlist(&["s1.ts", "s2.ts", "s3.ts", "s4.ts"]).into_bytes(),
+        );
+        for (i, s) in segs.iter().enumerate() {
+            // 服务端只按路径路由，查询串随便加
+            files.insert(format!("/m/s{}.ts", i + 1), s.clone());
+        }
+        // s3 前 3 次请求失败（= 默认分片重试预算），第 4 次起正常
+        let mut fail = HashMap::new();
+        fail.insert("/m/s3.ts".to_string(), 3usize);
+        let srv = start_server(files, fail).await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        // 并发 1：分片按序在飞，失败点之后的分片不被提前请求，计数才好断言
+        let opts = PlaylistOptions {
+            concurrency: 1,
+            probe_sizes: false,
+            ..Default::default()
+        };
+        let plan_a = fetch_plan(&client, &srv.url("/m/index.m3u8"), &cancel, &[], &opts)
+            .await
+            .expect("取清单");
+        let path = dir.join("out.ts");
+
+        let err = download_playlist(&client, &path, &plan_a, &opts, &cancel, PlaylistStats::new(0))
+            .await
+            .expect_err("s3 连续失败应上报");
+        // 上抛的必须是**真实原因**（分片级 500），不是笼统的"未下载完整" ——
+        // 引擎靠它判断要不要重取清单再续一轮
+        assert!(matches!(err, HttpError::Http(500)), "实际: {err:?}");
+        assert!(xfer_storage::ctrl_path(&path).exists(), "失败时控制文件应保留");
+        let s1_hits = srv.hits("/m/s1.ts");
+        let s2_hits = srv.hits("/m/s2.ts");
+        assert!(s1_hits >= 1 && s2_hits >= 1, "前两段应已下过");
+
+        // 第二趟：同一批段，签名与时间戳全换了
+        let rotated = "?sign=rotated-token&t=1712999999";
+        let plan_b = PlaylistPlan {
+            source: format!("{}{rotated}", plan_a.source),
+            segments: plan_a
+                .segments
+                .iter()
+                .map(|s| Segment {
+                    url: format!("{}{rotated}", s.url),
+                    ..s.clone()
+                })
+                .collect(),
+            ..plan_a.clone()
+        };
+        assert_ne!(
+            fingerprint(&plan_a),
+            fingerprint(&plan_b),
+            "两趟的严格指纹必然不同"
+        );
+        let (baseline, _) = resume_point(&path, &plan_b);
+        assert!(
+            baseline > 0,
+            "换签名后仍必须认得这是同一批段、给出非 0 的续传基线（否则就是从零）"
+        );
+
+        let done = download_playlist(&client, &path, &plan_b, &opts, &cancel, PlaylistStats::new(0))
+            .await
+            .expect("换签名后的续传应成功");
+        assert_eq!(done.bytes, expected.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), expected, "产物必须逐字节正确");
+        assert_eq!(srv.hits("/m/s1.ts"), s1_hits, "已拼进产物的段不能重下");
+        assert_eq!(srv.hits("/m/s2.ts"), s2_hits, "已拼进产物的段不能重下");
+        assert_eq!(
+            srv.hits("/m/s4.ts"),
+            1,
+            "已完整落在段文件里的段（还没轮到拼）也不能重下"
+        );
+    }
+
+    /// 单个分片失败**不得**一票否决整条任务：其余分片照常下完（进度最大化），
+    /// 收尾再上抛真实错误。
+    ///
+    /// 旧行为是"第一个失败的分片直接 break"，于是一条 2000 段的流里有一段连撞
+    /// 三次 5xx，后面 1900 段一个都不下 —— 用户看到"下一会就报错"，重试又要从
+    /// 那个点开始重来。现在失败的分片被跳过、其余全部落盘。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_failing_segment_does_not_abort_the_rest() {
+        let dir = tmpdir("hls-partial-failure");
+        let segs: Vec<Vec<u8>> = (1..=4).map(|i| sample(i, 20 * 1024)).collect();
+        let mut files = HashMap::new();
+        files.insert(
+            "/m/index.m3u8".to_string(),
+            media_playlist(&["s1.ts", "s2.ts", "s3.ts", "s4.ts"]).into_bytes(),
+        );
+        for (i, s) in segs.iter().enumerate() {
+            files.insert(format!("/m/s{}.ts", i + 1), s.clone());
+        }
+        // s2 一直失败（100 次远超重试预算），s3/s4 正常
+        let mut fail = HashMap::new();
+        fail.insert("/m/s2.ts".to_string(), 100usize);
+        let srv = start_server(files, fail).await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        let opts = PlaylistOptions {
+            concurrency: 1,
+            probe_sizes: false,
+            ..Default::default()
+        };
+        let plan = fetch_plan(&client, &srv.url("/m/index.m3u8"), &cancel, &[], &opts)
+            .await
+            .expect("取清单");
+        let path = dir.join("out.ts");
+        let err = download_playlist(&client, &path, &plan, &opts, &cancel, PlaylistStats::new(0))
+            .await
+            .expect_err("s2 持续失败仍应上报");
+        assert!(
+            matches!(err, HttpError::Http(500)),
+            "上抛的应是 s2 的真实错误，而不是笼统的「未下载完整」：{err:?}"
+        );
+        // s3 / s4 尽管排在失败分片之后，也必须被下载（进度最大化）
+        assert_eq!(srv.hits("/m/s3.ts"), 1, "失败分片之后的分片仍要下");
+        assert_eq!(srv.hits("/m/s4.ts"), 1, "失败分片之后的分片仍要下");
+        // s4 的整段已落在段文件里，恢复时不该重下
+        assert_eq!(
+            std::fs::metadata(dir.join("out.ts.hlseg/000003"))
+                .map(|m| m.len())
+                .unwrap_or(0),
+            segs[3].len() as u64,
+            "已下完但没轮到拼的分片必须留在段文件里"
+        );
+        assert!(xfer_storage::ctrl_path(&path).exists(), "控制文件应保留");
+    }
+
     /// AES-128 加密分片：按 IV 解密后与明文一致（含 PKCS7 去填充）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn decrypts_aes128_segments() {
@@ -3273,6 +4206,198 @@ mod tests {
         let expected: Vec<u8> = plain.iter().flatten().copied().collect();
         assert_eq!(std::fs::read(&path).unwrap(), expected);
         assert_eq!(done.bytes, expected.len() as u64);
+    }
+
+    /// 密钥以**十六进制文本**下发（线上极常见的一种发法）：必须照样解开。
+    ///
+    /// 早先只认"裸 16 字节"，这种站点的密钥会被判成"长度不对"，整条任务直接失败 ——
+    /// 这是本轮改动里对真实可用性影响最大的一条。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn decrypts_aes128_with_hex_text_key() {
+        use aes::cipher::{BlockEncryptMut, KeyIvInit};
+        type Enc = cbc::Encryptor<aes::Aes128>;
+
+        let dir = tmpdir("aes-hex");
+        let key = [0x3Cu8; 16];
+        let plain: Vec<Vec<u8>> = (1..=2).map(|i| sample(i, 8 * 1024 + 3)).collect();
+        let mut files = HashMap::new();
+        files.insert("/m/index.m3u8".to_string(), {
+            let mut s = String::from("#EXTM3U\n");
+            // IV 显式给出，顺便覆盖"带 0x 前缀 + 大写"的写法
+            s.push_str("#EXT-X-KEY:METHOD=AES-128,URI=\"key.txt\",IV=0x00000000000000000000000000000001\n");
+            for i in 1..=2 {
+                s.push_str(&format!("#EXTINF:4.0,\ns{i}.ts\n"));
+            }
+            s.push_str("#EXT-X-ENDLIST\n");
+            s.into_bytes()
+        });
+        // 密钥是 32 个 hex 字符的文本，不是 16 字节裸数据
+        files.insert("/m/key.txt".to_string(), hex::encode(key).into_bytes());
+        for (i, p) in plain.iter().enumerate() {
+            // 清单里显式给了 IV（全段同一个），加密端必须用同一个
+            let iv = iv_from_sequence(1);
+            let mut buf = vec![0u8; p.len() + 16];
+            buf[..p.len()].copy_from_slice(p);
+            let enc = Enc::new(&key.into(), &iv.into());
+            let ct = enc
+                .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buf, p.len())
+                .unwrap()
+                .to_vec();
+            files.insert(format!("/m/s{}.ts", i + 1), ct);
+        }
+        let srv = start_server(files, HashMap::new()).await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        let opts = PlaylistOptions::default();
+        let plan = fetch_plan(&client, &srv.url("/m/index.m3u8"), &cancel, &[], &opts)
+            .await
+            .expect("取清单");
+        let path = dir.join("out.ts");
+        download_playlist(&client, &path, &plan, &opts, &cancel, PlaylistStats::new(0))
+            .await
+            .expect("下载");
+        let expected: Vec<u8> = plain.iter().flatten().copied().collect();
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+    }
+
+    /// 解密分派：能解的解开，不能解的给一句**说清原因**的话。
+    #[test]
+    fn decrypt_dispatch_covers_methods_and_rejects_the_rest() {
+        use aes::cipher::{BlockEncryptMut, KeyIvInit};
+        let key = [0x2Bu8; 16];
+        let iv = [0x11u8; 16];
+        let plain: Vec<u8> = (0..64u32).map(|i| i as u8).collect();
+        let mut buf = vec![0u8; plain.len() + 16];
+        buf[..plain.len()].copy_from_slice(&plain);
+        let enc = cbc::Encryptor::<aes::Aes128>::new(&key.into(), &iv.into());
+        let ct = enc
+            .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buf, plain.len())
+            .unwrap()
+            .to_vec();
+
+        let mk = |method: KeyMethod, format: KeyFormat| SegmentKey {
+            url: "k".into(),
+            iv,
+            method,
+            key_format: format,
+        };
+
+        // 明文：原样返回
+        let sk = mk(KeyMethod::None, KeyFormat::Identity);
+        assert_eq!(decrypt_segment_with(&[], &sk, b"abc").unwrap(), b"abc");
+
+        // AES-128：十六进制文本密钥与裸密钥都要认
+        let sk = mk(KeyMethod::Aes128, KeyFormat::Identity);
+        assert_eq!(
+            decrypt_segment_with(hex::encode(key).as_bytes(), &sk, &ct).unwrap(),
+            plain
+        );
+        assert_eq!(decrypt_segment_with(&key, &sk, &ct).unwrap(), plain);
+
+        // AES-256：32 字节密钥走另一条长度
+        let key32 = [0x5Au8; 32];
+        let mut buf32 = vec![0u8; plain.len() + 16];
+        buf32[..plain.len()].copy_from_slice(&plain);
+        let enc256 = cbc::Encryptor::<aes::Aes256>::new(&key32.into(), &iv.into());
+        let ct256 = enc256
+            .encrypt_padded_mut::<aes::cipher::block_padding::Pkcs7>(&mut buf32, plain.len())
+            .unwrap()
+            .to_vec();
+        let sk = mk(KeyMethod::Aes256, KeyFormat::Identity);
+        assert_eq!(decrypt_segment_with(&key32, &sk, &ct256).unwrap(), plain);
+
+        // fMP4 的样本级加密：本版只识别、不解 —— 但话要说清楚（不是 DRM，是没实现）
+        let fmp4 = [0u8, 0, 0, 24, b'f', b't', b'y', b'p', 0, 0, 0, 0];
+        let sk = mk(KeyMethod::SampleAes, KeyFormat::Identity);
+        let err = decrypt_segment_with(&key, &sk, &fmp4).unwrap_err().to_string();
+        assert!(err.contains("fMP4"), "要点明容器: {err}");
+        assert!(err.contains("cbcs"), "要点明加密形态: {err}");
+
+        // DRM：给的是"密钥拿不到"的原因，而不是笼统的失败
+        let sk = mk(KeyMethod::SampleAes, KeyFormat::FairPlay);
+        let err = decrypt_segment_with(&key, &sk, &fmp4).unwrap_err().to_string();
+        assert!(err.contains("FairPlay"), "{err}");
+        assert!(err.contains("授权服务器"), "{err}");
+
+        // SAMPLE-AES-CTR 落到 TS 上 = 清单与实际内容不一致，也要点明
+        let ts_like: Vec<u8> = std::iter::repeat(0x47u8).take(188 * 2).collect();
+        let sk = mk(KeyMethod::SampleAesCtr, KeyFormat::Identity);
+        let err = decrypt_segment_with(&key, &sk, &ts_like).unwrap_err().to_string();
+        assert!(err.contains("SAMPLE-AES-CTR"), "{err}");
+    }
+
+    /// `#EXT-X-MAP` 中途更换：新的初始化段必须**插在换的那一处**（顺序不能乱）。
+    #[test]
+    fn mid_stream_map_change_is_inlined_in_order() {
+        let text = "#EXTM3U\n\
+            #EXT-X-MAP:URI=\"init1.mp4\"\n\
+            #EXTINF:4.0,\na.m4s\n\
+            #EXTINF:4.0,\nb.m4s\n\
+            #EXT-X-MAP:URI=\"init2.mp4\"\n\
+            #EXTINF:4.0,\nc.m4s\n\
+            #EXT-X-ENDLIST\n";
+        let m = parse_media(text, &base()).unwrap();
+        assert!(m.fmp4);
+        assert_eq!(m.init.as_ref().unwrap().url, "https://cdn.example.com/videos/abc/init1.mp4");
+        // 序列：a, b, init2, c —— 换 MAP 那一下把它插在 c 之前
+        let urls: Vec<&str> = m.segments.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://cdn.example.com/videos/abc/a.m4s",
+                "https://cdn.example.com/videos/abc/b.m4s",
+                "https://cdn.example.com/videos/abc/init2.mp4",
+                "https://cdn.example.com/videos/abc/c.m4s",
+            ]
+        );
+        // 重复声明同一个 MAP 不该重复插入
+        let text2 = "#EXTM3U\n#EXT-X-MAP:URI=\"i.mp4\"\n\
+            #EXTINF:4.0,\na.m4s\n#EXT-X-MAP:URI=\"i.mp4\"\n#EXTINF:4.0,\nb.m4s\n#EXT-X-ENDLIST\n";
+        let m2 = parse_media(text2, &base()).unwrap();
+        assert_eq!(m2.segments.len(), 2);
+    }
+
+    /// `#EXT-X-GAP`：空洞段跳过（序号照常推进，不能把它当成一个分片去下）。
+    #[test]
+    fn gap_segments_are_skipped() {
+        let text = "#EXTM3U\n\
+            #EXTINF:4.0,\na.ts\n\
+            #EXT-X-GAP\n#EXTINF:4.0,\ngap.ts\n\
+            #EXTINF:4.0,\nb.ts\n#EXT-X-ENDLIST\n";
+        let m = parse_media(text, &base()).unwrap();
+        let urls: Vec<&str> = m.segments.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://cdn.example.com/videos/abc/a.ts",
+                "https://cdn.example.com/videos/abc/b.ts",
+            ],
+            "空洞段不该进下载列表"
+        );
+    }
+
+    /// 纯 LL-HLS（只有 `#EXT-X-PART`）：退回用部分分片当分片，而不是报"没有分片"。
+    #[test]
+    fn ll_hls_parts_are_used_when_no_full_segments() {
+        let text = "#EXTM3U\n\
+            #EXT-X-TARGETDURATION:1\n\
+            #EXT-X-PART-INF:PART-TARGET=0.5\n\
+            #EXT-X-PART:DURATION=0.5,URI=\"p0.m4s\"\n\
+            #EXT-X-PART:DURATION=0.5,URI=\"p1.m4s\"\n\
+            #EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"p2.m4s\"\n";
+        let m = parse_media(text, &base()).unwrap();
+        let urls: Vec<&str> = m.segments.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://cdn.example.com/videos/abc/p0.m4s",
+                "https://cdn.example.com/videos/abc/p1.m4s",
+            ],
+            "PRELOAD-HINT 是提示不是分片，不该进列表"
+        );
+        assert!((m.segments[0].duration - 0.5).abs() < 1e-9);
+        assert!(m.live, "没有 ENDLIST 仍是直播窗口");
     }
 
     /// `#EXT-X-BYTERANGE`：同一文件的不同区间按清单顺序拼出来。
