@@ -311,6 +311,19 @@ pub struct TaskManager {
     /// 上次落盘会话内容的哈希：内容未变化时跳过写盘（30s 定期保存此前
     /// 无条件重写整份会话——分片位图可达数百 KB，空闲时纯属重复 IO）。
     session_hash: std::sync::atomic::AtomicU64,
+    /// 会话写盘的互斥锁。
+    ///
+    /// [`TaskManager::save_session_now`] 会被**多个后台任务同时**调用：30s 定期保存
+    /// （`tokio::time::interval` 的**首个 tick 立即触发**，所以它与启动后的任何一次
+    /// 业务保存都可能撞上）、订阅源刷新循环、任务终局收尾……
+    ///
+    /// 而写盘是"写临时文件 + `rename`"，且临时文件名是**固定**的
+    /// （`session.json.tmp`）。两次并发保存会共用同一个临时文件：A 写完、B 打开
+    /// 时截断、A 把它 `rename` 成正式文件 —— 落盘的结果是**一个半截的、两段内容
+    /// 拼起来的 JSON**。下一次启动读它必然解析失败，于是整份会话（订阅源、tracker
+    /// 列表、任务）一起丢失，表现为"重启后什么都没恢复"。慢机器 / CI 上后台任务
+    /// 更容易与业务保存重叠，本地反而几乎撞不上。
+    session_save_lock: Mutex<()>,
     /// RPC shutdown 触发的整体退出令牌。
     shutdown_token: CancellationToken,
 }
@@ -347,6 +360,7 @@ impl TaskManager {
             client_sig: Mutex::new(None),
             client_busy: tokio::sync::watch::channel(false).0,
             session_hash: std::sync::atomic::AtomicU64::new(0),
+            session_save_lock: Mutex::new(()),
             shutdown_token: CancellationToken::new(),
         })
     }
@@ -952,7 +966,13 @@ impl TaskManager {
     /// 内容与上次落盘一致时跳过写盘：定期保存每 30s 触发一次，而分片位图
     /// 会让会话文件达到数百 KB，空闲（暂停/做种/无变化）时反复重写纯属
     /// 无谓磁盘 IO 与 SSD 写入量。
+    ///
+    /// **全程持 [`TaskManager::session_save_lock`]**：写盘是"写固定名的临时文件 +
+    /// rename"，多路后台保存并发时会互相截断/抢 rename，落盘成半截 JSON（下一次
+    /// 启动整份会话都读不出来）。锁在函数入口就取，连"读哈希再决定要不要写"
+    /// 也在锁内 —— 否则两个线程可以同时通过检查、同时开写。
     fn save_session_now(&self) {
+        let _save = self.session_save_lock.lock().unwrap();
         let path = self.inner.lock().unwrap().session.clone();
         let Some(path) = path else { return };
         let v = self.session_json();

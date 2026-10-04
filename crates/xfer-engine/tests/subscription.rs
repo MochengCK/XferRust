@@ -346,3 +346,60 @@ async fn tracker_sources_persist_across_restart() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// **并发保存会话不得写出半截 JSON**。
+///
+/// `save_session_now` 是**多路后台任务共用**的：30s 定期保存（`tokio::time::interval`
+/// 的**首个 tick 立即触发**，所以它和启动后的任何一次业务保存都可能撞上）、订阅源
+/// 刷新循环、任务终局收尾……而写盘是"写**固定名**临时文件 + `rename`"。
+///
+/// 没有互斥时两路并发会共用同一个临时文件：A 写完、B 打开时把它截断、A 再把它
+/// `rename` 成正式文件 —— 落盘的就是**两段内容拼起来的半截 JSON**。下一次启动
+/// `read_session_file` 解析失败 → 整份会话（订阅源、tracker 列表、任务）一起丢失，
+/// 表现为"重启后什么都没恢复"（CI 上 `tracker_sources_persist_across_restart`
+/// 间歇性挂在"tracker 列表应恢复 0 != 3"就是这个形态：慢机器 / 高并行下后台保存
+/// 与业务保存更容易重叠，本地串行几乎撞不上）。
+///
+/// 判据不是只看最后一次落盘 —— 每次保存之后立刻重读一次：中间任何一次出现半截
+/// JSON 都是真实危害（那一刻崩溃/断电就等于会话全丢）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_session_saves_never_produce_torn_json() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = temp_dir("concurrent-save");
+    let session = dir.join("session.json");
+    let mgr = TaskManager::start_with_session(Some(dir.clone()), Some(1), session.clone());
+
+    let torn = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for t in 0..8 {
+        let m = mgr.clone();
+        let torn = torn.clone();
+        let session = session.clone();
+        handles.push(std::thread::spawn(move || {
+            for k in 0..60 {
+                // 内容每次都变：这一趟必须真正落盘（不被哈希去重跳过）
+                let _ = m.add_global_tracker(&format!("udp://t{t}-{k}.example/ann"));
+                // 正式文件只应被"完整的临时文件 rename"替换，任何时候读它都该是完整 JSON
+                if let Ok(text) = std::fs::read_to_string(&session) {
+                    if serde_json::from_str::<serde_json::Value>(&text).is_err() {
+                        torn.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert_eq!(
+        torn.load(Ordering::SeqCst),
+        0,
+        "并发保存期间出现过半截 JSON（重启会整份会话读不出来）"
+    );
+    let text = std::fs::read_to_string(&session).expect("会话文件应存在");
+    serde_json::from_str::<serde_json::Value>(&text).expect("落盘的会话必须是完整 JSON");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
