@@ -439,7 +439,7 @@ array response; only entries carrying an `id` are answered).
 // Request
 {"jsonrpc": "2.0", "id": 1, "method": "engine.getVersion", "params": {"token": "mytoken"}}
 // Success response
-{"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.3.3",
+{"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.3.4",
  "features": ["http", "resume", "checksum", "bt", "hls", "events", "bitfield",
               "wanted-bitfield", "ban-peer", "change-uri", "get-servers",
               "verify-files"]}}
