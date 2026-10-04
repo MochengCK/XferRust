@@ -132,6 +132,28 @@ async fn start_hls_server_trickle(
     slow: HashMap<String, u64>,
     trickle: Trickle,
 ) -> HlsServer {
+    start_hls_server_full(files, content_types, seg_delay_ms, slow, trickle, FailGates::default())
+        .await
+}
+
+/// "前 N 次请求失败"的闸门：`(剩余失败次数, 失败状态码)`。
+///
+/// 用 `Arc<AtomicUsize>` 而不是 `usize`，是为了让用例能**中途放行**：先让某个
+/// 分片一直失败到任务报错，再 `store(0)` 放行并恢复任务，验证"失败后重新下载
+/// 走的是断点续传、不是从零"。状态码由用例给 —— 404（非瞬态，任务会真的停下）
+/// 与 403（瞬态：引擎应重取清单再续）走的是两条不同的恢复路径。
+type FailGates = HashMap<String, (Arc<AtomicUsize>, StatusCode)>;
+
+/// 上面那一串封装的最底层：额外支持"指定路径持续失败直到放行"。
+async fn start_hls_server_full(
+    files: HashMap<String, Vec<u8>>,
+    content_types: HashMap<String, String>,
+    seg_delay_ms: u64,
+    slow: HashMap<String, u64>,
+    trickle: Trickle,
+    gates: FailGates,
+) -> HlsServer {
+    use axum::response::IntoResponse;
     let mut hits: HashMap<String, Arc<AtomicUsize>> = HashMap::new();
     let requests: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -143,6 +165,7 @@ async fn start_hls_server_trickle(
         let delayed = path.starts_with("/show/seg");
         let extra = slow.get(&path).copied().unwrap_or(0);
         let trickle_cfg = trickle.get(&path).copied();
+        let gate = gates.get(&path).cloned();
         let requests = requests.clone();
         let route = path.clone();
         hits.insert(path.clone(), hit.clone());
@@ -154,6 +177,7 @@ async fn start_hls_server_trickle(
                 let ct = ct.clone();
                 let requests = requests.clone();
                 let route = route.clone();
+                let gate = gate.clone();
                 async move {
                     hit.fetch_add(1, Ordering::SeqCst);
                     let range_hdr = headers
@@ -161,6 +185,14 @@ async fn start_hls_server_trickle(
                         .and_then(|v| v.to_str().ok())
                         .map(|s| s.to_string());
                     requests.lock().unwrap().push((route.clone(), range_hdr.clone()));
+                    if let Some((g, code)) = &gate {
+                        // 用例自己决定用哪个状态码：404 = 非瞬态（任务就此停下），
+                        // 403 = 瞬态（引擎应重取清单换新地址后继续）
+                        if g.load(Ordering::SeqCst) > 0 {
+                            g.fetch_sub(1, Ordering::SeqCst);
+                            return (*code).into_response();
+                        }
+                    }
                     let wait = if delayed { seg_delay_ms } else { 0 } + extra;
                     if wait > 0 {
                         tokio::time::sleep(Duration::from_millis(wait)).await;
@@ -281,6 +313,22 @@ async fn wait_progress(mgr: &TaskManager, gid: &Gid, min_bytes: u64, limit_ms: u
 
 fn file_of(st: &serde_json::Value) -> PathBuf {
     PathBuf::from(st["files"][0]["path"].as_str().unwrap_or_default())
+}
+
+/// 等任务进入 `error`（`wait_status` 见到 error 会 panic，失败态用例要单独一个）。
+async fn wait_error(mgr: &TaskManager, gid: &Gid, limit_ms: u64) -> Option<serde_json::Value> {
+    let mut waited = 0u64;
+    loop {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waited += 50;
+        let st = tell(mgr, gid).await;
+        if st["status"].as_str().unwrap_or_default() == "error" {
+            return Some(st);
+        }
+        if waited >= limit_ms {
+            return None;
+        }
+    }
 }
 
 /// 主清单选流 + 顺序拼接 + 命名/总长/分片位图回填 + 控制文件清理。
@@ -406,6 +454,170 @@ async fn hls_pause_resume_keeps_prefix() {
         "已持久化的首段不应在恢复后重下"
     );
     assert!(!ctrl_path(&file_of(&st)).exists());
+}
+
+/// **失败的 HLS 任务可以就地重跑，而且从断点续传（不是从零）**。
+///
+/// 用户报的现场：某些站点下着下着报错，点"重新下载"就得从头来。三个原因被这条
+/// 用例一起钉住：
+///
+///   1. 分片失败以前**一票否决**整条任务 —— 失败点之后的分片一个都不下，
+///      重试时那些段自然也要重下；
+///   2. `unpause` 以前只认 `paused`，失败态的任务根本无法就地重跑，界面上的
+///      "重新下载"只能退化成"删记录 + 新建任务"，而删记录会连带清掉控制文件；
+///   3. 目标文件已存在时新任务还会改名成 `xxx.1.ts`，等于彻底从零。
+///
+/// 这里让 seg3 一直返回 404（**非瞬态**，任务会真的停下来而不是被清单级重试
+/// 反复拉起），确认此时 seg4 已经下好；再放行并 `unpause`，确认：
+///   - 任务能就地重跑（第 2 条）；
+///   - 已拼进产物 / 已落在段文件里的分片**一个都不重下**（第 1、3 条）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hls_failed_task_resumes_from_breakpoint_on_unpause() {
+    let dir = tmpdir("resume-after-error");
+    let segs: Vec<Vec<u8>> = (1..=4).map(|i| sample(i, 24 * 1024)).collect();
+    let expected: Vec<u8> = segs.iter().flatten().copied().collect();
+    let mut files = HashMap::new();
+    files.insert(
+        "/show/index.m3u8".to_string(),
+        media_playlist(
+            &["seg1.ts", "seg2.ts", "seg3.ts", "seg4.ts"],
+            true,
+        )
+        .into_bytes(),
+    );
+    for (i, s) in segs.iter().enumerate() {
+        files.insert(format!("/show/seg{}.ts", i + 1), s.clone());
+    }
+    // seg3 一直失败，直到用例放行
+    let gate = Arc::new(AtomicUsize::new(1000));
+    let mut gates = FailGates::default();
+    gates.insert(
+        "/show/seg3.ts".to_string(),
+        (gate.clone(), StatusCode::NOT_FOUND),
+    );
+    let srv = start_hls_server_full(files, HashMap::new(), 0, HashMap::new(), HashMap::new(), gates)
+        .await;
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = mgr
+        .add_uri(
+            vec![srv.url("/show/index.m3u8")],
+            &serde_json::json!({
+                "dir": dir,
+                "split": "1",
+                "hls-probe-size": "false",
+                "hls-segment-retries": "1",
+            }),
+            None,
+        )
+        .expect("addUri 应成功");
+
+    let st = wait_error(&mgr, &gid, 30_000)
+        .await
+        .expect("seg3 持续 404 后任务应进入 error");
+    let path = file_of(&st);
+    assert!(ctrl_path(&path).exists(), "失败时必须保留控制文件（续传现场）");
+    // 失败点**之后**的分片照样下完了 —— 这是"进度最大化"的直接证据
+    assert_eq!(
+        srv.hits("/show/seg4.ts"),
+        1,
+        "失败分片之后的分片也必须被下载（旧行为会直接放弃整条任务）"
+    );
+    let seg1_hits = srv.hits("/show/seg1.ts");
+    let seg2_hits = srv.hits("/show/seg2.ts");
+    assert!(seg1_hits >= 1 && seg2_hits >= 1, "前两段应已下过");
+    let seg3_hits = srv.hits("/show/seg3.ts");
+
+    // 放行 seg3 → 就地重跑
+    gate.store(0, Ordering::SeqCst);
+    mgr.unpause(&gid).expect("失败态任务应可以就地重跑");
+    let st = wait_status(&mgr, &gid, "complete", 40_000)
+        .await
+        .expect("重跑后 40s 内应完成");
+    assert_eq!(
+        std::fs::read(file_of(&st)).unwrap(),
+        expected,
+        "续传后产物必须逐字节完整"
+    );
+    assert_eq!(srv.hits("/show/seg1.ts"), seg1_hits, "已拼进产物的段不能重下");
+    assert_eq!(srv.hits("/show/seg2.ts"), seg2_hits, "已拼进产物的段不能重下");
+    assert_eq!(
+        srv.hits("/show/seg4.ts"),
+        1,
+        "已完整落在段文件里的段（还没轮到拼）也不能重下"
+    );
+    assert!(
+        srv.hits("/show/seg3.ts") > seg3_hits,
+        "只有失败的那一段需要重下"
+    );
+    assert!(!ctrl_path(&file_of(&st)).exists(), "完成后控制文件应收掉");
+}
+
+/// **分片地址过期（403）不再判死整条任务**：清单级重试会重新拉清单并续传。
+///
+/// 带防盗链的站点（`?sign=…&t=…`）在下几百段的过程中签名必然过期。原地重发同一个
+/// URL 只会继续被拒 —— 唯一能恢复的动作是**重新拉一次清单拿一批新地址**。这条用例
+/// 让 seg3 前 1 次返回 403，确认引擎自动重取清单、从断点续上、最终逐字节正确，
+/// 而不是把整条任务判失败、让用户从头再下（用户报的"下一会它就报错"）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hls_expired_signature_recovers_by_refetching_manifest() {
+    let dir = tmpdir("expired-signature");
+    let segs: Vec<Vec<u8>> = (1..=4).map(|i| sample(i, 24 * 1024)).collect();
+    let expected: Vec<u8> = segs.iter().flatten().copied().collect();
+    let mut files = HashMap::new();
+    files.insert(
+        "/show/index.m3u8".to_string(),
+        media_playlist(&["seg1.ts", "seg2.ts", "seg3.ts", "seg4.ts"], true).into_bytes(),
+    );
+    for (i, s) in segs.iter().enumerate() {
+        files.insert(format!("/show/seg{}.ts", i + 1), s.clone());
+    }
+    // seg3 第一次请求被拒（签名过期），之后正常
+    let gate = Arc::new(AtomicUsize::new(1));
+    let mut gates = FailGates::default();
+    gates.insert(
+        "/show/seg3.ts".to_string(),
+        (gate.clone(), StatusCode::FORBIDDEN),
+    );
+    let srv = start_hls_server_full(files, HashMap::new(), 0, HashMap::new(), HashMap::new(), gates)
+        .await;
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = mgr
+        .add_uri(
+            vec![srv.url("/show/index.m3u8")],
+            &serde_json::json!({
+                "dir": dir,
+                "split": "1",
+                "hls-probe-size": "false",
+                "hls-segment-retries": "1",
+            }),
+            None,
+        )
+        .expect("addUri 应成功");
+
+    // 任务**不该**进入 error：403 是"换一批新地址就能恢复"的瞬态失败
+    let st = wait_status(&mgr, &gid, "complete", 40_000)
+        .await
+        .expect("签名过期应被自动恢复，而不是判成失败");
+    assert_eq!(
+        std::fs::read(file_of(&st)).unwrap(),
+        expected,
+        "恢复后产物必须逐字节完整"
+    );
+    assert_eq!(
+        srv.hits("/show/seg3.ts"),
+        2,
+        "被拒的那一段应重试一次（重取清单后）"
+    );
+    assert_eq!(srv.hits("/show/seg1.ts"), 1, "其余分片不该被重下");
+    assert_eq!(srv.hits("/show/seg2.ts"), 1, "其余分片不该被重下");
+    assert_eq!(
+        srv.hits("/show/seg4.ts"),
+        1,
+        "失败点之后已下好的分片不该被重下"
+    );
+    assert!(!ctrl_path(&file_of(&st)).exists(), "完成后控制文件应收掉");
 }
 
 /// 进度必须**一路往前走**，同时不虚报超过一个分片。

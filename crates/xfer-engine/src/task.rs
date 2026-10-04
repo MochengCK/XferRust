@@ -73,20 +73,21 @@ impl TaskKind {
     }
 }
 
-/// URL 是否为 HLS 清单地址（按路径扩展名判定，忽略查询串与矩阵参数）。
+/// URL 是否为 HLS 清单地址。
 ///
-/// 只认 `.m3u8`：`.m3u` 是通用播放列表容器（常见于纯音频列表），
-/// 按 HLS 解析必然失败；这类地址仍可经响应头 `Content-Type` 嗅探
-/// 走播放列表路径（见 [`crate::manager`] 的 `try_uri`）。
+/// 判据与 `xfer-http` 的嗅探**共用同一份实现**（[`xfer_http::looks_like_hls_url`]），
+/// 免得"什么算 HLS 地址"在引擎两处给出不同答案。覆盖：
+///
+/// - 路径后缀 `.m3u8`（标准）与 `.m3u`（不少站点用它发 HLS；纯音频 M3U 会被
+///   正文校验挡下并回退普通 HTTP 下载，见 `drive_playlist`）；
+/// - 查询串里写明了 HLS 的（`?format=hls` / `?type=m3u8` / `?output=m3u8` …）——
+///   大量中转接口的清单地址没有扩展名，全靠这一条。
+///
+/// 都不命中时仍有一条兜底：普通 HTTP 任务会按响应头做一次内容嗅探
+/// （见 [`xfer_http::Probe::is_playlist_hint`]），服务器声明了 mpegurl 一样能走上
+/// 播放列表这条路。
 pub fn is_playlist_url(u: &str) -> bool {
-    let path = u.split(['?', '#']).next().unwrap_or(u);
-    let path = path
-        .split(';')
-        .next()
-        .unwrap_or(path)
-        .trim()
-        .to_ascii_lowercase();
-    path.ends_with(".m3u8")
+    xfer_http::looks_like_hls_url(u)
 }
 
 /// `hls` / `hls-playlist` 选项的显式取值（None = 未设置，按扩展名自动判定）。

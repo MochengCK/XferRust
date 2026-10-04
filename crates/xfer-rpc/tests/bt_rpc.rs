@@ -362,3 +362,82 @@ async fn task_add_passthrough_bt_file_selection() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 边下边播的播放头（`task.setPlayhead`）。
+///
+/// 两件事分开看：
+/// - **调用错误**（参数缺失 / gid 非法 / 任务不存在）要如实报错 —— 那是宿主写错了；
+/// - **作用不到引擎**（磁力元数据还没就绪、任务暂停中、非 BT）返回
+///   `applied:false` —— 这是尽力而为的提示，不是失败，播放器不该为此弹错。
+#[tokio::test]
+async fn native_set_playhead_reports_applied() {
+    let dir = std::env::temp_dir().join(format!("xfer-rpc-playhead-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mgr = TaskManager::start(dir.clone(), 1);
+    let events = mgr.events();
+    let router = Arc::new(RpcRouter::new(None, mgr.clone(), events));
+
+    // 缺 offset：参数错误
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"task.setPlayhead","params":{"gid":"deadbeefdeadbeef"}}"#;
+    let resp = router.handle(body).response.expect("应有响应");
+    let err = resp["error"].to_string();
+    assert!(err.contains("offset"), "缺 offset 应明确报参数错误: {resp}");
+
+    // gid 非法
+    let body = r#"{"jsonrpc":"2.0","id":2,"method":"task.setPlayhead","params":{"gid":"nope","offset":0}}"#;
+    let resp = router.handle(body).response.unwrap();
+    assert!(
+        resp["error"].to_string().contains("GID"),
+        "非法 gid 应报错: {resp}"
+    );
+
+    // 任务不存在
+    let body = r#"{"jsonrpc":"2.0","id":3,"method":"task.setPlayhead","params":{"gid":"deadbeefdeadbeef","offset":0}}"#;
+    let resp = router.handle(body).response.unwrap();
+    assert!(
+        resp["error"].to_string().contains("不存在"),
+        "任务不存在应报错: {resp}"
+    );
+
+    // 磁力任务（元数据未就绪 ⇒ 没有在跑的 BT 引擎）：applied=false，不是错误
+    let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=playhead-test";
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"task.add","params":{{"magnet":"{magnet}","dir":"{}"}}}}"#,
+        dir.display()
+    );
+    let resp = router.handle(&body).response.unwrap();
+    assert_eq!(resp["error"], serde_json::Value::Null, "task.add 失败: {resp}");
+    let gid = resp["result"]["gid"].as_str().unwrap().to_string();
+
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":5,"method":"task.setPlayhead","params":{{"gid":"{gid}","offset":1048576}}}}"#
+    );
+    let resp = router.handle(&body).response.unwrap();
+    assert_eq!(resp["error"], serde_json::Value::Null, "提示不该报错: {resp}");
+    assert_eq!(
+        resp["result"]["applied"],
+        serde_json::Value::Bool(false),
+        "没有在跑的 BT 引擎 → applied=false（但要带原因）: {resp}"
+    );
+    assert!(
+        !resp["result"]["reason"].as_str().unwrap_or("").is_empty(),
+        "applied=false 要说清为什么: {resp}"
+    );
+
+    // 清除（offset = -1）走同一条路，也不该报错
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":6,"method":"task.setPlayhead","params":{{"gid":"{gid}","offset":-1}}}}"#
+    );
+    let resp = router.handle(&body).response.unwrap();
+    assert_eq!(resp["error"], serde_json::Value::Null, "清除提示不该报错: {resp}");
+
+    // 能力清单里要有 playhead（宿主据此判断引擎支不支持这条通道）
+    assert!(
+        xfer_rpc::ENGINE_FEATURES.contains(&"playhead"),
+        "engine.getVersion 的能力清单要包含 playhead"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

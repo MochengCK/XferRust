@@ -173,8 +173,9 @@ fn meta_of(tb: &[u8]) -> TorrentMeta {
     parse_torrent(tb).unwrap()
 }
 
-async fn run_download(meta: TorrentMeta, dir: &std::path::Path) -> Result<(), String> {
-    let cfg = TorrentConfig {
+/// 测试用配置：本地闭环（无 DHT/PEX/LPD/UPnP、不对 tracker 之外的地址拨号）。
+fn test_config(dir: &std::path::Path, meta: &TorrentMeta) -> TorrentConfig {
+    TorrentConfig {
         enable_dht_ipv6: false,
         enable_pex: false,
         disk_cache_bytes: 0,
@@ -206,8 +207,11 @@ async fn run_download(meta: TorrentMeta, dir: &std::path::Path) -> Result<(), St
         seed_duration: 0,
         seed_ratio: 0.0,
         selected_files: None,
-    };
-    let engine = TorrentEngine::new(meta, cfg).map_err(|e| e.to_string())?;
+    }
+}
+
+async fn run_download(meta: TorrentMeta, dir: &std::path::Path) -> Result<(), String> {
+    let engine = TorrentEngine::new(meta.clone(), test_config(dir, &meta)).map_err(|e| e.to_string())?;
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         engine.clone().run(CancellationToken::new()),
@@ -215,6 +219,105 @@ async fn run_download(meta: TorrentMeta, dir: &std::path::Path) -> Result<(), St
     .await
     .map_err(|_| "下载超时".to_string())??;
     Ok(())
+}
+
+/// 位图 → 已完成片号（wire 语义：每片 1 bit，字节内高位在前）。
+fn done_pieces(engine: &TorrentEngine) -> Vec<u32> {
+    let Some(bf) = engine.bitfield() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for i in 0..bf.len() * 8 {
+        if bf[i / 8] >> (7 - (i % 8)) & 1 == 1 {
+            out.push(i as u32);
+        }
+    }
+    out
+}
+
+/// 起下载、等到至少 `want` 片完成就停下（返回已完成的片号，升序）。
+async fn run_until_pieces(engine: Arc<TorrentEngine>, want: usize) -> Vec<u32> {
+    let cancel = CancellationToken::new();
+    let runner = tokio::spawn(engine.clone().run(cancel.clone()));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut done = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        done = done_pieces(&engine);
+        if done.len() >= want {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    cancel.cancel();
+    let _ = runner.await;
+    done
+}
+
+/// 边下边播的**优先下载**（播放头 → 选片）：有播放头时，播放头那一带先下，
+/// 哪怕它在文件末尾；没有播放头时才是默认的"从第 0 片起"。
+///
+/// 用本地 swarm 真下几片来验（选片策略的单测在 `playhead.rs`，这里验的是
+/// "引擎真的照它选"）。
+#[tokio::test]
+async fn playhead_priority_downloads_that_region_first() {
+    // 数据必须**大于 Stream 窗口（32 MiB）**：否则窗口覆盖整个文件，
+    // 有没有播放头都是片号升序，测不出差别。
+    let data: Vec<u8> = (0..640 * PIECE_LEN).map(|i| ((i % 251) + 1) as u8).collect();
+
+    let (taddr, seed_ref) = start_tracker().await;
+    let tracker_url = format!("http://{taddr}/announce");
+    let meta = meta_of(&make_torrent_bytes(&data, &tracker_url));
+    let seed = Arc::new(Seed {
+        data: Arc::new(data.clone()),
+        piece_len: PIECE_LEN,
+    });
+    let (sl, saddr) = bind_random().await;
+    *seed_ref.write().unwrap() = Some(saddr);
+    tokio::spawn(serve_seed(
+        sl,
+        seed,
+        InfoHash::from_bytes(&meta.info_hash),
+        PeerId::azureus_prefix(&[9u8; 12]),
+    ));
+
+    const PLAYHEAD: u64 = 36 * 1024 * 1024;
+    const PLAYHEAD_PIECE: u32 = (PLAYHEAD / PIECE_LEN as u64) as u32;
+    assert!(PLAYHEAD_PIECE > 0, "测试前提：播放头不在文件开头");
+
+    // ① 有播放头：先完成的片必须都在播放头往后那一带，且从播放头那片起
+    let dir = std::env::temp_dir().join(format!("xfer-bt-playhead-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let m2 = meta_of(&make_torrent_bytes(&data, &tracker_url));
+    let engine = TorrentEngine::new(m2.clone(), test_config(&dir, &m2)).unwrap();
+    engine.set_playhead(Some(PLAYHEAD));
+    let done = run_until_pieces(engine.clone(), 6).await;
+    engine.set_playhead(None);
+    assert!(!done.is_empty(), "一片都没下到（本地 swarm 没连上）");
+    assert_eq!(
+        done.iter().min(),
+        Some(&PLAYHEAD_PIECE),
+        "第一片必须落在播放头（实际：{done:?}）"
+    );
+    assert!(
+        done.iter().all(|p| *p >= PLAYHEAD_PIECE),
+        "播放头之外的片不该抢先下（实际：{done:?}）"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // ② 对照：没有播放头时是默认行为 —— 从第 0 片开始
+    let dir2 = std::env::temp_dir().join(format!("xfer-bt-noplayhead-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir2);
+    std::fs::create_dir_all(&dir2).unwrap();
+    let m3 = meta_of(&make_torrent_bytes(&data, &tracker_url));
+    let engine2 = TorrentEngine::new(m3.clone(), test_config(&dir2, &m3)).unwrap();
+    let done2 = run_until_pieces(engine2.clone(), 3).await;
+    assert_eq!(
+        done2.iter().min(),
+        Some(&0),
+        "没有播放头时不该改变默认行为（实际：{done2:?}）"
+    );
+    let _ = std::fs::remove_dir_all(&dir2);
 }
 
 #[tokio::test]

@@ -1135,6 +1135,10 @@ pub struct TorrentEngine {
     /// 由 `selected_files` 推导的所需片位图（None = 全量）。
     /// 元数据就绪 / 文件选择变更时重算。
     wanted: Mutex<Option<PieceMap>>,
+    /// 边下边播的播放头（字节偏移；`u64::MAX` = 未设置）。
+    /// 由 [`Self::set_playhead`] 写入、`assign_piece` 无锁读 —— 播放头会随
+    /// 播放推进/seek 频繁变化，选片路径上不能为它再抢一把锁。
+    playhead: AtomicU64,
 }
 
 /// 动态 announce 列表：按协议分流（http / udp）。
@@ -1263,6 +1267,7 @@ impl TorrentEngine {
             seeding: AtomicBool::new(false),
             seed_duration_secs: AtomicU64::new(seed_duration_init),
             wanted: Mutex::new(None),
+            playhead: AtomicU64::new(u64::MAX),
         });
         engine.refresh_done_bytes();
         engine.apply_selection();
@@ -1331,6 +1336,7 @@ impl TorrentEngine {
             seeding: AtomicBool::new(false),
             seed_duration_secs: AtomicU64::new(seed_duration_init),
             wanted: Mutex::new(None),
+            playhead: AtomicU64::new(u64::MAX),
         });
         // 磁力启动：尝试加载已保存的种子（bt-load-saved-metadata）
         engine.try_load_saved_torrent();
@@ -1570,6 +1576,19 @@ impl TorrentEngine {
     pub fn set_selected_files(&self, files: Option<Vec<usize>>) {
         *self.selected_files.lock().unwrap() = files;
         self.apply_selection();
+    }
+
+    /// 设置/清除**播放头**（边下边播）。
+    ///
+    /// `Some(offset)` = "本地正在播这个字节位置"，选片会把这一带提到最前
+    /// （档位与窗口见 [`crate::playhead`]）；`None` = 播放结束，退回纯 rarest-first。
+    ///
+    /// 播放头是**运行时的瞬时状态**，刻意不进续传文件：暂停/恢复、重启后
+    /// 重新播放会再设一次；把它持久化只会让"上次播过的地方"长期压着
+    /// 别的片不让下。偏移超出种子范围是安全的（谁都不在窗口里 ⇒ 全量 rarest-first）。
+    pub fn set_playhead(&self, offset: Option<u64>) {
+        self.playhead
+            .store(offset.unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// 存储句柄是否覆盖给定文件选择（热切换可行性检查）。
@@ -5932,10 +5951,15 @@ impl TorrentEngine {
     /// 锁内原子注册选中的片。避免与持 PeerState 锁访问 store 的路径
     /// 构成锁环，也避免长时间持有 store 锁阻塞其他 peer。
     fn assign_piece(&self, cell: &Arc<PeerCell>) -> Option<u32> {
-        let (count, store_have) = {
+        let (count, store_have, piece_len, total_len) = {
             let guard = self.store.lock().unwrap();
             let store = guard.as_ref().unwrap();
-            (store.piece_count(), store.map().clone())
+            (
+                store.piece_count(),
+                store.map().clone(),
+                store.piece_len(0).max(1),
+                store.total_length(),
+            )
         };
         let peer_have = cell.state.lock().unwrap().have.clone();
         let peer_haves: Vec<PieceMap> = {
@@ -5946,21 +5970,31 @@ impl TorrentEngine {
                 .collect()
         };
 
-        // (稀有度, 片号)，按稀有度升序
+        // (片号, 稀有度)：稀有度 = 当前连接 peers 中拥有该片的人数（越少越优先）
         let mut candidates: Vec<(u32, u32)> = Vec::new();
         for idx in 0..count {
             if !peer_have.is_set(idx) || store_have.is_set(idx) || !self.piece_wanted(idx) {
                 continue;
             }
             let rarity = peer_haves.iter().filter(|h| h.is_set(idx)).count() as u32;
-            candidates.push((rarity, idx));
+            candidates.push((idx, rarity));
         }
-        candidates.sort_unstable();
+        // 排片：**有播放头时窗口内的片优先**（且在窗口内按片号升序 —— 必须
+        // 形成连续前缀，稀有度排序会把窗口里的片打散），窗口外仍是 rarest-first。
+        // 档位与窗口见 `crate::playhead`（那里有单测钉住顺序）。
+        let playhead = match self.playhead.load(Ordering::Relaxed) {
+            u64::MAX => None,
+            offset => Some(offset),
+        };
+        crate::playhead::order(&mut candidates, playhead, |idx| {
+            let start = idx as u64 * piece_len;
+            (start, (start + piece_len).min(total_len))
+        });
 
         // 原子注册：在 assigned 锁内取第一个未被占用的片，
         // 避免多个 peer 同时选中同一片造成重复下载
         let mut assigned = self.assigned.lock().unwrap();
-        for (_, idx) in candidates {
+        for (idx, _) in candidates {
             if !assigned.contains(&idx) {
                 assigned.insert(idx);
                 return Some(idx);

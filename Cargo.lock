@@ -2509,6 +2509,7 @@ version = "0.3.3"
 dependencies = [
  "aes",
  "axum",
+ "base64",
  "bytes",
  "cbc",
  "futures-util",

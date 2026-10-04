@@ -1438,8 +1438,30 @@ impl TaskManager {
 
     pub fn unpause(&self, gid: &Gid) -> Result<(), String> {
         let task = self.task_of(gid)?;
-        if task.status() != Status::Paused {
-            return Err("任务未处于暂停状态".into());
+        // `Error` 也允许就地重跑 —— 这正是"重新下载"该有的语义。
+        //
+        // 任务的 `shared.path`、控制文件（`.aria2`）与乱序落盘的段目录
+        // （`<产物>.hlseg/`）都还在，重跑会**从断点续传**而不是从零。
+        //
+        // 旧实现只认 `Paused`，于是界面上的"重新下载"只能退化成
+        // 「删掉这条记录 + 用原地址新建一条任务」—— 而删除记录会连带清掉控制文件
+        // （`delete_task_ctrl`），新任务既找不到续传现场、又因为目标文件已存在而
+        // 改名成 `xxx.1.ts`，用户看到的就是"一出错，重新下载必定从零开始"。
+        let status = task.status();
+        if !matches!(status, Status::Paused | Status::Error) {
+            return Err("任务未处于暂停或失败状态".into());
+        }
+        // 失败态重跑：清掉上一次的错误信息，否则界面上"下载中"还挂着旧错误。
+        // 同时把它从"已停止结果"里摘掉 —— 终态任务本来就登记在那儿，重跑了还留着
+        // 会变成重复条目（列表里同一条出现两次、numStopped 也算两遍）。
+        if status == Status::Error {
+            {
+                let mut sh = task.shared.lock().unwrap();
+                sh.error_code = 0;
+                sh.error_message.clear();
+            }
+            task.finished_at.store(0, Ordering::Relaxed);
+            self.inner.lock().unwrap().stopped_order.retain(|g| g != gid);
         }
         // 磁力解析流程：等待文件选择的任务必须先勾选文件
         // （元数据在重启后丢失时例外——恢复下载会重新解析并再次暂停）
@@ -3025,6 +3047,28 @@ impl TaskManager {
         Ok(sel)
     }
 
+    /// 边下边播：把"播放头在这个字节位置"告诉 BT 任务（`None` = 停止播放）。
+    ///
+    /// 偏移是**种子总数据内的字节位置**（多文件种子要算上前面文件的长度），
+    /// 引擎据此把播放头附近的片提到最前（档位与窗口见 `xfer_bt::playhead`）。
+    ///
+    /// 返回 `applied` 而不是对"作用不到引擎"报错：这是**尽力而为的提示**，
+    /// 暂停中的任务、元数据还没就绪的磁力、非 BT 任务都没有在跑的引擎，
+    /// 播放器宿主不该为此弹错（它只管把播放位置报过来）。任务不存在仍报错 ——
+    /// 那是调用方参数错了，不该被静默吞掉。
+    pub fn set_playhead(&self, gid: &Gid, offset: Option<u64>) -> Result<Value, String> {
+        self.task_of(gid)?;
+        let engines = self.bt_engines.lock().unwrap();
+        let Some(engine) = engines.get(gid) else {
+            return Ok(json!({
+                "applied": false,
+                "reason": "该任务没有在跑的 BT 引擎（非 BT / 暂停中 / 元数据未就绪）",
+            }));
+        };
+        engine.set_playhead(offset);
+        Ok(json!({ "applied": true }))
+    }
+
     /// 向 BT 任务动态添加 tracker URL。
     ///
     /// - 等待/暂停/活动状态均可添加，新 tracker 立即参与下一轮 announce。
@@ -4428,6 +4472,27 @@ async fn drive_bt_download(
 /// 同一 URI 瞬态失败的重试上限（含首次共 3 次尝试）。
 const URI_TRANSIENT_ATTEMPTS: u32 = 3;
 
+/// 播放列表（HLS）同一 URI 瞬态失败的重试上限（含首次共 6 次尝试）。
+///
+/// 比普通 HTTP 宽一倍，原因有两条：
+///
+/// 1. **每次重试都会重新拉一次清单**，也就是重新协商一次签名/令牌。带防盗链的
+///    站点（`?sign=…&t=…` 有效期常只有几分钟）在下几百段的过程中必然过期，
+///    旧行为（3 次、且 403 不算瞬态）直接判死整条任务 —— 用户现场就是
+///    "下一会它就报错"。
+/// 2. **重试很便宜**：分片走控制文件续传、段内半截走 `Range`，一轮重试只会
+///    补下"还没下完的那部分"，不会把已下好的字节重来一遍。
+const PLAYLIST_TRANSIENT_ATTEMPTS: u32 = 6;
+
+/// 播放列表瞬态重试的退避：1s / 2s / 4s / 8s / 15s（`attempt` 从 2 起）。
+///
+/// 指数退避而不是固定 1s/3s：签名过期与限流都要等一小会儿，密集重试只会继续
+/// 撞同一堵墙（还可能把限流踩得更死）。
+fn playlist_retry_backoff(attempt: u32) -> Duration {
+    let secs = 1u64 << attempt.saturating_sub(2).min(4);
+    Duration::from_secs(secs.min(15))
+}
+
 /// 是否为值得同 URI 重试的瞬态失败：连接类/超时/中途断流/5xx
 /// 都可立即重试（分片走控制文件续传、单连接走 Range 续传，
 /// 重试成本只有剩余部分）；4xx、本地 IO、取消不重试。
@@ -4443,6 +4508,26 @@ fn is_transient_failure(f: &TaskFailure) -> bool {
         TaskFailure::Http(HttpError::Http(code)) => *code >= 500,
         _ => false,
     }
+}
+
+/// 播放列表（HLS）专用的瞬态判据：在 [`is_transient_failure`] 之上补
+/// "换一批新地址就能恢复"的几类 4xx。
+///
+/// - `401` / `403` / `410`：清单里的分片地址**带着有效期**（签名 / 一次性令牌 /
+///   防盗链），下到一半过期就会被拒。原地重发同一个 URL 没用，但**重取清单**
+///   会拿到一批新地址 —— `drive_playlist` 的每次重试都会重新 `fetch_plan`，
+///   于是这类失败变成"续传 + 换签名"而不是"任务失败"。
+/// - `408` / `425` / `429`：CDN 边缘瞬时状态 / 限流，退避后再来即可。
+///
+/// 为什么不在 [`is_transient_failure`] 里一起放开：普通 HTTP 任务（单文件）
+/// 没有办法"换地址"，403/401 重试 3 次纯属浪费用户 4 秒；而 HLS 的清单天然
+/// 支持重新协商。两地判据分开是刻意的。
+fn is_transient_playlist_failure(f: &TaskFailure) -> bool {
+    use xfer_http::HttpError;
+    if is_transient_failure(f) {
+        return true;
+    }
+    matches!(f, TaskFailure::Http(HttpError::Http(code)) if matches!(*code, 401 | 403 | 408 | 410 | 425 | 429))
 }
 
 /// 依次尝试 URI 列表（镜像故障转移），全部失败返回最后一个错误。
@@ -4746,17 +4831,37 @@ async fn drive_playlist(
             {
                 Ok(()) => return Ok(()),
                 Err(f) if f.is_cancelled() => return Err(f),
+                // 地址"像清单"但内容不是：**能退就退**。
+                //
+                // 判据是"像"而不是"是"，所以必然有误判（`.m3u` 的纯音频列表、
+                // `?format=hls` 其实是直链的中转地址……）。这些地址以前是会正常
+                // 下载的，不能因为这一版放宽了识别就变成失败。
+                //
+                // 唯一的例外是**路径确实以 `.m3u8` 结尾**：那种地址返回非清单内容
+                // 基本就是登录页 / 报错页 / 反爬拦截页，把那一页存成"视频"才是真的
+                // 坑人（用户拿到一个几百字节的 .ts），宁可失败并说清楚。
+                Err(TaskFailure::Http(xfer_http::HttpError::NotPlaylist))
+                    if !xfer_http::path_of(uri)
+                        .to_ascii_lowercase()
+                        .ends_with(".m3u8") =>
+                {
+                    tracing::info!(
+                        gid = %task.gid, uri = idx,
+                        "地址像清单但内容不是，回退按普通文件下载"
+                    );
+                    let client = mgr.client.read().unwrap().clone();
+                    return try_uri(mgr, &client, task, uri, idx, cancel).await;
+                }
                 Err(f) => {
-                    if is_transient_failure(&f) && attempt < URI_TRANSIENT_ATTEMPTS {
+                    if is_transient_playlist_failure(&f) && attempt < PLAYLIST_TRANSIENT_ATTEMPTS {
                         attempt += 1;
+                        let backoff = playlist_retry_backoff(attempt);
                         tracing::warn!(
                             gid = %task.gid, uri = idx, attempt,
-                            error = %f, "播放列表瞬态失败，断点续传重试"
+                            backoff_s = backoff.as_secs(),
+                            error = %f,
+                            "播放列表瞬态失败，重取清单后断点续传重试"
                         );
-                        let backoff = match attempt {
-                            2 => Duration::from_secs(1),
-                            _ => Duration::from_secs(3),
-                        };
                         tokio::select! {
                             _ = tokio::time::sleep(backoff) => {}
                             _ = cancel.cancelled() => return Err(f),

@@ -208,6 +208,24 @@ impl HttpError {
         }
     }
 
+    /// 分片/清单下载里"值得**原地**再试一次"的错误：在 [`Self::is_retryable`]
+    /// 之上补三类"过一会儿再来就好"的状态码。
+    ///
+    /// - `408` 请求超时、`425` Too Early：CDN 边缘节点的瞬时状态；
+    /// - `429` 限流：**必须**靠退避重试，直接放弃等于把站点限流当故障；
+    ///
+    /// 刻意**不含** `401` / `403` / `410`：这三类是"**这一个地址**已经不认了"
+    /// （签名过期、防盗链、资源被摘），原地重发同一个 URL 只会拿到同样的拒绝。
+    /// 正确的恢复动作是**重取清单换一批新地址** —— 那由清单级重试负责
+    /// （引擎 `drive_playlist` 把 401/403/410 也算瞬态，每次重试都重新拉清单）。
+    /// 这两层分工是刻意的：分片级只做"同址重发"，跨址的恢复留给上层。
+    pub fn is_retryable_segment(&self) -> bool {
+        match self {
+            Self::Http(code) => matches!(code, 408 | 425 | 429) || *code >= 500,
+            other => other.is_retryable(),
+        }
+    }
+
     /// 映射到线上协议的任务错误码。
     pub fn error_code(&self) -> i64 {
         match self {
@@ -240,26 +258,119 @@ pub struct Probe {
 }
 
 impl Probe {
-    /// 是否**像是** HLS 播放列表（MIME 命中或文件名以 `.m3u8` 结尾）。
+    /// 是否**像是** HLS 播放列表。
     ///
-    /// 只是嗅探：`m3u8` 的 MIME 在线上五花八门（`application/vnd.apple.mpegurl`、
-    /// `application/x-mpegurl`、`audio/mpegurl`、甚至 `text/plain`），因此
-    /// 命中后仍必须读正文确认首行是 `#EXTM3U`（见 [`crate::fetch_plan`]
-    /// 的 [`HttpError::NotPlaylist`]）。
+    /// 三条线索任一成立即可（都只是"像"，命中后仍必须读正文确认首行是
+    /// `#EXTM3U`，见 [`crate::fetch_plan`] 的 [`HttpError::NotPlaylist`]）：
+    ///
+    /// 1. 响应声明的 MIME 属于 mpegurl 家族 —— 线上这个头的写法极多：
+    ///    `application/vnd.apple.mpegurl`、`application/x-mpegurl`、
+    ///    `application/mpegurl`、`audio/mpegurl`、`audio/x-mpegurl`、
+    ///    `text/mpegurl`，甚至干脆是 `text/plain`（所以第 2、3 条兜底）；
+    /// 2. 地址本身像清单（后缀 `.m3u8` / `.m3u`，或查询串里写明了 HLS，
+    ///    见 [`looks_like_hls_url`]）；
+    /// 3. 地址路径里有清单的形状（`/hls/`、`playlist.m3u8`、`master.m3u8`…）——
+    ///    无扩展名的中转接口基本都长这样。
     pub fn is_playlist_hint(&self) -> bool {
         if let Some(ct) = &self.content_type {
-            let ct = ct.to_ascii_lowercase();
-            if ct.contains("mpegurl") || ct.contains("m3u8") || ct.contains("vnd.apple") {
+            if mime_is_mpegurl(ct) {
                 return true;
             }
         }
-        let path = self
-            .final_url
-            .split(['?', '#'])
+        if looks_like_hls_url(&self.final_url) {
+            return true;
+        }
+        let path = path_of(&self.final_url);
+        let lower = path.to_ascii_lowercase();
+        const HINTS: [&str; 8] = [
+            "/hls/",
+            "/hls_",
+            "_hls.",
+            "/m3u8/",
+            "playlist.m3u8",
+            "playlist.m3u",
+            "master.m3u8",
+            "index.m3u8",
+        ];
+        HINTS.iter().any(|h| lower.contains(h))
+    }
+}
+
+/// 取 URL 的路径部分（去查询串 / 片段，再去矩阵参数）。
+pub fn path_of(url: &str) -> &str {
+    let no_frag = url.split('#').next().unwrap_or(url);
+    let path = no_frag.split('?').next().unwrap_or(no_frag);
+    path.split(';').next().unwrap_or(path).trim()
+}
+
+/// MIME 是否属于 mpegurl（HLS 清单）家族。
+///
+/// 大小写与 `;charset=…` 参数都要容忍：`Application/VND.Apple.MPEGURL; charset=utf-8`
+/// 这种写法真的存在，而它一旦被漏掉，整条任务就会去按普通文件下一份几百字节的清单。
+pub fn mime_is_mpegurl(content_type: &str) -> bool {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    ct.contains("mpegurl") || ct.contains("m3u8") || ct.contains("vnd.apple")
+}
+
+/// 查询串里是否**明确声明**了这一路是 HLS。
+///
+/// 只认"参数值本身就是 HLS"的组合（`format=hls` / `type=m3u8` / `output=m3u8` …），
+/// 不去猜语义模糊的参数 —— 宁可漏，也不要让一个普通地址被当成清单去解析。
+/// 参数名取自线上常见的中转 / 播放接口。
+pub fn hls_query_hint(query: &str) -> bool {
+    const NAMES: [&str; 12] = [
+        "format",
+        "fmt",
+        "type",
+        "output",
+        "ext",
+        "suffix",
+        "filetype",
+        "file_type",
+        "mediatype",
+        "media_type",
+        "container",
+        "f",
+    ];
+    for pair in query.split('&') {
+        let (k, v) = match pair.split_once('=') {
+            Some(kv) => kv,
+            None => continue,
+        };
+        if !NAMES.contains(&k.trim().to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        let v = v
+            .split(';')
             .next()
-            .unwrap_or(&self.final_url)
+            .unwrap_or(v)
+            .trim()
             .to_ascii_lowercase();
-        path.ends_with(".m3u8") || path.ends_with(".m3u")
+        if v == "hls" || v == "m3u8" || v == "m3u" || mime_is_mpegurl(&v) {
+            return true;
+        }
+    }
+    false
+}
+
+/// URL 是否像 HLS 清单（后缀 `.m3u8` / `.m3u`，或查询串里写明了 HLS）。
+///
+/// **不做内容嗅探**：只回答"要不要按清单去试一次"。引擎与界面共用同一份判据，
+/// 免得两边对"什么算 HLS 地址"给出不同答案。
+pub fn looks_like_hls_url(url: &str) -> bool {
+    let lower = path_of(url).to_ascii_lowercase();
+    if lower.ends_with(".m3u8") || lower.ends_with(".m3u") {
+        return true;
+    }
+    let no_frag = url.split('#').next().unwrap_or(url);
+    match no_frag.split_once('?') {
+        Some((_, q)) => hls_query_hint(q),
+        None => false,
     }
 }
 
