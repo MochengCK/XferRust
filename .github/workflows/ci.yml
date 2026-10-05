@@ -5,11 +5,38 @@ name: CI
 # 无对应版本 → 自动创建草稿；草稿已存在 → 每次构建覆盖产物并按最新双语模板
 # （.github/RELEASE_EN.md / .github/RELEASE_ZH.md）重新生成说明；已发布 → 不覆盖。
 # 确认无误后手动在 Releases 页发布。
+# 触发路径：**只有会改变产物的文件才触发构建**。
+#
+# 为什么用白名单（`paths:`）而不是黑名单（`paths-ignore:`）：漏掉一个该触发
+# 的路径，症状是"推上去了但 CI 没跑"，而且是**静默的** —— 比多跑一次构建贵得多。
+#
+# 这里包含了 `.github/RELEASE_*.md`：`release` 作业就是拿它拼发布说明的，
+# 改了它必须重跑才能反映到草稿 Release 上。
+# 不触发的（故意的）：`README*.md` / `TESTING.md` / `ANALYSIS_BT_SPEED.md`、
+# `LICENSE`、`data/`（运行期数据，没有 include_bytes! 打进二进制）、`fuzz/`。
 on:
   push:
     branches: [main]
+    paths:
+      - 'src/**'              # xfer（TUI）二进制
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'examples/**'
+      - 'scripts/**'          # CI 会调用这里的脚本
+      - '.github/workflows/**'
+      - '.github/RELEASE_*.md'  # release 作业读它拼说明
   pull_request:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'examples/**'
+      - 'scripts/**'
+      - '.github/workflows/**'
+      - '.github/RELEASE_*.md'
   workflow_dispatch:
 
 concurrency:
