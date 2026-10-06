@@ -832,6 +832,12 @@ impl TaskManager {
                     .store(t["avgActiveMs"].as_u64().unwrap_or(0), Ordering::Relaxed);
                 task.avg_bytes
                     .store(t["avgBytes"].as_u64().unwrap_or(0), Ordering::Relaxed);
+                // 恢复"直播录制"身份与已录时长：暂停/完成的录制任务在重启后
+                // 仍保持录制任务的卡片形态（不回落成普通任务）
+                task.live
+                    .store(t["isLive"].as_bool().unwrap_or(false), Ordering::Relaxed);
+                task.live_recorded_ms
+                    .store(t["liveRecordedMs"].as_u64().unwrap_or(0), Ordering::Relaxed);
                 match t["status"].as_str().unwrap_or("waiting") {
                     "complete" => sh.status = Status::Complete,
                     "error" => sh.status = Status::Error,
@@ -923,6 +929,11 @@ impl TaskManager {
                     "btBitfield": bt_bf_hex,
                     "httpNumPieces": http_num_pieces,
                     "httpPieceLen": http_piece_len,
+                    // 直播录制身份与已录时长：重启后卡片仍按"录制任务"呈现
+                    // （保留录制图标 + 状态 + 已录制 横杠行；完成/暂停的录制
+                    // 不会因为重启就回落到普通任务的形态）
+                    "isLive": t.live.load(Ordering::Relaxed),
+                    "liveRecordedMs": t.live_recorded_ms.load(Ordering::Relaxed),
                 })
             })
             .collect();
@@ -5869,6 +5880,47 @@ mod tests {
             .unwrap();
         let g = mgr.get_global_option();
         assert_eq!(g["hls-live-stall-timeout"], serde_json::json!("0"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 直播录制身份随会话持久化：重启后（完成/暂停的）录制任务仍保持
+    /// "录制任务"形态 —— UI 靠 `isLive` 决定卡片走不走录制布局
+    /// （录制图标 + 状态 + 已录制 横杠行），丢了它就会回落成普通任务。
+    #[tokio::test]
+    async fn live_identity_survives_session_restore() {
+        let dir = std::env::temp_dir().join(format!("xfer-live-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("session.json");
+        let _ = std::fs::remove_file(&session);
+
+        let mgr = TaskManager::start_with_session(Some(dir.clone()), Some(1), session.clone());
+        let gid = mgr
+            .add_uri(
+                vec!["http://127.0.0.1:1/live.m3u8".into()],
+                &serde_json::json!({"pause": "true"}),
+                None,
+            )
+            .unwrap();
+        {
+            let task = mgr.task_of(&gid).unwrap();
+            task.live.store(true, Ordering::Relaxed);
+            task.live_recorded_ms.store(123_456, Ordering::Relaxed);
+        }
+        mgr.save_session().unwrap();
+        drop(mgr);
+
+        let mgr2 = TaskManager::start_with_session(None, None, session);
+        let task2 = mgr2.task_of(&gid).unwrap();
+        assert!(
+            task2.live.load(Ordering::Relaxed),
+            "重启后仍应保持录制身份（isLive）"
+        );
+        assert_eq!(task2.live_recorded_ms.load(Ordering::Relaxed), 123_456);
+        let st = crate::task::status_json_native(&task2);
+        assert_eq!(st["isLive"], serde_json::json!(true));
+        assert_eq!(st["liveRecordedMs"], serde_json::json!(123_456));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

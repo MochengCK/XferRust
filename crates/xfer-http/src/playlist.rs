@@ -44,6 +44,7 @@
 //! - `#EXT-X-MEDIA` 的**独立音轨组**：见 [`choose_variant`] 的说明。
 
 mod crypto;
+mod timeline;
 mod ts;
 
 pub use crypto::{KeyFormat, KeyMethod, SegmentKey};
@@ -2046,6 +2047,17 @@ fn decrypt_sample_level(key: &[u8], sk: &SegmentKey, data: &[u8]) -> Result<Vec<
     ))
 }
 
+/// 产物最终完成时把时间轴归零（分片自带源侧时间偏移，详见 [`timeline`] 模块头）。
+/// 尽最大努力：失败只影响"时长显示"，不影响文件内容 —— warn 即可，不上抛。
+fn normalize_product_timeline_logged(path: &Path) {
+    if let Err(e) = timeline::normalize_product_timeline(path) {
+        tracing::warn!(
+            err = %e,
+            "产物时间轴归零失败（文件内容不受影响；时长显示可能仍带源偏移）"
+        );
+    }
+}
+
 /// 是不是 MPEG-TS：首个字节是同步字节，且长度是 188 的整数倍。
 ///
 /// 两个条件一起用：单看 `0x47` 会把偶然撞上的 fMP4 认成 TS，单看长度倍数又太弱。
@@ -2949,6 +2961,7 @@ async fn download_playlist_unordered(
             // 全部拼进去了：段目录是空的，顺手收掉它和控制文件
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_file(&ctrl_path);
+            normalize_product_timeline_logged(path);
             Ok(PlaylistDone {
                 bytes: sink.position(),
                 segments: written,
@@ -3286,6 +3299,7 @@ async fn download_playlist_ordered(
         }
         (None, true) => {
             let _ = std::fs::remove_file(&ctrl_path);
+            normalize_product_timeline_logged(path);
             return Ok(PlaylistDone {
                 bytes: file_bytes,
                 segments: written,
@@ -4206,6 +4220,9 @@ pub async fn record_playlist(
             // 录到干净：段目录已空，收掉现场
             let _ = std::fs::remove_dir_all(seg_dir(path));
             let _ = std::fs::remove_file(&ctrl_path);
+            // 时间轴归零：直播分片自带"开播以来"的时间戳，不归零的话
+            // 播放器显示的时长会变成"开播至今"（用户报的"显示直播总时长"）
+            normalize_product_timeline_logged(path);
             let bytes = sink.position();
             tracing::info!(
                 bytes,
@@ -6717,5 +6734,79 @@ mod tests {
             "EXT-X-MAP 写在 MEDIA-SEQUENCE 之前时，序号要校正到第一段"
         );
         assert!(!plan.live, "带 ENDLIST 的清单不是直播");
+    }
+
+    /// 直播 fMP4 清单：`#EXT-X-MAP` 初始化段 + 可选 ENDLIST。
+    fn live_fmp4_playlist(seq: u64, n: u64, endlist: bool) -> String {
+        let mut s = String::from("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MAP:URI=\"init.mp4\"\n");
+        s.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{seq}\n"));
+        for i in seq..seq + n {
+            s.push_str(&format!("#EXTINF:1.0,\nseg{i}.m4s\n"));
+        }
+        if endlist {
+            s.push_str("#EXT-X-ENDLIST\n");
+        }
+        s
+    }
+
+    /// 直播 fMP4 录完：**产物时间轴归零** —— 分片 tfdt 从"开播以来"（10s）
+    /// 起算，录完不归零的话播放器会把它显示成"开播至今"（用户报的
+    /// "显示直播总时长而不是实际录制时长"）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_fmp4_record_normalizes_timeline_to_zero() {
+        let dir = tmpdir("live-fmp4-norm");
+        // 视频首段 10s@90k、音频 10s@48k；三段各推进 1s（EXTINF 1.0）
+        let segs: Vec<Vec<u8>> = (0..3u64)
+            .map(|i| {
+                super::timeline::fixtures::fmp4_segment(
+                    900_000 + i * 90_000,
+                    480_000 + i * 48_000,
+                )
+            })
+            .collect();
+        let mut files = HashMap::new();
+        files.insert(
+            "/live/init.mp4".to_string(),
+            super::timeline::fixtures::fmp4_init(),
+        );
+        for (i, s) in segs.iter().enumerate() {
+            files.insert(format!("/live/seg{i}.m4s"), s.clone());
+        }
+        let srv = start_live_server(
+            vec![
+                live_fmp4_playlist(0, 1, false),
+                live_fmp4_playlist(1, 2, false),
+                live_fmp4_playlist(2, 1, true),
+            ],
+            HashMap::new(),
+            files,
+        )
+        .await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        let opts = PlaylistOptions {
+            probe_sizes: false,
+            live_stall_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let url = srv.url("/live/index.m3u8");
+        let plan = fetch_plan(&client, &url, &cancel, &[], &opts)
+            .await
+            .expect("取清单");
+        assert!(plan.live);
+
+        let path = dir.join("live.mp4");
+        let stats = PlaylistStats::new(0);
+        let done = record_playlist(&client, &path, &plan, &url, &opts, &cancel, stats)
+            .await
+            .expect("直播录制应正常收尾");
+        assert_eq!(done.segments, 4, "init + 3 段");
+        let firsts = super::timeline::first_tfdts(&path);
+        assert_eq!(firsts.get(&2).copied(), Some(0), "视频轨首 tfdt 应归零");
+        assert_eq!(firsts.get(&1).copied(), Some(0), "音频轨首 tfdt 应归零");
+        // 每轨相对推进量保留：三段共 3s（视频 270000@90k、音频 144000@48k）
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!bytes.is_empty(), "产物应包含 init 与分段");
     }
 }

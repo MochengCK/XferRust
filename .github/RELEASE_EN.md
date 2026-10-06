@@ -2,9 +2,10 @@
 
 - HLS streams (a playlist with no `#EXT-X-ENDLIST`) are now **recorded continuously**: instead of downloading the current window and stopping, the engine follows new segments as the manifest grows and appends them in order until the stream ends or the source stops publishing
 - Recording is **resumable**: pausing (or failing and retrying) keeps everything recorded so far, and resuming continues from the break point — signed URLs that rotate on every fetch do not get in the way
-- Task status reports live recording: `isLive` marks a recording task, and `liveRecordedMs` is the **recorded media duration** (how much of the output is playable), so clients can show "recording · elapsed"
+- Task status reports live recording: `isLive` marks a recording task (kept through pause / completion and restarts, so clients always render it as a recording), and `liveRecordedMs` is the **recorded media duration** (how much of the output is playable), so clients can show "recording · elapsed"
 - New global / per-task option `hls-live-stall-timeout` (seconds): how long a live source may go without new segments before the recording wraps up; 120 seconds by default, `0` = never conclude on inactivity
 - Nothing is silently faked: if the live window slides past a segment before it could be fetched, the engine skips it openly (and logs it, without failing the task); if a segment can never be fetched and blocks the splice point, the task fails honestly and a retry continues from the break point
+- The finished output shows the **correct duration**: live segments carry source-side ("since broadcast start") timestamps, so at wrap-up the timeline is shifted to start at zero — players report how long the recording actually is, not "time since the stream began"
 
 ## New Features
 
@@ -14,6 +15,7 @@
 - Segments are downloaded concurrently and spliced strictly in order: out-of-order segments land in per-segment files first and are moved into place at the splice point, so the output always stays a playable prefix; `#EXT-X-MAP` init segments (including ones replaced mid-recording) are handled too.
 - The recording wraps up when: the manifest gains `#EXT-X-ENDLIST`; no new segment shows up for `hls-live-stall-timeout` seconds (the source stopped publishing, or the playlist was never really live); the manifest keeps returning 404 / 410; or the task is paused / removed.
 - Resuming shares the same on-disk state as regular playlist downloads: the control file gains a live record (bytes on disk, next media sequence to splice, recorded duration, init segment already written). Pausing and failing both keep it; resuming truncates the output to the last flushed watermark, clears stale segment files, and re-fetches the remaining window with `Range` requests.
+- Timeline normalization: when the recording wraps up, sample timestamps are shifted to start at zero — each track is shifted by its own timescale so relative A/V offsets are preserved, and `sidx` presentation times are adjusted as well; live segments are timestamped from the broadcast start, and without this some players would report the duration as "time since the stream began" instead of the actual recording length.
 
 ## Behavior Changes
 
