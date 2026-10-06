@@ -269,6 +269,131 @@ async fn start_hls_server_full(
     }
 }
 
+/// 动态直播服务：清单内容按**请求轮次**从脚本里取（越界一直用最后一条），
+/// 分片是支持 `Range` 的静态文件；可对指定分片注入"响应前延迟"。
+/// 返回 `(服务, 脚本)` —— 往脚本里追加即可模拟"窗口在生长 / 最后加 ENDLIST"。
+async fn start_live_hls_server(
+    script: Vec<String>,
+    slow: HashMap<String, u64>,
+    files: HashMap<String, Vec<u8>>,
+) -> (HlsServer, Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::response::IntoResponse;
+    let mut hits: HashMap<String, Arc<AtomicUsize>> = HashMap::new();
+    let requests: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let script = Arc::new(std::sync::Mutex::new(script));
+    let mut app = Router::new();
+    {
+        let script = script.clone();
+        let hit = Arc::new(AtomicUsize::new(0));
+        let requests = requests.clone();
+        hits.insert("/live/index.m3u8".to_string(), hit.clone());
+        app = app.route(
+            "/live/index.m3u8",
+            get(move || {
+                let script = script.clone();
+                let hit = hit.clone();
+                let requests = requests.clone();
+                async move {
+                    let n = hit.fetch_add(1, Ordering::SeqCst);
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push(("/live/index.m3u8".to_string(), None));
+                    let guard = script.lock().unwrap();
+                    let body = guard
+                        .get(n)
+                        .or_else(|| guard.last())
+                        .cloned()
+                        .unwrap_or_else(|| "#EXTM3U\n".to_string());
+                    drop(guard);
+                    body.into_response()
+                }
+            }),
+        );
+    }
+    for (path, body) in files {
+        let data = Arc::new(body);
+        let hit = Arc::new(AtomicUsize::new(0));
+        let delay = slow.get(&path).copied().unwrap_or(0);
+        let requests = requests.clone();
+        let route = path.clone();
+        hits.insert(path.clone(), hit.clone());
+        app = app.route(
+            &path,
+            get(move |headers: HeaderMap| {
+                let data = data.clone();
+                let hit = hit.clone();
+                let requests = requests.clone();
+                let route = route.clone();
+                async move {
+                    hit.fetch_add(1, Ordering::SeqCst);
+                    let range_hdr = headers
+                        .get(header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((route.clone(), range_hdr.clone()));
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    let total = data.len();
+                    let range = range_hdr.unwrap_or_default();
+                    let (from, to) = match range
+                        .strip_prefix("bytes=")
+                        .and_then(|r| r.split_once('-'))
+                    {
+                        Some((f, t)) => (
+                            f.trim().parse::<usize>().unwrap_or(0),
+                            t.trim().parse::<usize>().unwrap_or(total),
+                        ),
+                        None => (0, total),
+                    };
+                    let from = from.min(total);
+                    let to = (to + 1).min(total).max(from);
+                    let body = data[from..to].to_vec();
+                    let mut resp = axum::response::Response::new(axum::body::Body::from(body));
+                    if from > 0 || to < total {
+                        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                        resp.headers_mut().insert(
+                            header::CONTENT_RANGE,
+                            HeaderValue::from_str(&format!(
+                                "bytes {}-{}/{}",
+                                from,
+                                to.saturating_sub(1),
+                                total
+                            ))
+                            .unwrap(),
+                        );
+                    }
+                    resp
+                }
+            }),
+        );
+    }
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(l, app).await;
+    });
+    (HlsServer { addr, hits, requests }, script)
+}
+
+/// 直播媒体清单：`#EXT-X-TARGETDURATION:1`（录制器轮询 0.5s），每段 1 秒。
+fn live_playlist(seq: u64, n: u64, endlist: bool) -> String {
+    let mut s = String::from("#EXTM3U\n#EXT-X-TARGETDURATION:1\n");
+    s.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{seq}\n"));
+    for i in seq..seq + n {
+        s.push_str(&format!("#EXTINF:1.0,\nseg{i}.ts\n"));
+    }
+    if endlist {
+        s.push_str("#EXT-X-ENDLIST\n");
+    }
+    s
+}
+
 async fn tell(mgr: &TaskManager, gid: &Gid) -> serde_json::Value {
     mgr.tell_status_native(gid, None).unwrap()
 }
@@ -820,35 +945,39 @@ async fn hls_task_errors_on_non_playlist_body() {
     assert!(dir.read_dir().unwrap().next().is_none(), "不应留下半成品文件");
 }
 
-/// 直播清单（无 `#EXT-X-ENDLIST`）：下载当前窗口即完成，产物为窗口快照。
+/// 直播清单（无 `#EXT-X-ENDLIST`）且**长时间没有新增分片**：按停滞正常收尾，
+/// 产物为录到的窗口快照；`hls-live-stall-timeout` 把默认两分钟压成两秒。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn hls_live_playlist_records_current_window() {
-    let dir = tmpdir("live");
+async fn hls_live_stall_ends_recording_with_window_snapshot() {
+    let dir = tmpdir("live-stall");
     let segs: Vec<Vec<u8>> = (1..=2).map(|i| sample(i, 8 * 1024)).collect();
     let expected: Vec<u8> = segs.iter().flatten().copied().collect();
     let mut files = HashMap::new();
-    files.insert(
-        "/live/index.m3u8".to_string(),
-        media_playlist(&["seg1.ts", "seg2.ts"], false).into_bytes(),
-    );
     for (i, s) in segs.iter().enumerate() {
-        files.insert(format!("/live/seg{}.ts", i + 1), s.clone());
+        files.insert(format!("/live/seg{i}.ts"), s.clone());
     }
-    let srv = start_hls_server(files, HashMap::new(), 0).await;
+    let (srv, _script) =
+        start_live_hls_server(vec![live_playlist(0, 2, false)], HashMap::new(), files).await;
 
     let mgr = TaskManager::start(dir.clone(), 2);
     let gid = mgr
         .add_uri(
             vec![srv.url("/live/index.m3u8")],
-            &serde_json::json!({"dir": dir}),
+            &serde_json::json!({"dir": dir, "hls-live-stall-timeout": "2"}),
             None,
         )
         .expect("addUri 应成功");
     let st = wait_status(&mgr, &gid, "complete", 30_000)
         .await
-        .expect("直播窗口快照也应完成");
+        .expect("停滞 2 秒后应正常收尾");
     assert_eq!(std::fs::read(file_of(&st)).unwrap(), expected);
     assert_eq!(file_of(&st).file_name().unwrap(), "live.ts");
+    assert_eq!(st["isLive"], true, "直播录制任务必须带 isLive 标记");
+    assert_eq!(
+        st["liveRecordedMs"].as_u64().unwrap_or(0),
+        2000,
+        "已录时长 = 2 段 × 1s"
+    );
 }
 
 /// 显式 `hls=false`：扩展名像清单也按普通 HTTP 整段下载。
@@ -1256,5 +1385,151 @@ async fn hls_total_length_converges_and_can_decrease() {
         diff * 100 <= (real_total as i64) * 30,
         "下载到 1/4 时总大小仍为 {q}，与真实 {real_total} 相差超过 30% —— \
          实测外推没有及时接管码率初值"
+    );
+}
+
+/// 直播跨多轮清单增长：每一段都录进产物，ENDLIST 一到就完成；状态里带
+/// `isLive` 与「已录制时长」（桌面卡片据此换形态）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hls_live_records_across_reloads_and_reports_recording_fields() {
+    let dir = tmpdir("live-record");
+    let seg_len = 16 * 1024usize;
+    let segs: Vec<Vec<u8>> = (0..4).map(|i| sample(i + 1, seg_len)).collect();
+    let expected: Vec<u8> = segs.iter().flatten().copied().collect();
+    let mut files = HashMap::new();
+    for (i, s) in segs.iter().enumerate() {
+        files.insert(format!("/live/seg{i}.ts"), s.clone());
+    }
+    let (srv, _script) = start_live_hls_server(
+        vec![
+            live_playlist(0, 1, false), // 第 1 轮：窗口 [0]
+            live_playlist(1, 2, false), // 第 2 轮：窗口 [1,2]
+            live_playlist(2, 2, true),  // 第 3 轮：窗口 [2,3] + ENDLIST
+        ],
+        HashMap::new(),
+        files,
+    )
+    .await;
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = mgr
+        .add_uri(
+            vec![srv.url("/live/index.m3u8")],
+            &serde_json::json!({"dir": dir, "hls-live-stall-timeout": "10"}),
+            None,
+        )
+        .expect("addUri 应成功");
+    let st = wait_status(&mgr, &gid, "complete", 40_000)
+        .await
+        .expect("ENDLIST 后应完成");
+    assert_eq!(std::fs::read(file_of(&st)).unwrap(), expected, "产物 = 全部段按序拼接");
+    assert_eq!(st["isLive"], true);
+    assert_eq!(
+        st["liveRecordedMs"].as_u64().unwrap_or(0),
+        4000,
+        "已录时长 = 4 段 × 1s"
+    );
+    assert_eq!(
+        st["totalLength"].as_u64().unwrap_or(0),
+        (4 * seg_len) as u64,
+        "完成后总长定格为产物长度"
+    );
+    for i in 0..4 {
+        assert_eq!(
+            srv.hits(&format!("/live/seg{i}.ts")),
+            1,
+            "第 {i} 段只该下载一次（跨轮去重）"
+        );
+    }
+}
+
+/// 直播暂停 → 恢复：已录前缀保住（不重下、不丢），窗口滑过的分片按丢失处理。
+/// 恢复时清单已带 ENDLIST —— 靠**直播现场**（控制文件）继续走录制路径收尾，
+/// 而不是退化成整片清单从头下（这正是 `has_live_ctrl` 的用途）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hls_live_pause_resume_keeps_recorded_prefix() {
+    let dir = tmpdir("live-pause");
+    let seg_len = 16 * 1024usize;
+    let segs: Vec<Vec<u8>> = (0..5).map(|i| sample(i + 11, seg_len)).collect();
+    let mut files = HashMap::new();
+    for (i, s) in segs.iter().enumerate() {
+        files.insert(format!("/live/seg{i}.ts"), s.clone());
+    }
+    // seg2 慢 1500ms：暂停点必然落在"前两段已录、seg2 还在下"的窗口里
+    let mut slow = HashMap::new();
+    slow.insert("/live/seg2.ts".to_string(), 1500u64);
+    let (srv, script) =
+        start_live_hls_server(vec![live_playlist(0, 3, false)], slow, files).await;
+
+    let mgr = TaskManager::start(dir.clone(), 2);
+    let gid = mgr
+        .add_uri(
+            vec![srv.url("/live/index.m3u8")],
+            &serde_json::json!({"dir": dir, "hls-live-stall-timeout": "30"}),
+            None,
+        )
+        .expect("addUri 应成功");
+    assert!(
+        wait_progress(&mgr, &gid, (2 * seg_len) as u64, 20_000).await,
+        "20s 内应录进前两段"
+    );
+    // 让"下载完成 → 按序拼接"落定（毫秒级），再暂停 —— 保证暂停点前面
+    // 恰好是两段完整的产物前缀
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    mgr.pause(&gid).expect("pause 应成功");
+    let st = wait_status(&mgr, &gid, "paused", 15_000)
+        .await
+        .expect("暂停未生效");
+    let file = file_of(&st);
+    assert!(
+        xfer_http::playlist_has_live_ctrl(&file),
+        "暂停后应留下直播现场（控制文件）"
+    );
+    let prefix_len = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        prefix_len >= (2 * seg_len) as u64,
+        "前两段应已拼进产物（实际 {prefix_len} 字节）"
+    );
+
+    // 恢复前：窗口已经跳过 seg2，且清单带上 ENDLIST（录制现场仍在）
+    script.lock().unwrap().push(live_playlist(3, 2, true));
+    mgr.unpause(&gid).expect("unpause 应成功");
+    let st = wait_status(&mgr, &gid, "complete", 40_000)
+        .await
+        .expect("恢复后应收尾成功");
+
+    let out = std::fs::read(file_of(&st)).unwrap();
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&segs[0]);
+    expected.extend_from_slice(&segs[1]);
+    expected.extend_from_slice(&segs[3]);
+    expected.extend_from_slice(&segs[4]);
+    assert_eq!(
+        out, expected,
+        "恢复后：已录前缀保住；窗口滑过的 seg2 按丢失处理，不凭空出现"
+    );
+    assert_eq!(srv.hits("/live/seg0.ts"), 1, "已录段不得重下");
+    assert_eq!(
+        srv.hits("/live/seg1.ts"),
+        1,
+        "已录段不得重下（seg1 的请求序列: {:?}）",
+        srv.ranges("/live/seg1.ts")
+    );
+    assert_eq!(
+        srv.hits("/live/seg3.ts"),
+        1,
+        "seg3 的请求序列: {:?}",
+        srv.ranges("/live/seg3.ts")
+    );
+    assert_eq!(
+        srv.hits("/live/seg4.ts"),
+        1,
+        "seg4 的请求序列: {:?}",
+        srv.ranges("/live/seg4.ts")
+    );
+    assert_eq!(
+        st["liveRecordedMs"].as_u64().unwrap_or(0),
+        4000,
+        "已录时长从现场（2s）继续累计新录的 2s"
     );
 }

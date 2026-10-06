@@ -12,9 +12,10 @@ mod testutil;
 pub use adaptive::{AdaptiveConfig, AdaptiveScheduler, ConnPerf, ScheduleAction};
 pub use playlist::{
     default_filename as playlist_default_filename, download_playlist, fetch_plan,
-    resume_point as playlist_resume_point, PlaylistDone, PlaylistOptions, PlaylistPlan,
-    PlaylistStats, Segment as PlaylistSegment, SegmentKey as PlaylistKey,
-    DEFAULT_SEGMENT_RETRIES,
+    has_live_ctrl as playlist_has_live_ctrl, live_resume_point as playlist_live_resume_point,
+    record_playlist, resume_point as playlist_resume_point, seg_dir_for as playlist_seg_dir,
+    PlaylistDone, PlaylistOptions, PlaylistPlan, PlaylistStats, Segment as PlaylistSegment,
+    SegmentKey as PlaylistKey, DEFAULT_SEGMENT_RETRIES,
 };
 pub use rate::RateLimiter;
 pub use split::{

@@ -214,7 +214,9 @@ xfer tui [-d dir] [-j max-concurrent]
   默认保存目录。
 - *HLS（M3U8）*：分片并发（`hls-concurrency`）、选流策略（`hls-variant` = 最高 /
   最低码率）、分片大小预探测（`hls-probe-size`）、单分片重试次数
-  （`hls-segment-retries`）、落盘方式（`hls-write-mode` = 乱序拼接 / 边下边排）。
+  （`hls-segment-retries`）、落盘方式（`hls-write-mode` = 乱序拼接 / 边下边排）、
+  直播清单（无 `#EXT-X-ENDLIST`）的持续录制：`hls-live-stall-timeout` 秒无新增
+  分片即收尾（`0` = 不按停滞自动收尾）。
 - *Tracker 与界面*：全局 tracker 列表、tracker 订阅源、界面语言
   （简体 / 繁体 / English，写入会话持久化）。下方「引擎」卡片显示引擎版本、
   运行时间、能力清单（`engine.getVersion` 的 `features`）、代理与会话文件状态。
@@ -391,7 +393,7 @@ xferrust --rpc-listen-port=6800 --rpc-secret=mytoken
 // 请求
 {"jsonrpc": "2.0", "id": 1, "method": "engine.getVersion", "params": {"token": "mytoken"}}
 // 成功响应
-{"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.3.2",
+{"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.3.5",
  "features": ["http", "resume", "checksum", "bt", "events", "bitfield",
               "wanted-bitfield", "ban-peer", "change-uri", "get-servers",
               "verify-files"]}}

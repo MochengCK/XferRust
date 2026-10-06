@@ -37,7 +37,10 @@
 //! - fMP4（CMAF）的 SAMPLE-AES / cenc / cbcs：需要按 `moof`/`senc` 逐样本解，
 //!   本版只做识别与报错；
 //! - DRM（FairPlay / Widevine / PlayReady）：密钥在授权服务器上，原理上拿不到；
-//! - 直播清单（无 `#EXT-X-ENDLIST`）：按"当前窗口快照"一次性下载；
+//! - 直播清单（无 `#EXT-X-ENDLIST`）：走**直播录制**（[`record_playlist`]）——
+//!   持续重拉清单、按媒体序号续录，直到 ENDLIST / 长时间无新分片 / 用户停止；
+//! - 纯低延迟清单（只有 `#EXT-X-PART`）：身份不稳定，仍按"当前窗口快照"一次性
+//!   下载并在日志中说明；
 //! - `#EXT-X-MEDIA` 的**独立音轨组**：见 [`choose_variant`] 的说明。
 
 mod crypto;
@@ -47,7 +50,7 @@ pub use crypto::{KeyFormat, KeyMethod, SegmentKey};
 
 use base64::Engine as _;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -136,6 +139,18 @@ pub struct Segment {
     /// 为了精确总长去逐个探测（756 个分片要打 756 个请求，用户看到的就是
     /// "半天没反应"），改成用「已下字节 ÷ 已覆盖时长」实时外推总长。
     pub duration: f64,
+    /// **媒体序号**（`#EXT-X-MEDIA-SEQUENCE` 起算，每个 URI 行 +1）。
+    ///
+    /// 直播录制靠它做**跨清单快照的身份**：滑窗每次刷新后，同一个分片的
+    /// 地址可能重新签名（逐字比对必然不相等），但序号恒定不变 —— 录过的不
+    /// 重下、没录的按序号补齐，全靠这一个数。初始化段（`#EXT-X-MAP`）取
+    /// **它后面第一个分片的序号**（见 `is_map`）。
+    pub seq: u64,
+    /// 是不是 fMP4 初始化段（`#EXT-X-MAP`，含中途更换的那一个）。
+    ///
+    /// 初始化段在"序号空间"里排在**同一 seq 的媒体分片之前**（录制时按
+    /// `(seq, is_map)` 排序拼接）。普通媒体分片恒为 false。
+    pub is_map: bool,
 }
 
 /// 已解析的下载计划（引擎据此决定文件名、总长与分片位图粒度）。
@@ -176,6 +191,16 @@ pub struct PlaylistPlan {
     /// **没有声音的视频**。置这一位是为了让上层能把话说清楚（日志 / 界面提示），
     /// 而不是让用户拿到一个静音文件还以为下载器坏了。
     pub separate_audio: bool,
+    /// `#EXT-X-TARGETDURATION`（秒，0 = 清单没写）。直播录制的**清单轮询
+    /// 节奏**按它取半：目标时长是分片产出的最大间隔，比它更稀地拉清单就会
+    /// 漏分片。
+    pub target_duration: f64,
+    /// 纯低延迟清单（只有 `#EXT-X-PART`、连一个整段分片都没有）。
+    ///
+    /// 这类清单的"分片"是同一媒体序号下不断增补的切片，**没有稳定的跨快照
+    /// 身份**（序号不随 part 推进），不是直播录制能依赖的对象：引擎对它保持
+    /// 旧的"当前窗口快照一次性下载"行为，并如实标注。
+    pub parts_only: bool,
 }
 
 impl PlaylistPlan {
@@ -213,7 +238,19 @@ pub struct PlaylistOptions {
     /// 单路）；② 进度只能吸附"光标那一段"的速度，总速度与进度显示对不上
     /// （用户报"速度几 MB、文件却几 KB 几 KB 地涨"）。乱序落盘把每个分片
     /// 直接写进磁盘（不占内存），进度就是磁盘上的真实字节数，与速度一致。
+    ///
+    /// **直播录制恒走乱序落盘**（那条路径没有"整条计划"的概念），本开关只
+    /// 影响整片清单。
     pub ordered_write: bool,
+    /// 直播录制的**停滞判定**：清单连续这么久没有新增分片（且已录到窗口
+    /// 末尾）即视为"直播已结束"，录制正常收尾。
+    ///
+    /// 为什么需要它：不少站点的"直播"清单实际是**不带 `#EXT-X-ENDLIST` 的
+    /// 点播列表**（窗口已经封口、只是不肯声明）；没有这一档，这类任务会永远
+    /// "录制中"。默认 120 秒 —— 真实直播的分片间隔在 2~10 秒量级，两分钟
+    /// 没有任何新增足以判定源已停播；`Duration::ZERO` = 不自动收尾（只认
+    /// `#EXT-X-ENDLIST` 与手动停止）。
+    pub live_stall_timeout: Duration,
 }
 
 impl Default for PlaylistOptions {
@@ -227,6 +264,8 @@ impl Default for PlaylistOptions {
             headers: Vec::new(),
             // 默认乱序：见字段说明（内存/吞吐/进度三者都更好）
             ordered_write: false,
+            // 两分钟无新增分片 → 视为直播结束（见字段说明）
+            live_stall_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -293,6 +332,13 @@ pub struct PlaylistStats {
     /// 模式的进度**恰好等于磁盘上的真实字节**，与 `speed` 对得上。拼接时它们
     /// 只是"转移"（`spilled` 减该段长度、`completed` 加同样多），进度单调不减。
     pub spilled: AtomicU64,
+    /// 直播录制的**已录制媒体时长**（毫秒）。
+    ///
+    /// 口径 = 已拼进产物的媒体分片 `#EXTINF` 之和（初始化段不计）——
+    /// 它等于"产物这个文件能播多长"，与"从按下录制过去了多久"是两回事
+    /// （网络中断/追帧时两者会分叉，用户关心的是前者）。
+    /// 非直播任务恒为 0。
+    pub live_ms: AtomicU64,
     /// 是否乱序落盘（决定 [`Self::progress`] 的口径）。
     unordered: AtomicBool,
     /// 每个分片各自的已接收字节（按绝对序号，按需增长）。
@@ -314,9 +360,15 @@ impl PlaylistStats {
             sizes: Mutex::new(Vec::new()),
             seg_total: AtomicUsize::new(0),
             spilled: AtomicU64::new(0),
+            live_ms: AtomicU64::new(0),
             unordered: AtomicBool::new(false),
             slots: Mutex::new(Vec::new()),
         })
+    }
+
+    /// 直播录制的已录媒体时长（毫秒）。
+    pub fn live_recorded_ms(&self) -> u64 {
+        self.live_ms.load(Ordering::Relaxed)
     }
 
     /// 预置分片总数（段数已知时调用，让"全部确知"的判定能提前成立）。
@@ -697,6 +749,10 @@ struct MediaPlaylist {
     live: bool,
     /// 清单里出现过 `#EXT-X-MAP`（fMP4/CMAF 的初始化段）。
     fmp4: bool,
+    /// `#EXT-X-TARGETDURATION`（秒，0 = 未声明）。
+    target_duration: f64,
+    /// 整段分片一个都没有、退回用 `#EXT-X-PART` 顶替（见 [`parse_media`] 末尾）。
+    parts_only: bool,
     /// 解不出来的原因（DRM / 未知加密方式）：由调用方决定怎么报。
     ///
     /// 不在解析中途直接 `Err`：解析器要能把整条清单读完，才能给出**完整**的
@@ -805,6 +861,11 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
             sequence = rest.trim().parse().unwrap_or(0);
             continue;
         }
+        if let Some(rest) = line.strip_prefix("#EXT-X-TARGETDURATION:") {
+            // 直播录制的轮询节奏依据（取半）；解析不出就按 0（上层回退用均值）
+            out.target_duration = rest.trim().parse::<f64>().unwrap_or(0.0).max(0.0);
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("#EXT-X-DISCONTINUITY-SEQUENCE:") {
             // 只影响 IV 推导的起点（已在 MEDIA-SEQUENCE 里体现），这里认得即可
             let _ = rest;
@@ -903,6 +964,10 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
                 key: None,
                 size: range.map(|(_, len)| len),
                 duration: 0.0,
+                // 排在**它后面第一个分片**的位置之前：先取当前计数器，
+                // 收尾时会把它校正到实际的第一段序号（见函数末尾）
+                seq: sequence,
+                is_map: true,
             };
             out.fmp4 = true;
             match &current_map {
@@ -954,6 +1019,11 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
                     key: key.as_ref().map(|k| k.resolve(sequence)),
                     size: None,
                     duration,
+                    // 纯 LL-HLS 的 part 没有稳定的跨快照序号（所有 part 共享
+                    // 当前计数器的值）；它们不参与直播录制的身份判定，
+                    // 这里如实标注即可（见 `parts_only`）。
+                    seq: sequence,
+                    is_map: false,
                 });
             }
             continue;
@@ -1004,10 +1074,20 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
             key: key.as_ref().map(|k| k.resolve(sequence)),
             size: range.map(|(_, len)| len),
             duration,
+            seq: sequence,
+            is_map: false,
         });
         sequence += 1;
     }
     out.live = !endlist;
+    // 初始化段的序号校正：它要排在"它后面第一个分片"之前 —— 若 `EXT-X-MAP`
+    // 出现在 `EXT-X-MEDIA-SEQUENCE` 之前（少数站点这么写），解析中途拿到的
+    // 计数器还是 0，这里用实际第一段的序号覆盖（列表为空时保持原值）。
+    if let Some(first) = out.segments.first() {
+        if let Some(init) = out.init.as_mut() {
+            init.seq = first.seq;
+        }
+    }
     // 纯 LL-HLS（只有 #EXT-X-PART、没有整段）：用部分分片顶。
     // 这些分片本身就是合法的 CMAF 分片，顺序拼接同样能播。
     if out.segments.is_empty() && !parts.is_empty() {
@@ -1016,6 +1096,7 @@ fn parse_media(text: &str, base: &Url) -> Result<MediaPlaylist, String> {
             "清单只有 #EXT-X-PART（纯低延迟），按部分分片下载"
         );
         out.segments = parts;
+        out.parts_only = true;
     }
     Ok(out)
 }
@@ -1153,11 +1234,15 @@ pub async fn fetch_plan(
             duration_secs,
             bitrate,
             separate_audio,
+            target_duration: media.target_duration,
+            parts_only: media.parts_only,
         };
         if plan.segment_count() == 0 {
             return Err(HttpError::Protocol("播放列表中没有可下载的分片".into()));
         }
-        if opts.probe_sizes {
+        // 直播清单**不做**大小预探测：它的"总长"没有意义（窗口还在生长），
+        // 而预探测的 1 字节请求会跟录制器下载首段抢跑（白打一轮分片请求）。
+        if opts.probe_sizes && !plan.live {
             probe_segment_sizes(client, &mut plan, cancel, headers, opts.concurrency).await;
         } else {
             plan.total = sum_sizes(&plan);
@@ -1400,6 +1485,20 @@ struct PlaylistCtrl {
     /// 段大小未知），所以"完整"必须记在这里。
     #[serde(default)]
     mask: String,
+    /// **直播录制**（`mode == "live"`）：下一个待拼接的**媒体序号**。
+    ///
+    /// 直播的"已有多少"不能用段数表示（序号会跳过、窗口会滑），用序号本身
+    /// 才是稳定水位：恢复后 `seq` 之前的段一律不重下。
+    #[serde(default)]
+    seq: u64,
+    /// **直播录制**：已录媒体时长（毫秒） = 已拼媒体分片 `#EXTINF` 之和。
+    /// UI 的"已录制时长"（产物能播多长），与"从开始录制过去了多久"无关。
+    #[serde(default)]
+    live_ms: u64,
+    /// **直播录制**：最后写进产物的初始化段（`#EXT-X-MAP`）身份
+    /// （[`map_stable_key`]）。防恢复后把已经在产物开头的 init 再插一份。
+    #[serde(default)]
+    map: String,
 }
 
 /// 乱序落盘的模式标记（控制文件里的 `mode` 字段）。
@@ -2574,6 +2673,10 @@ async fn download_playlist_unordered(
         part: 0,
         mode: CTRL_MODE_UNORDERED.to_string(),
         mask: mask_to_hex(done),
+        // 直播专用字段：整片清单路径恒为空
+        seq: 0,
+        live_ms: 0,
+        map: String::new(),
     };
     // 已完成段的时长合计：乱序下"已覆盖时长"不能用前缀算（段是乱序完成的），
     // 用已完成段的时长和 —— 段大小/时长的比例在整条流上是稳定的，够用
@@ -3009,6 +3112,10 @@ async fn download_playlist_ordered(
         part,
         mode: String::new(),
         mask: String::new(),
+        // 直播专用字段：整片清单路径恒为空
+        seq: 0,
+        live_ms: 0,
+        map: String::new(),
     };
 
     // 重排窗口：**在飞下载**与**已下好待写**分开计。
@@ -3194,6 +3301,937 @@ async fn download_playlist_ordered(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 直播录制
+// ---------------------------------------------------------------------------
+
+/// `mode == "live"` 的控制文件：直播录制的断点现场。
+const CTRL_MODE_LIVE: &str = "live";
+
+/// 直播清单的轮询节奏 = `#EXT-X-TARGETDURATION / 2`（夹在 0.5~30 秒之间）。
+///
+/// 为什么取半：目标时长是分片产出的**最大**间隔，按正它走，一次服务器哆嗦
+/// 就会整段踩进滑窗盲区；取半后每个分片至少有两次拉清单的机会。
+/// 目标时长缺失时用「总时长 ÷ 段数」的均值兜底，再不行按 4 秒。
+fn live_reload_interval(plan: &PlaylistPlan) -> Duration {
+    let t = if plan.target_duration > 0.0 {
+        plan.target_duration
+    } else if plan.duration_secs > 0.0 && !plan.segments.is_empty() {
+        plan.duration_secs / plan.segments.len() as f64
+    } else {
+        4.0
+    };
+    Duration::from_millis(((t / 2.0) * 1000.0) as u64)
+        .clamp(Duration::from_millis(500), Duration::from_secs(30))
+}
+
+/// 直播分片（或初始化段）的段文件：文件名是**媒体序号**（10 位补零便于浏览；
+/// 初始化段加 `m` 后缀）。跨快照身份 = 序号，段文件也随之按序号落。
+fn live_seg_file(path: &Path, seq: u64, is_map: bool) -> PathBuf {
+    seg_dir(path).join(if is_map {
+        format!("{seq:010}m")
+    } else {
+        format!("{seq:010}")
+    })
+}
+
+/// 解析段文件名 → `(序号, 是否初始化段)`；不是本模式的命名就返回 None。
+fn parse_live_seg_name(name: &str) -> Option<(u64, bool)> {
+    if let Some(digits) = name.strip_suffix('m') {
+        return digits.parse().ok().map(|s| (s, true));
+    }
+    name.parse().ok().map(|s| (s, false))
+}
+
+/// 直播段目录里的字节合计（= 已下到磁盘、还没拼进产物的字节）。
+fn live_spilled_bytes(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(rd) = std::fs::read_dir(seg_dir(path)) {
+        for e in rd.flatten() {
+            total = total.saturating_add(e.metadata().map(|m| m.len()).unwrap_or(0));
+        }
+    }
+    total
+}
+
+/// 清掉**永远不会被拼接**的残留段文件（序号已落在待拼光标之前）。
+fn sweep_live_seg_files(path: &Path, head_seq: u64) {
+    if let Ok(rd) = std::fs::read_dir(seg_dir(path)) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if let Some((seq, _)) = parse_live_seg_name(&name) {
+                if seq < head_seq {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+}
+
+/// 初始化段的身份：稳定地址 + 区间（签名轮换不影响同一段）。
+fn map_stable_key(seg: &Segment) -> String {
+    match seg.range {
+        Some((o, l)) => format!("{}#{o}:{l}", stable_url(&seg.url)),
+        None => stable_url(&seg.url),
+    }
+}
+
+/// 读**直播**控制文件（不校验清单指纹 —— 直播的滑窗指纹必然变，
+/// 流身份由 [`live_ctrl_matches`] 用"稳定清单地址"判定）。
+fn load_live_ctrl_raw(path: &Path) -> Option<PlaylistCtrl> {
+    let ctrl = xfer_storage::ctrl_path(path);
+    let raw = std::fs::read_to_string(ctrl).ok()?;
+    let c: PlaylistCtrl = serde_json::from_str(&raw).ok()?;
+    if c.kind != CTRL_KIND || c.mode != CTRL_MODE_LIVE {
+        return None;
+    }
+    Some(c)
+}
+
+/// 直播现场是不是同一条流：两边清单地址的**稳定形态**一致即可
+/// （逐字比对在直播上必然失败 —— 令牌与重定向每轮都在换）。
+fn live_ctrl_matches(c: &PlaylistCtrl, plan: &PlaylistPlan) -> bool {
+    !c.url.is_empty() && stable_url(&c.url) == stable_url(&plan.source)
+}
+
+/// 产物旁边是否存在**直播录制**的控制文件。
+///
+/// 引擎用它决定走哪条驱动：直播流结束后清单会带上 `#EXT-X-ENDLIST`
+/// （`plan.live` 变 false），但录制现场还在 —— 不能因为"现在看着不像直播"
+/// 就把断点现场丢掉、退化成整片清单路径从头下。
+pub fn has_live_ctrl(path: &Path) -> bool {
+    load_live_ctrl_raw(path).is_some()
+}
+
+/// 播放列表任务的**中间段目录**（`<产物>.hlseg/`：乱序落盘的段文件、
+/// 直播录制的按序号段文件）。引擎删除任务时用它清残留。
+pub fn seg_dir_for(path: &Path) -> PathBuf {
+    seg_dir(path)
+}
+
+/// 直播录制的续传水位：`(已落盘字节, 已录媒体时长毫秒)`。
+///
+/// 与 [`record_playlist`] 内部的初始化**共用同一份判定**（引擎侧进度基线
+/// 与录制器起点必须逐字节一致，否则恢复第一帧就会倒退）。
+pub fn live_resume_point(path: &Path, plan: &PlaylistPlan) -> Option<(u64, u64)> {
+    let c = load_live_ctrl_raw(path)?;
+    if !live_ctrl_matches(&c, plan) {
+        return None;
+    }
+    let disk_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if disk_len < c.bytes {
+        // 产物比控制文件短：现场被动过 → 整份丢掉重来（不拼来源不明的半截）
+        return None;
+    }
+    Some((c.bytes, c.live_ms))
+}
+
+/// 一件活的在途状态。
+#[derive(Debug)]
+enum LiveItemState {
+    /// 在队列里（`retry_at` = 重试不早于该时刻）。
+    Queued { retry_at: Option<std::time::Instant> },
+    /// 有 future 在飞。
+    Inflight,
+    /// 整段已落到自己的段文件里，等按序拼接。
+    Done,
+    /// 重试耗尽：等窗口滑过被丢弃，或顶住拼接点时上抛错误。
+    Failed,
+}
+
+/// 队列里的一件活：媒体分片或初始化段。
+#[derive(Debug)]
+struct LiveItem {
+    seg: Segment,
+    state: LiveItemState,
+    /// 已经试过几次（每次失败 +1，成功清零）。
+    attempts: u32,
+}
+
+impl LiveItem {
+    fn queued(seg: Segment) -> Self {
+        Self {
+            seg,
+            state: LiveItemState::Queued { retry_at: None },
+            attempts: 0,
+        }
+    }
+
+    fn is_queued(&self) -> bool {
+        matches!(self.state, LiveItemState::Queued { .. })
+    }
+}
+
+/// 派发目标的身份（初始化段单独一档：它悬在"下一个媒体段之前"）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveKey {
+    LeadingMap,
+    Map(u64),
+    Seg(u64),
+}
+
+/// 直播录制的状态机（不含 sink / future，纯数据 + 序号推进）。
+struct LiveState {
+    /// 下一个待拼接的**媒体序号**。
+    head_seq: u64,
+    /// 见过的最大媒体序号（窗口尾部；停滞判定的锚点）。
+    win_tail: u64,
+    /// 清单已声明结束（`#EXT-X-ENDLIST` / 持续 404）。
+    stream_end: bool,
+    /// 已收到 ENDLIST 或持续 404：不再拉清单。
+    reload_stopped: bool,
+    /// 媒体分片：序号 → 状态。
+    segs: BTreeMap<u64, LiveItem>,
+    /// 中途更换的初始化段：**它后面第一个媒体段的序号** → 状态。
+    maps: BTreeMap<u64, LiveItem>,
+    /// 悬空的初始化段：必须写在**下一个拼接的媒体段之前**（录制起点 /
+    /// 恢复后首段用）。序号绑定对它不适用 —— 它跟着下一段走，窗口跳变也不丢。
+    leading_map: Option<LiveItem>,
+    /// 已经入过队/写过的初始化段身份（跨快照去重：EXT-X-MAP 每轮清单都会
+    /// 重播一遍，按地址逐字比对必重；序号那套身份对 map 也不成立）。
+    map_seen: HashSet<String>,
+    /// 最后写进产物的初始化段身份（续传时从控制文件恢复）。
+    written_map: Option<String>,
+    /// 已拼接的段数（含初始化段；控制文件 `prefix`）。
+    spliced_total: usize,
+    /// 因窗口滑过而永久跳过的段数（诊断）。
+    skipped: u64,
+    /// 最后一次**有新增分片**的时刻（停滞判定）。
+    last_new_at: std::time::Instant,
+    /// 最后一次**成功拉到清单**的时刻（清单一直拉不到时不得判定停滞）。
+    last_ok_reload: std::time::Instant,
+    /// 清单连续失败次数（退避用）。
+    fail_streak: u32,
+    /// 清单连续 404/410 次数（≥ 阈值视为"直播已结束"）。
+    gone_streak: u32,
+}
+
+impl LiveState {
+    /// 把一份清单快照并入状态：新段入队、未开工的刷地址、窗口跳变丢死段。
+    ///
+    /// 返回本轮**新增**的条目数（0 = 这条流没有新内容 —— 停滞判定的输入）。
+    fn apply(&mut self, plan: &PlaylistPlan, path: &Path) -> usize {
+        let Some(first) = plan.segments.first() else {
+            return 0;
+        };
+        let win_start = first.seq;
+        if let Some(last) = plan.segments.last() {
+            self.win_tail = self.win_tail.max(last.seq);
+        }
+        // 1) 窗口滑过了、且还没开工（或已判死）的段：永久跳过。
+        //    在飞的照旧等结果 —— 老地址可能还能下完。
+        let mut advanced = 0u64;
+        if win_start > self.head_seq {
+            let stale: Vec<u64> = self
+                .segs
+                .range(self.head_seq..win_start)
+                .filter(|(_, it)| {
+                    matches!(it.state, LiveItemState::Queued { .. } | LiveItemState::Failed)
+                })
+                .map(|(s, _)| *s)
+                .collect();
+            for s in stale {
+                self.segs.remove(&s);
+                advanced += 1;
+                let _ = std::fs::remove_file(live_seg_file(path, s, false));
+            }
+            // 推进待拼光标：跳过的序号里没有任何可拼/可等的东西
+            while self.head_seq < win_start && !self.segs.contains_key(&self.head_seq) {
+                self.maps.remove(&self.head_seq);
+                self.head_seq += 1;
+                advanced += 1;
+            }
+            if advanced > 0 {
+                tracing::warn!(
+                    head = self.head_seq,
+                    win_start,
+                    skipped = advanced,
+                    "直播窗口已滑过 {advanced} 个未完成分片（录制跟不上产出），按丢失处理"
+                );
+                self.skipped += advanced;
+            }
+        }
+        // 2) 初始化段（顶层 init + 中途更换的内联 map）
+        let mut added = 0usize;
+        if let Some(init) = &plan.init {
+            live_consider_map(self, init, None, &mut added);
+        }
+        for s in &plan.segments {
+            if s.is_map {
+                live_consider_map(self, s, Some(s.seq), &mut added);
+            }
+        }
+        // 3) 媒体段：收新的、刷旧的（令牌轮换后旧地址会失效）
+        for s in &plan.segments {
+            if s.is_map || s.seq < self.head_seq {
+                continue;
+            }
+            match self.segs.get_mut(&s.seq) {
+                Some(it) => match it.state {
+                    LiveItemState::Queued { .. } => it.seg = s.clone(),
+                    // 判死过的段：换了签名等于换了张入场券，给最后一次机会
+                    LiveItemState::Failed
+                        if stable_url(&it.seg.url) != stable_url(&s.url) =>
+                    {
+                        it.seg = s.clone();
+                        it.state = LiveItemState::Queued { retry_at: None };
+                        it.attempts = 0;
+                    }
+                    _ => {}
+                },
+                None => {
+                    self.segs.insert(s.seq, LiveItem::queued(s.clone()));
+                    added += 1;
+                }
+            }
+        }
+        // 4) 结束标记
+        if !plan.live {
+            self.stream_end = true;
+            self.reload_stopped = true;
+        }
+        if added > 0 {
+            self.last_new_at = std::time::Instant::now();
+        }
+        added
+    }
+
+    /// 取一件可以开工的活（按"最接近拼接点"排序），并把它标记为在飞。
+    fn take_for_dispatch(&mut self, now: std::time::Instant) -> Option<(LiveKey, Segment)> {
+        fn due(st: &LiveItemState, now: std::time::Instant) -> bool {
+            match st {
+                LiveItemState::Queued { retry_at } => retry_at.map_or(true, |t| t <= now),
+                _ => false,
+            }
+        }
+        if let Some(m) = self.leading_map.as_mut() {
+            if due(&m.state, now) {
+                m.state = LiveItemState::Inflight;
+                return Some((LiveKey::LeadingMap, m.seg.clone()));
+            }
+        }
+        for (seq, m) in self.maps.iter_mut() {
+            if due(&m.state, now) {
+                m.state = LiveItemState::Inflight;
+                return Some((LiveKey::Map(*seq), m.seg.clone()));
+            }
+        }
+        for (seq, s) in self.segs.iter_mut() {
+            if due(&s.state, now) {
+                s.state = LiveItemState::Inflight;
+                return Some((LiveKey::Seg(*seq), s.seg.clone()));
+            }
+        }
+        None
+    }
+
+    /// 某件活的段文件路径。
+    fn file_of(&self, path: &Path, key: LiveKey) -> PathBuf {
+        match key {
+            LiveKey::LeadingMap => live_seg_file(path, 0, true),
+            LiveKey::Map(seq) => live_seg_file(path, seq, true),
+            LiveKey::Seg(seq) => live_seg_file(path, seq, false),
+        }
+    }
+
+    /// 拼接**最多一件**：按「悬空 init → 序号绑定的 init → 媒体段」的顺序，
+    /// 遇到没下完的当即停（顺序拼接的硬约束）。
+    ///
+    /// 返回 `(搬运字节数, 媒体时长毫秒)`；没有可拼的返回 `None`。
+    fn splice_one(
+        &mut self,
+        path: &Path,
+        sink: &mut xfer_storage::FileSink,
+    ) -> Result<Option<(u64, u64)>, HttpError> {
+        let leading_done = self
+            .leading_map
+            .as_ref()
+            .is_some_and(|m| matches!(m.state, LiveItemState::Done));
+        if leading_done {
+            let m = self.leading_map.take().expect("上面刚判过 Some");
+            let moved = splice_seg(&live_seg_file(path, 0, true), sink)?;
+            self.written_map = Some(map_stable_key(&m.seg));
+            self.spliced_total += 1;
+            return Ok(Some((moved, 0)));
+        }
+        if self.leading_map.is_some() {
+            return Ok(None);
+        }
+        let map_done = self
+            .maps
+            .get(&self.head_seq)
+            .is_some_and(|m| matches!(m.state, LiveItemState::Done));
+        if map_done {
+            let m = self
+                .maps
+                .remove(&self.head_seq)
+                .expect("上面刚判过 Some");
+            let moved = splice_seg(&live_seg_file(path, self.head_seq, true), sink)?;
+            self.written_map = Some(map_stable_key(&m.seg));
+            self.spliced_total += 1;
+            return Ok(Some((moved, 0)));
+        }
+        if self.maps.contains_key(&self.head_seq) {
+            return Ok(None);
+        }
+        let seg_done = self
+            .segs
+            .get(&self.head_seq)
+            .is_some_and(|it| matches!(it.state, LiveItemState::Done));
+        if !seg_done {
+            return Ok(None);
+        }
+        let it = self.segs.remove(&self.head_seq).expect("上面刚判过 Some");
+        let moved = splice_seg(&live_seg_file(path, self.head_seq, false), sink)?;
+        let dur_ms = (it.seg.duration.max(0.0) * 1000.0).round() as u64;
+        self.head_seq += 1;
+        self.spliced_total += 1;
+        Ok(Some((moved, dur_ms)))
+    }
+
+    /// 是否已经"录到干净"：没有可拼/可下的东西，且光标越过了已知窗口尾部。
+    fn drained(&self) -> bool {
+        self.leading_map.is_none()
+            && self.head_seq > self.win_tail
+            && !self.segs.contains_key(&self.head_seq)
+            && !self.maps.contains_key(&self.head_seq)
+    }
+
+    /// 拼接点是否被一个**重试耗尽**的条目顶死。
+    fn blocked_failed(&self) -> bool {
+        if self
+            .leading_map
+            .as_ref()
+            .is_some_and(|m| matches!(m.state, LiveItemState::Failed))
+        {
+            return true;
+        }
+        if self
+            .maps
+            .get(&self.head_seq)
+            .is_some_and(|m| matches!(m.state, LiveItemState::Failed))
+        {
+            return true;
+        }
+        self.segs
+            .get(&self.head_seq)
+            .is_some_and(|s| matches!(s.state, LiveItemState::Failed))
+    }
+}
+
+/// 把一段初始化段并入队列（跨快照去重：身份 = 稳定地址 + 区间）。
+///
+/// - 已经入过队/写过：只刷新地址（签名轮换），位置不动；
+/// - `seq_bound = Some(seq)` 且在未来：钉在"它后面第一个媒体段"之前；
+/// - 其余（顶层 init / 已经轮到）：悬在下一个拼接点之前。
+fn live_consider_map(st: &mut LiveState, seg: &Segment, seq_bound: Option<u64>, added: &mut usize) {
+    let sk = map_stable_key(seg);
+    if st.map_seen.contains(&sk) {
+        let refresh = |it: &mut LiveItem| {
+            if it.is_queued() {
+                it.seg.url = seg.url.clone();
+                it.seg.key = seg.key.clone();
+            }
+        };
+        if let Some(m) = st.leading_map.as_mut() {
+            if map_stable_key(&m.seg) == sk {
+                refresh(m);
+                return;
+            }
+        }
+        for m in st.maps.values_mut() {
+            if map_stable_key(&m.seg) == sk {
+                refresh(m);
+                return;
+            }
+        }
+        return;
+    }
+    st.map_seen.insert(sk);
+    match seq_bound {
+        Some(seq) if seq > st.head_seq => {
+            let mut m = LiveItem::queued(seg.clone());
+            m.seg.seq = seq;
+            m.seg.is_map = true;
+            st.maps.insert(seq, m);
+        }
+        _ => {
+            if st.leading_map.is_none() {
+                let mut m = LiveItem::queued(seg.clone());
+                m.seg.is_map = true;
+                st.leading_map = Some(m);
+            }
+        }
+    }
+    *added += 1;
+}
+
+/// 直播录制的失败重试上限（单个分片）：超过就转为 `Failed`。
+const LIVE_SEG_MAX_ATTEMPTS: u32 = 6;
+/// 直播录制的清单 404/410 连续次数上限：到这个数视为直播已结束。
+const LIVE_GONE_LIMIT: u32 = 6;
+
+/// **HLS 直播录制**：把一棵还在生长的清单持续拉成产物。
+///
+/// 与整片清单下载的根本差别：没有"全部段"这个概念，清单只是**某一刻的窗口**。
+/// 录制循环按 `#EXT-X-TARGETDURATION / 2` 的节奏重拉清单，用**媒体序号**
+/// 判定新旧（签名轮换/换域名都不影响），新段入队并发下载，按序号顺序拼进
+/// 产物；直到出现 `#EXT-X-ENDLIST`（正常收尾）、清单长时间不再新增
+/// （[`PlaylistOptions::live_stall_timeout`]，收尾）、地址持续 404（收尾），
+/// 或用户暂停/删除（取消，保存现场）。
+///
+/// 断点现场（控制文件 `mode=="live"`）：产物字节数 + 下一个待拼序号 +
+/// 已录时长 + 已写初始化段身份；恢复时对仍在窗口里的段发 `Range` 续传，
+/// 对已滑过的段按丢失处理并**如实记录**。
+///
+/// `reload_url` = 用户最初给的那条清单地址（每轮重拉走它 —— 主清单重定向/
+/// 换变体都归 [`fetch_plan`] 管，录制器不自己决定变体）。
+pub async fn record_playlist(
+    client: &reqwest::Client,
+    path: &Path,
+    plan: &PlaylistPlan,
+    reload_url: &str,
+    opts: &PlaylistOptions,
+    cancel: &CancellationToken,
+    stats: Arc<PlaylistStats>,
+) -> Result<PlaylistDone, HttpError> {
+    use xfer_storage::FileSink;
+
+    if plan.parts_only || plan.segments.is_empty() {
+        return Err(HttpError::Protocol(
+            "低延迟直播清单（只有 #EXT-X-PART、没有整段分片）暂不支持持续录制".into(),
+        ));
+    }
+
+    let ctrl_path = xfer_storage::ctrl_path(path);
+    // 续传现场：必须同一模式 + 同一条流 + 产物不小于控制文件水位
+    // （注意 `load_live_ctrl_raw` 收的是**产物路径**，它自己会去算控制文件路径）
+    let ctrl_file = load_live_ctrl_raw(path).filter(|c| live_ctrl_matches(c, plan));
+    let mut resume: Option<PlaylistCtrl> = None;
+    if let Some(c) = ctrl_file {
+        let disk_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if disk_len >= c.bytes {
+            resume = Some(c);
+        } else {
+            // 产物比控制文件短：现场被动过 → 整份丢掉重来（不拼来源不明的半截）
+            tracing::warn!("直播现场与产物不一致，重新开始录制");
+        }
+    }
+    let (bytes0, head0, ms0, segs0, map0) = match &resume {
+        Some(c) => (c.bytes, c.seq, c.live_ms, c.prefix, Some(c.map.clone())),
+        None => (0u64, 0u64, 0u64, 0usize, None),
+    };
+    if resume.is_none() {
+        // 全新开始：清掉旧段目录（不能复用来历不明的半截），产物交给 create 截断
+        let _ = std::fs::remove_dir_all(seg_dir(path));
+    } else {
+        // 恢复：截断产物到控制文件水位（丢弃上次未 flush 的尾巴），
+        // 清掉光标之前的残留段文件
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_len(bytes0))
+            .map_err(|e| HttpError::Io(e.to_string()))?;
+        sweep_live_seg_files(path, head0);
+    }
+    let mut sink = if bytes0 > 0 {
+        FileSink::append_at(path, bytes0).map_err(|e| HttpError::Io(e.to_string()))?
+    } else {
+        FileSink::create(path).map_err(|e| HttpError::Io(e.to_string()))?
+    };
+
+    // 进度口径：与乱序落盘一致 —— 进度 = 产物 + 段文件的真实字节数
+    stats.mark_unordered();
+    stats.completed.store(bytes0, Ordering::Relaxed);
+
+    let mut state = LiveState {
+        // 全新：从初始窗口的第一段开始；恢复：从控制文件的光标继续
+        head_seq: if resume.is_none() {
+            plan.segments.first().map(|s| s.seq).unwrap_or(0)
+        } else {
+            head0
+        },
+        win_tail: 0,
+        stream_end: false,
+        reload_stopped: false,
+        segs: BTreeMap::new(),
+        maps: BTreeMap::new(),
+        leading_map: None,
+        map_seen: HashSet::new(),
+        written_map: map0.filter(|s| !s.is_empty()),
+        spliced_total: segs0,
+        skipped: 0,
+        last_new_at: std::time::Instant::now(),
+        last_ok_reload: std::time::Instant::now(),
+        fail_streak: 0,
+        gone_streak: 0,
+    };
+    if let Some(w) = &state.written_map {
+        state.map_seen.insert(w.clone());
+    }
+    // 首帧清单：新段入队（恢复时自动跳过 `head_seq` 之前的已录段）。
+    // 之后**再清一次**段目录：首帧的窗口跳变可能把光标推得更远，此后
+    // 光标之前的一切残段（含上次暂停留下的半截）都永远不会被拼接 ——
+    // 不清掉它们会被 "spilled" 当成本盘的已录字节，进度从此虚高。
+    state.apply(plan, path);
+    sweep_live_seg_files(path, state.head_seq);
+    stats
+        .spilled
+        .store(live_spilled_bytes(path), Ordering::Relaxed);
+    stats.live_ms.store(ms0, Ordering::Relaxed);
+
+    let ctx = Ctx {
+        client,
+        cancel,
+        limiter: opts.limiter.as_deref(),
+        headers: &opts.headers,
+        retries: opts.retries.max(1),
+        stats: &stats,
+        keys: Mutex::new(HashMap::new()),
+    };
+    let conn = opts.concurrency.clamp(1, 64);
+    // 重拉清单用的选项：绝不预探测分片大小（直播的"总长"没有意义），
+    // 其余（选流偏好 / 逐任务头 / 限速器）沿用。
+    let reload_opts = {
+        let mut o = opts.clone();
+        o.probe_sizes = false;
+        o
+    };
+    let reload_interval = live_reload_interval(plan);
+    let stall_timeout = opts.live_stall_timeout;
+    let reload_cancel = cancel.child_token();
+    let (rtx, mut rrx) = tokio::sync::mpsc::channel::<Result<PlaylistPlan, HttpError>>(2);
+    let _rtx_keepalive = rtx.clone();
+
+    let mut futs: FuturesUnordered<BoxFuture<'_, (LiveKey, Result<SegBody, HttpError>)>> =
+        FuturesUnordered::new();
+    let mut inflight = 0usize;
+    let mut next_reload_at = std::time::Instant::now() + reload_interval;
+    let mut reload_inflight = false;
+    let mut last_save = std::time::Instant::now() - CTRL_SAVE_INTERVAL;
+    // 自上次落盘以来有没有新的拼接（决定要不要周期性 flush + 存现场）。
+    // **不能只看"这一轮有没有搬东西"**：直播的拼接是零星发生的（一段一段
+    // 落地），若只在"正好搬了东西的那一轮"里检查节流，产物会长时间停在
+    // 512KB 写缓冲里 —— 用户在文件管理器里看到的长度、播放器打开的部分
+    // 文件都会滞后于实际录制。
+    let mut dirty = false;
+    // 段级永久失败的第一个错误（收尾上抛真实原因）
+    let mut permanent_err: Option<HttpError> = None;
+    let ctrl_of = |st: &LiveState, bytes: u64| PlaylistCtrl {
+        kind: CTRL_KIND.to_string(),
+        v: 1,
+        fp: String::new(),
+        fps: String::new(),
+        url: plan.source.clone(),
+        segs: 0,
+        prefix: st.spliced_total,
+        bytes,
+        part: 0,
+        mode: CTRL_MODE_LIVE.to_string(),
+        mask: String::new(),
+        seq: st.head_seq,
+        live_ms: stats.live_ms.load(Ordering::Relaxed),
+        map: st.written_map.clone().unwrap_or_default(),
+    };
+    let save_now = |sink: &mut FileSink, st: &LiveState| {
+        let _ = sink.flush_buf();
+        save_ctrl(&ctrl_path, &ctrl_of(st, sink.position()));
+    };
+
+    enum Exit {
+        Ended,
+        Stalled,
+        Cancelled,
+    }
+    let outcome: Result<Exit, HttpError> = 'record: loop {
+        // 1) 按序拼接（分批搬运，与乱序模式同一套）
+        let mut spliced_now = 0u64;
+        loop {
+            match state.splice_one(path, &mut sink) {
+                Ok(Some((moved, dur_ms))) => {
+                    // 先记产物侧、再减段文件侧：进度中途只会略偏高，绝不回落
+                    stats.completed.store(sink.position(), Ordering::Relaxed);
+                    let _ = stats
+                        .spilled
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(moved))
+                        });
+                    if dur_ms > 0 {
+                        stats.live_ms.fetch_add(dur_ms, Ordering::Relaxed);
+                    }
+                    dirty = true;
+                    spliced_now = spliced_now.saturating_add(moved);
+                    if spliced_now >= SPLICE_BATCH_BYTES {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => break 'record Err(e),
+            }
+        }
+        if dirty && last_save.elapsed() >= CTRL_SAVE_INTERVAL {
+            save_now(&mut sink, &state);
+            dirty = false;
+            last_save = std::time::Instant::now();
+        }
+
+        // 2) 补齐在飞下载
+        while inflight < conn {
+            let now = std::time::Instant::now();
+            let Some((key, seg)) = state.take_for_dispatch(now) else {
+                break;
+            };
+            let sf = state.file_of(path, key);
+            let existing = std::fs::metadata(&sf).map(|m| m.len()).unwrap_or(0);
+            let target = if seg.key.is_some() {
+                // 加密段：解密要整段，收进内存（收完由主循环写段文件）
+                SegTarget::Mem(Arc::new(Mutex::new(Vec::new())))
+            } else {
+                // 初始化段一律重下（很小，且可能换了内容）；媒体段按文件
+                // 已有长度续传（暂停不丢半截）
+                let truncate = existing == 0 || !matches!(key, LiveKey::Seg(_));
+                match SegFile::open(&sf, truncate) {
+                    Ok(f) => SegTarget::Disk(Arc::new(Mutex::new(f))),
+                    Err(e) => break 'record Err(e),
+                }
+            };
+            inflight += 1;
+            let ctx = &ctx;
+            futs.push(Box::pin(async move {
+                let r = fetch_segment(ctx, &seg, &target, 0, None).await;
+                (key, r)
+            }));
+        }
+
+        // 3) 收尾判定
+        if state.stream_end && state.drained() {
+            break Ok(Exit::Ended);
+        }
+        // 拼接点被"重试耗尽"的段顶死：等窗口滑过（或已经确定结束）就报错 ——
+        // 错误可重播（unpause 会带着新清单/新签名重来），比悄无声息地挂住好
+        if inflight == 0
+            && state.blocked_failed()
+            && (state.stream_end
+                || state.last_new_at.elapsed() >= stall_timeout.max(Duration::from_secs(30)))
+        {
+            break Err(permanent_err.take().unwrap_or_else(|| {
+                HttpError::Protocol("直播录制：仍有分片始终无法下载".into())
+            }));
+        }
+        let recently_reloaded = state.last_ok_reload.elapsed() < reload_interval * 4;
+        if !state.stream_end
+            && !stall_timeout.is_zero()
+            && state.drained()
+            && recently_reloaded
+            && state.last_new_at.elapsed() >= stall_timeout
+        {
+            tracing::info!(
+                stall_s = stall_timeout.as_secs(),
+                head = state.head_seq,
+                "直播清单连续 {} 秒没有新增分片，按录制结束收尾",
+                stall_timeout.as_secs()
+            );
+            break Ok(Exit::Stalled);
+        }
+
+        // 4) 到点重拉清单
+        let now = std::time::Instant::now();
+        if !reload_inflight && !state.reload_stopped && now >= next_reload_at {
+            reload_inflight = true;
+            let task_client = client.clone();
+            let task_url = reload_url.to_string();
+            let task_cancel = reload_cancel.clone();
+            let task_opts = reload_opts.clone();
+            let task_tx = rtx.clone();
+            tokio::spawn(async move {
+                let r = fetch_plan(
+                    &task_client,
+                    &task_url,
+                    &task_cancel,
+                    &task_opts.headers,
+                    &task_opts,
+                )
+                .await;
+                let _ = task_tx.send(r).await;
+            });
+        }
+
+        // 5) 等事件：下载完成 / 清单回来 / 取消 / 心跳（节拍同时驱动保存与停滞判定）
+        let wait = if reload_inflight {
+            Duration::from_millis(200)
+        } else {
+            next_reload_at
+                .saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(200))
+                .max(Duration::from_millis(20))
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break 'record Ok(Exit::Cancelled),
+            maybe = rrx.recv(), if reload_inflight => {
+                reload_inflight = false;
+                match maybe {
+                    Some(Ok(new_plan)) => {
+                        state.fail_streak = 0;
+                        state.gone_streak = 0;
+                        state.last_ok_reload = std::time::Instant::now();
+                        if new_plan.parts_only {
+                            // 纯低延迟快照：身份不稳定，跳过这一轮（继续按旧窗口录）
+                            tracing::warn!("直播清单本轮只有 #EXT-X-PART，跳过");
+                        } else {
+                            state.apply(&new_plan, path);
+                        }
+                        next_reload_at = std::time::Instant::now() + reload_interval;
+                    }
+                    Some(Err(e)) => {
+                        // 清单拉不到：不是录制失败（断网可能只是暂时的），
+                        // 退避重试；持续 404/410 才按"直播已结束"收尾
+                        let gone = matches!(&e, HttpError::Http(code) if *code == 404 || *code == 410);
+                        if gone {
+                            state.gone_streak += 1;
+                            tracing::warn!(
+                                streak = state.gone_streak,
+                                limit = LIVE_GONE_LIMIT,
+                                "直播清单返回 {}（{}/{}）",
+                                e,
+                                state.gone_streak,
+                                LIVE_GONE_LIMIT
+                            );
+                            if state.gone_streak >= LIVE_GONE_LIMIT {
+                                tracing::info!("直播清单持续不可用，按录制结束收尾");
+                                state.stream_end = true;
+                                state.reload_stopped = true;
+                            }
+                        } else {
+                            state.fail_streak = state.fail_streak.saturating_add(1);
+                            tracing::warn!(err = %e, "直播清单拉取失败，退避重试");
+                        }
+                        let secs = (1u64 << state.fail_streak.min(4)).min(15);
+                        next_reload_at = std::time::Instant::now() + Duration::from_secs(secs);
+                    }
+                    None => {
+                        // 重拉任务消失（理论上不可达）：当作一次失败重排
+                        next_reload_at = std::time::Instant::now() + Duration::from_secs(1);
+                    }
+                }
+            }
+            Some((key, res)) = futs.next(), if !futs.is_empty() => {
+                inflight -= 1;
+                match res {
+                    Ok(body) => {
+                        // 加密段：把解出来的明文写进段文件（到这一刻才算落盘）
+                        if body.on_disk == 0 {
+                            let sf = state.file_of(path, key);
+                            let w = SegFile::open(&sf, true).and_then(|mut f| {
+                                f.append(&body.data)?;
+                                f.finish()
+                            });
+                            match w {
+                                Ok(n) => {
+                                    stats.spilled.fetch_add(n, Ordering::Relaxed);
+                                }
+                                Err(e) => break 'record Err(e),
+                            }
+                        }
+                        if let Some(item) = live_item_mut(&mut state, key) {
+                            item.state = LiveItemState::Done;
+                            item.attempts = 0;
+                        }
+                    }
+                    Err(e) if matches!(e, HttpError::Cancelled) => {
+                        break 'record Ok(Exit::Cancelled);
+                    }
+                    Err(e) if matches!(e, HttpError::Io(_)) => break 'record Err(e),
+                    Err(e) => {
+                        // 单段失败：退避重试；重试耗尽转 Failed（等窗口滑过，
+                        // 或顶住拼接点时上抛）
+                        let mut give_up = false;
+                        if let Some(item) = live_item_mut(&mut state, key) {
+                            item.attempts = item.attempts.saturating_add(1);
+                            if item.attempts >= LIVE_SEG_MAX_ATTEMPTS {
+                                item.state = LiveItemState::Failed;
+                                give_up = true;
+                            } else {
+                                let backoff =
+                                    Duration::from_secs(1 + 2 * u64::from(item.attempts));
+                                item.state = LiveItemState::Queued {
+                                    retry_at: Some(std::time::Instant::now() + backoff),
+                                };
+                            }
+                        }
+                        if give_up {
+                            if permanent_err.is_none() {
+                                permanent_err = Some(e);
+                            }
+                            tracing::warn!(?key, "直播分片重试耗尽，标记失败并等待窗口滑过");
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep(wait) => {}
+        }
+    };
+    reload_cancel.cancel();
+
+    // —— 收尾：丢掉在飞请求，落盘现场 ——
+    drop(futs);
+    let flush = sink.flush().map_err(|e| HttpError::Io(e.to_string()));
+    if let Err(e) = flush {
+        save_ctrl(&ctrl_path, &ctrl_of(&state, sink.position()));
+        return Err(e);
+    }
+    stats.completed.store(sink.position(), Ordering::Relaxed);
+
+    match outcome {
+        Err(e) => {
+            // 失败也保留现场：下次 unpause / 重试从断点续录
+            save_ctrl(&ctrl_path, &ctrl_of(&state, sink.position()));
+            Err(e)
+        }
+        Ok(Exit::Cancelled) => {
+            save_ctrl(&ctrl_path, &ctrl_of(&state, sink.position()));
+            tracing::info!(
+                bytes = sink.position(),
+                head = state.head_seq,
+                skipped = state.skipped,
+                "直播录制暂停（现场已保存，恢复后继续）"
+            );
+            Err(HttpError::Cancelled)
+        }
+        Ok(Exit::Ended) | Ok(Exit::Stalled) => {
+            // 录到干净：段目录已空，收掉现场
+            let _ = std::fs::remove_dir_all(seg_dir(path));
+            let _ = std::fs::remove_file(&ctrl_path);
+            let bytes = sink.position();
+            tracing::info!(
+                bytes,
+                segments = state.spliced_total,
+                skipped = state.skipped,
+                live_ms = stats.live_ms.load(Ordering::Relaxed),
+                "直播录制结束"
+            );
+            Ok(PlaylistDone {
+                bytes,
+                segments: state.spliced_total,
+                total_segments: state.spliced_total,
+            })
+        }
+    }
+}
+
+/// 某件活的可变引用（键 → 状态机的槽位）。
+fn live_item_mut(state: &mut LiveState, key: LiveKey) -> Option<&mut LiveItem> {
+    match key {
+        LiveKey::LeadingMap => state.leading_map.as_mut(),
+        LiveKey::Map(seq) => state.maps.get_mut(&seq),
+        LiveKey::Seg(seq) => state.segs.get_mut(&seq),
+    }
+}
+
 
 /// 默认产物文件名：清单地址末段去扩展名，通用名则回退父目录名。
 pub fn default_filename(manifest_url: &str, fmp4: bool) -> String {
@@ -3416,12 +4454,16 @@ mod tests {
                 key: None,
                 size: None,
                 duration: 4.0,
+                seq: 0,
+                is_map: false,
             }],
             live: true,
             fmp4: false,
             total: None,
             duration_secs: 4.0,
             separate_audio: false,
+            target_duration: 4.0,
+            parts_only: false,
         };
         assert_eq!(fingerprint(&mk("a.ts")), fingerprint(&mk("a.ts")));
         assert_ne!(fingerprint(&mk("a.ts")), fingerprint(&mk("b.ts")));
@@ -3905,7 +4947,15 @@ mod tests {
         let plan_b = PlaylistPlan {
             segments: vec![
                 plan_a.segments[0].clone(),
-                Segment { url: srv.url("/m/b.ts"), range: None, key: None, size: None, duration: 4.0 },
+                Segment {
+                    url: srv.url("/m/b.ts"),
+                    range: None,
+                    key: None,
+                    size: None,
+                    duration: 4.0,
+                    seq: 1,
+                    is_map: false,
+                },
             ],
             ..plan_a.clone()
         };
@@ -3920,12 +4970,15 @@ mod tests {
             init: None,
             segments: urls
                 .iter()
-                .map(|u| Segment {
+                .enumerate()
+                .map(|(i, u)| Segment {
                     url: (*u).to_string(),
                     range: None,
                     key: None,
                     size: None,
                     duration: 4.0,
+                    seq: i as u64,
+                    is_map: false,
                 })
                 .collect(),
             live: false,
@@ -3934,6 +4987,8 @@ mod tests {
             duration_secs: 4.0 * urls.len() as f64,
             bitrate: None,
             separate_audio: false,
+            target_duration: 4.0,
+            parts_only: false,
         }
     }
 
@@ -5201,5 +6256,466 @@ mod tests {
             real_total,
             "精确总长必须等于产物真实字节数"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 直播录制（动态清单：按请求轮次变窗口，模拟"流在生长"）
+    // ------------------------------------------------------------------
+
+    /// 直播测试服务：清单内容按**请求轮次**从脚本里取（越界就一直用最后
+    /// 一条），可用 [`LiveServer::push_manifest`] 中途追加脚本 —— 模拟
+    /// "窗口在生长 / 最后加上 ENDLIST"。分片是支持 `Range` 的静态文件，
+    /// 可对指定分片注入"响应前延迟"（制造"暂停发生在半途"的现场）。
+    struct LiveServer {
+        base: String,
+        hits: HashMap<String, Arc<AtomicUsize>>,
+        script: Arc<Mutex<Vec<String>>>,
+        manifest_hits: Arc<AtomicUsize>,
+    }
+
+    impl LiveServer {
+        fn url(&self, p: &str) -> String {
+            format!("{}{}", self.base, p)
+        }
+        fn hits(&self, p: &str) -> usize {
+            self.hits.get(p).map(|c| c.load(Ordering::SeqCst)).unwrap_or(0)
+        }
+        fn manifest_hits(&self) -> usize {
+            self.manifest_hits.load(Ordering::SeqCst)
+        }
+        /// 追加一段清单脚本（下一轮拉清单用）。
+        fn push_manifest(&self, text: String) {
+            self.script.lock().unwrap().push(text);
+        }
+    }
+
+    async fn start_live_server(
+        script: Vec<String>,
+        slow: HashMap<String, u64>,
+        files: HashMap<String, Vec<u8>>,
+    ) -> LiveServer {
+        use axum::http::{header, HeaderValue, StatusCode};
+        use axum::routing::get;
+        use axum::Router;
+
+        let script = Arc::new(Mutex::new(script));
+        let manifest_hits = Arc::new(AtomicUsize::new(0));
+        let mut hits: HashMap<String, Arc<AtomicUsize>> = HashMap::new();
+        let mut app = Router::new();
+        {
+            let script = script.clone();
+            let hits_c = manifest_hits.clone();
+            app = app.route(
+                "/live/index.m3u8",
+                get(move || {
+                    let script = script.clone();
+                    let hits_c = hits_c.clone();
+                    async move {
+                        let n = hits_c.fetch_add(1, Ordering::SeqCst);
+                        let guard = script.lock().unwrap();
+                        let body = if guard.is_empty() {
+                            "#EXTM3U\n".to_string()
+                        } else {
+                            guard[n.min(guard.len() - 1)].clone()
+                        };
+                        drop(guard);
+                        (
+                            [(
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/vnd.apple.mpegurl"),
+                            )],
+                            body,
+                        )
+                    }
+                }),
+            );
+        }
+        for (path, body) in files {
+            let data = Arc::new(body);
+            let hit = Arc::new(AtomicUsize::new(0));
+            let delay = slow.get(&path).copied().unwrap_or(0);
+            hits.insert(path.clone(), hit.clone());
+            app = app.route(
+                &path,
+                get(move |headers: axum::http::HeaderMap| {
+                    let data = data.clone();
+                    let hit = hit.clone();
+                    async move {
+                        hit.fetch_add(1, Ordering::SeqCst);
+                        if delay > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                        let total = data.len();
+                        let range = headers
+                            .get(header::RANGE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let (from, to) = match range
+                            .strip_prefix("bytes=")
+                            .and_then(|r| r.split_once('-'))
+                        {
+                            Some((f, t)) => (
+                                f.trim().parse::<usize>().unwrap_or(0),
+                                t.trim().parse::<usize>().unwrap_or(total),
+                            ),
+                            None => (0, total),
+                        };
+                        let from = from.min(total);
+                        let to = (to + 1).min(total).max(from);
+                        let body = data[from..to].to_vec();
+                        let mut resp =
+                            axum::response::Response::new(axum::body::Body::from(body));
+                        if from > 0 || to < total {
+                            *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                            resp.headers_mut().insert(
+                                header::CONTENT_RANGE,
+                                HeaderValue::from_str(&format!(
+                                    "bytes {}-{}/{}",
+                                    from,
+                                    to.saturating_sub(1),
+                                    total
+                                ))
+                                .unwrap(),
+                            );
+                        }
+                        resp
+                    }
+                }),
+            );
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(l, app).await;
+        });
+        LiveServer {
+            base: format!("http://{addr}"),
+            hits,
+            script,
+            manifest_hits,
+        }
+    }
+
+    /// 直播媒体清单：每段 `#EXTINF:1.0`（目标时长 1 秒 → 轮询 0.5 秒）。
+    fn live_media_playlist(seq: u64, n: u64, endlist: bool) -> String {
+        let mut s = String::from("#EXTM3U\n#EXT-X-TARGETDURATION:1\n");
+        s.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{seq}\n"));
+        for i in seq..seq + n {
+            s.push_str(&format!("#EXTINF:1.0,\nseg{i}.ts\n"));
+        }
+        if endlist {
+            s.push_str("#EXT-X-ENDLIST\n");
+        }
+        s
+    }
+
+    /// 直播录制的核心判据：**跨多轮清单增长**把每一段都录进产物，
+    /// ENDLIST 一到就正常收尾（清现场），已录时长 = 各段 `#EXTINF` 之和。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_records_across_manifest_reloads_until_endlist() {
+        let dir = tmpdir("live-record");
+        let seg_len = 16 * 1024usize;
+        let segs: Vec<Vec<u8>> = (0..4).map(|i| sample(i + 1, seg_len)).collect();
+        let mut files = HashMap::new();
+        for (i, s) in segs.iter().enumerate() {
+            files.insert(format!("/live/seg{i}.ts"), s.clone());
+        }
+        let srv = start_live_server(
+            vec![
+                live_media_playlist(0, 1, false), // 第 1 轮：窗口 [0]
+                live_media_playlist(1, 2, false), // 第 2 轮：窗口 [1,2]
+                live_media_playlist(2, 2, true),  // 第 3 轮：窗口 [2,3] + ENDLIST
+            ],
+            HashMap::new(),
+            files,
+        )
+        .await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        let opts = PlaylistOptions {
+            probe_sizes: false,
+            live_stall_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let plan = fetch_plan(&client, &srv.url("/live/index.m3u8"), &cancel, &[], &opts)
+            .await
+            .expect("取清单");
+        assert!(plan.live, "无 ENDLIST 的清单应被标为直播");
+
+        let path = dir.join("live.ts");
+        let stats = PlaylistStats::new(0);
+        let done = record_playlist(
+            &client,
+            &path,
+            &plan,
+            &srv.url("/live/index.m3u8"),
+            &opts,
+            &cancel,
+            stats.clone(),
+        )
+        .await
+        .expect("直播录制应正常收尾");
+
+        let expected: Vec<u8> = segs.iter().flatten().copied().collect();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            expected,
+            "产物必须是全部段按序拼接（跨多轮清单）"
+        );
+        assert_eq!(done.bytes, (4 * seg_len) as u64);
+        assert_eq!(stats.live_recorded_ms(), 4000, "已录时长 = 4 段 × 1s");
+        assert!(
+            !xfer_storage::ctrl_path(&path).exists(),
+            "正常收尾要清掉直播现场（控制文件）"
+        );
+        assert!(
+            !seg_dir(&path).exists(),
+            "正常收尾要清掉段目录（全部已拼接）"
+        );
+        assert!(
+            srv.manifest_hits() >= 3,
+            "应跨多轮重拉清单，实际 {} 次",
+            srv.manifest_hits()
+        );
+        for i in 0..4 {
+            assert_eq!(
+                srv.hits(&format!("/live/seg{i}.ts")),
+                1,
+                "第 {i} 段只该下载一次（跨轮去重）"
+            );
+        }
+    }
+
+    /// 无 ENDLIST 但长时间没有新增分片：按停滞收尾（"假直播"的点播列表
+    /// 也靠这一档结束），产物 = 窗口快照。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_stall_finishes_recording_without_endlist() {
+        let dir = tmpdir("live-stall");
+        let seg_len = 8 * 1024usize;
+        let segs: Vec<Vec<u8>> = (0..2).map(|i| sample(i + 1, seg_len)).collect();
+        let mut files = HashMap::new();
+        for (i, s) in segs.iter().enumerate() {
+            files.insert(format!("/live/seg{i}.ts"), s.clone());
+        }
+        // 静态窗口：永远这两段，不给 ENDLIST
+        let srv = start_live_server(
+            vec![live_media_playlist(0, 2, false)],
+            HashMap::new(),
+            files,
+        )
+        .await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        let opts = PlaylistOptions {
+            probe_sizes: false,
+            live_stall_timeout: Duration::from_millis(1000),
+            ..Default::default()
+        };
+        let plan = fetch_plan(&client, &srv.url("/live/index.m3u8"), &cancel, &[], &opts)
+            .await
+            .expect("取清单");
+        assert!(plan.live);
+
+        let path = dir.join("live.ts");
+        let stats = PlaylistStats::new(0);
+        let started = std::time::Instant::now();
+        let done = tokio::time::timeout(
+            Duration::from_secs(20),
+            record_playlist(
+                &client,
+                &path,
+                &plan,
+                &srv.url("/live/index.m3u8"),
+                &opts,
+                &cancel,
+                stats.clone(),
+            ),
+        )
+        .await
+        .expect("停滞收尾不该挂住（20s 超时）")
+        .expect("停滞是正常收尾");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(1000),
+            "停滞判定要等满阈值才收尾，实际 {:?}",
+            elapsed
+        );
+        let expected: Vec<u8> = segs.iter().flatten().copied().collect();
+        assert_eq!(std::fs::read(&path).unwrap(), expected, "产物 = 窗口快照");
+        assert_eq!(done.bytes, (2 * seg_len) as u64);
+        assert_eq!(stats.live_recorded_ms(), 2000);
+        assert!(!xfer_storage::ctrl_path(&path).exists(), "停滞收尾同样是正常收尾");
+    }
+
+    /// 暂停 → 恢复：段文件/前缀全部保住（已录段不重下），窗口跳过的部分
+    /// 按丢失处理并如实反映在产物里；恢复后"已录时长"从现场继续累计。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn live_pause_resume_skips_missing_window_and_keeps_prefix() {
+        let dir = tmpdir("live-pause");
+        let seg_len = 16 * 1024usize;
+        let segs: Vec<Vec<u8>> = (0..5).map(|i| sample(i + 11, seg_len)).collect();
+        let mut files = HashMap::new();
+        for (i, s) in segs.iter().enumerate() {
+            files.insert(format!("/live/seg{i}.ts"), s.clone());
+        }
+        // seg2 慢发 800ms：暂停必然落在"前两段已拼接、seg2 还没完"的窗口里
+        let mut slow = HashMap::new();
+        slow.insert("/live/seg2.ts".to_string(), 800u64);
+        let srv = start_live_server(
+            vec![live_media_playlist(0, 3, false)],
+            slow,
+            files,
+        )
+        .await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        let opts = PlaylistOptions {
+            probe_sizes: false,
+            live_stall_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        let url = srv.url("/live/index.m3u8");
+        let plan_a = fetch_plan(&client, &url, &cancel, &[], &opts)
+            .await
+            .expect("取清单");
+        assert!(plan_a.live);
+        let path = dir.join("live.ts");
+
+        // —— 第一段录制：录到前两段就暂停 ——
+        // 判据用 `progress()`（含 512KB 写缓冲里的字节）而不是磁盘文件长度：
+        // 落盘是 1 秒节流的，文件可见长度会比实际拼接滞后 ≤1s，拿它当触发
+        // 会让"seg2 慢发的 800ms"窗口被吃掉。
+        let stats_a = PlaylistStats::new(0);
+        let rec = {
+            let client = client.clone();
+            let path = path.clone();
+            let plan = plan_a.clone();
+            let url = url.clone();
+            let opts = opts.clone();
+            let cancel = cancel.clone();
+            let stats = stats_a.clone();
+            tokio::spawn(async move {
+                record_playlist(&client, &path, &plan, &url, &opts, &cancel, stats).await
+            })
+        };
+        let mut waited = 0u64;
+        while stats_a.progress() < (2 * seg_len) as u64 && waited < 10_000 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 20;
+        }
+        assert!(
+            stats_a.progress() >= (2 * seg_len) as u64,
+            "10s 内应录进前两段"
+        );
+        cancel.cancel();
+        let r = rec.await.unwrap();
+        assert!(matches!(r, Err(HttpError::Cancelled)), "暂停应返回 Cancelled");
+
+        // 现场：控制文件在，水位 = 已拼两段、光标指到 seg2
+        let ctrl = load_live_ctrl_raw(&path).expect("暂停后应留下直播现场");
+        assert_eq!(ctrl.mode, "live");
+        assert_eq!(ctrl.bytes, (2 * seg_len) as u64, "产物水位 = 已拼接前缀");
+        assert_eq!(ctrl.seq, 2, "光标应停在第三段（seg2）");
+        assert_eq!(ctrl.live_ms, 2000, "已录时长 = 前两段 2s");
+        assert_eq!(
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            (2 * seg_len) as u64,
+            "暂停收尾要 flush：磁盘上的产物长度必须等于水位"
+        );
+        assert!(has_live_ctrl(&path));
+        let (rp_bytes, rp_ms) = live_resume_point(&path, &plan_a).expect("应有续传水位");
+        assert_eq!((rp_bytes, rp_ms), ((2 * seg_len) as u64, 2000));
+
+        // —— 第二段录制：窗口已经跳过 seg2（5 秒后才恢复），只剩 seg3/seg4 与 ENDLIST ——
+        // 暂停用的令牌已经不可复用（取消是"一次性"的）：换一张新的
+        let cancel_b = CancellationToken::new();
+        srv.push_manifest(live_media_playlist(3, 2, true));
+        let plan_b = fetch_plan(&client, &url, &cancel_b, &[], &opts)
+            .await
+            .expect("取清单");
+        assert!(!plan_b.live, "该轮清单已带 ENDLIST");
+        assert!(
+            has_live_ctrl(&path),
+            "清单结束了但现场还在：必须继续走录制路径（引擎据此路由）"
+        );
+        let stats_b = PlaylistStats::new(0);
+        let done = record_playlist(
+            &client,
+            &path,
+            &plan_b,
+            &url,
+            &opts,
+            &cancel_b,
+            stats_b.clone(),
+        )
+        .await
+        .expect("恢复后应收尾成功");
+
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend_from_slice(&segs[0]);
+        expected.extend_from_slice(&segs[1]);
+        expected.extend_from_slice(&segs[3]);
+        expected.extend_from_slice(&segs[4]);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            expected,
+            "恢复后：已录前缀保住；窗口跳过的 seg2 按丢失处理，不凭空出现"
+        );
+        assert_eq!(done.bytes, expected.len() as u64);
+        assert_eq!(
+            stats_b.live_recorded_ms(),
+            4000,
+            "已录时长从现场（2s）继续累计新录的 2s"
+        );
+        assert_eq!(srv.hits("/live/seg0.ts"), 1, "已录段不得重下");
+        assert_eq!(srv.hits("/live/seg1.ts"), 1, "已录段不得重下");
+        assert_eq!(srv.hits("/live/seg3.ts"), 1);
+        assert_eq!(srv.hits("/live/seg4.ts"), 1);
+        assert!(!xfer_storage::ctrl_path(&path).exists(), "收尾后清掉现场");
+    }
+
+    /// 解析层：媒体序号、目标时长、初始化段序号校正（EXT-X-MAP 写在
+    /// MEDIA-SEQUENCE 之前也不能错位）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_parse_assigns_media_sequence_and_target_duration() {
+        let mut files = HashMap::new();
+        files.insert("/live/init.mp4".to_string(), sample(1, 128));
+        files.insert("/live/seg100.ts".to_string(), sample(2, 128));
+        files.insert("/live/seg101.ts".to_string(), sample(3, 128));
+        let srv = start_live_server(
+            vec!["#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MAP:URI=\"init.mp4\"\n\
+                  #EXT-X-MEDIA-SEQUENCE:100\n#EXTINF:1.0,\nseg100.ts\n#EXTINF:1.0,\nseg101.ts\n\
+                  #EXT-X-ENDLIST\n"
+                .to_string()],
+            HashMap::new(),
+            files,
+        )
+        .await;
+
+        let client = crate::build_client();
+        let cancel = CancellationToken::new();
+        let opts = PlaylistOptions {
+            probe_sizes: false,
+            ..Default::default()
+        };
+        let plan = fetch_plan(&client, &srv.url("/live/index.m3u8"), &cancel, &[], &opts)
+            .await
+            .expect("取清单");
+        assert_eq!(plan.target_duration, 1.0);
+        assert_eq!(plan.segments.len(), 2);
+        assert_eq!(plan.segments[0].seq, 100);
+        assert_eq!(plan.segments[1].seq, 101);
+        assert!(plan.segments.iter().all(|s| !s.is_map));
+        let init = plan.init.expect("应有初始化段");
+        assert!(init.is_map);
+        assert_eq!(
+            init.seq, 100,
+            "EXT-X-MAP 写在 MEDIA-SEQUENCE 之前时，序号要校正到第一段"
+        );
+        assert!(!plan.live, "带 ENDLIST 的清单不是直播");
     }
 }

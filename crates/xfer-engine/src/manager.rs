@@ -65,6 +65,12 @@ const MAX_HLS_CONNECTIONS: usize = 64;
 /// HLS 分片并发的默认值（用户没有显式设置任何连接数选项时）。
 const DEFAULT_HLS_CONNECTIONS: usize = 16;
 
+/// 直播录制停滞判定的默认秒数（`hls-live-stall-timeout` 未设置时）：
+/// 清单连续这么久没有新增分片且已录到窗口末尾 ⇒ 视为直播结束、正常收尾。
+/// 两分钟的依据：真实直播的分片间隔在 2~10 秒量级；而"不带 ENDLIST 的点播
+/// 列表"（占线上"假直播"的大头）也靠这一档收尾 —— 设 0 可关掉。
+const HLS_LIVE_STALL_DEFAULT_SECS: u64 = 120;
+
 /// 生成 16 字符 hex ID（用于订阅源标识）。
 fn generate_id() -> String {
     let mut buf = [0u8; 8];
@@ -1893,6 +1899,19 @@ impl TaskManager {
                     v == "ordered" || v == "sequential" || v == "true"
                 })
                 .unwrap_or(false),
+            // 直播录制的停滞判定（秒；0 = 不自动收尾）。默认两分钟：
+            // 真实直播的分片间隔在 2~10 秒量级，两分钟没有新增足以判定
+            // 源已停播；而"不带 ENDLIST 的点播列表"也靠它收尾。
+            live_stall_timeout: {
+                let secs = get("hls-live-stall-timeout")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(HLS_LIVE_STALL_DEFAULT_SECS);
+                if secs == 0 {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(secs)
+                }
+            },
         }
     }
 
@@ -1910,7 +1929,21 @@ impl TaskManager {
         headers: &xfer_http::RequestHeaders,
     ) -> Result<(), TaskFailure> {
         self.apply_task_rate_limits(task);
-        let opts = self.playlist_options(task, headers);
+        let mut opts = self.playlist_options(task, headers);
+        // 产物路径上已经有**直播现场**（暂停后续录 / 重启恢复）：这一趟大概率
+        // 走直播录制收尾，清单拉取跳过分片大小预探测 —— 录完的窗口通常只有
+        // 几十段，逐个 1 字节探测纯属白打请求（录制器根本不用"总长"）。
+        let resuming_live = task
+            .shared
+            .lock()
+            .unwrap()
+            .path
+            .clone()
+            .map(|p| xfer_http::playlist_has_live_ctrl(&p))
+            .unwrap_or(false);
+        if resuming_live {
+            opts.probe_sizes = false;
+        }
         let plan = match xfer_http::fetch_plan(client, uri, cancel, headers, &opts).await {
             Ok(p) => p,
             Err(e) => return Err(TaskFailure::Http(e)),
@@ -1922,12 +1955,90 @@ impl TaskManager {
                 segments = plan.segments.len(), "主清单选流完成"
             );
         }
+        let path = self.resolve_playlist_path(task, &plan, uri);
+        let min_split = self.split_options(task).min_split_size;
+
+        // —— 直播录制判定 ——
+        // ① 清单没有 `#EXT-X-ENDLIST`（且不是纯低延迟快照：那种没有稳定的
+        //    跨快照身份）；
+        // ② 产物旁边还有**直播现场** —— 录到一半的流后来结束了（清单带上
+        //    ENDLIST），但断点还在：这里必须继续走录制路径把尾巴录完，
+        //    不能当整片清单从头下。
+        let live_ctrl = xfer_http::playlist_has_live_ctrl(&path);
+        let live = (plan.live && !plan.parts_only) || live_ctrl;
+        if live {
+            task.live.store(true, Ordering::Relaxed);
+            if plan.live && !live_ctrl {
+                tracing::info!(
+                    gid = %task.gid, segments = plan.segments.len(),
+                    "直播清单（无 #EXT-X-ENDLIST）：开始持续录制"
+                );
+            }
+            // 续传水位：产物字节 + 已录媒体时长（与录制器内部共用同一判定）
+            let (resume_bytes, live_ms) =
+                xfer_http::playlist_live_resume_point(&path, &plan).unwrap_or((0, 0));
+            // 直播没有"总长"这个概念（流在生长）：total 留空，界面展示的是
+            // "已录制大小"；分片格子同样不建（没有分母）。
+            {
+                let mut sh = task.shared.lock().unwrap();
+                sh.completed = resume_bytes;
+                sh.connections = 0;
+                sh.total_len = None;
+                sh.file_len = resume_bytes;
+            }
+            *task.http_pieces.write().unwrap() = None;
+            task.completed_atomic.store(resume_bytes, Ordering::Relaxed);
+            task.connections_atomic.store(0, Ordering::Relaxed);
+            task.live_recorded_ms.store(live_ms, Ordering::Relaxed);
+
+            let stats = xfer_http::PlaylistStats::new(resume_bytes);
+            let sampler =
+                spawn_playlist_sampler(task, &stats, false, None, false, min_split, true);
+            let r = xfer_http::record_playlist(client, &path, &plan, uri, &opts, cancel, stats.clone())
+                .await;
+            sampler.abort();
+            // 无论成败都把"已录制时长"定格到任务上（卡片一直要显示它）
+            task.live_recorded_ms
+                .store(stats.live_recorded_ms(), Ordering::Relaxed);
+            return match r {
+                Ok(done) => {
+                    {
+                        let mut sh = task.shared.lock().unwrap();
+                        sh.completed = done.bytes;
+                        sh.connections = 0;
+                        sh.file_len = done.bytes;
+                        // 录完总长才定格为产物长度（录制期间不给百分比分母）
+                        sh.total_len = Some(done.bytes.max(1));
+                    }
+                    task.completed_atomic.store(done.bytes, Ordering::Relaxed);
+                    task.connections_atomic.store(0, Ordering::Relaxed);
+                    tracing::info!(
+                        gid = %task.gid, bytes = done.bytes, segments = done.segments,
+                        file = %path.display(), "直播录制完成"
+                    );
+                    finish_http_task(task, &path).await
+                }
+                Err(e) => {
+                    // 用 `progress()` 而不是 `completed`：段文件里的字节也算
+                    // 已录制（取消/暂停都不会丢），只看产物长度会掉一大截
+                    let completed = stats.progress();
+                    {
+                        let mut sh = task.shared.lock().unwrap();
+                        sh.completed = completed;
+                        sh.connections = 0;
+                    }
+                    task.completed_atomic.store(completed, Ordering::Relaxed);
+                    task.connections_atomic.store(0, Ordering::Relaxed);
+                    Err(TaskFailure::Http(e))
+                }
+            };
+        }
         if plan.live {
-            // 直播/滚动窗口清单没有 ENDLIST：只能下载"当前这一窗"，
-            // 后续新增的分片不会出现在产物里（不是失败，但要看得见）
+            // 纯低延迟（只有 #EXT-X-PART）清单：分片身份不稳定，持续录制
+            // 做不了 —— 明确按"当前窗口快照"处理，不装作是直播录制
             tracing::warn!(
                 gid = %task.gid, segments = plan.segments.len(),
-                "播放列表没有 #EXT-X-ENDLIST（直播/滚动窗口），按当前窗口快照下载"
+                "播放列表只有 #EXT-X-PART（低延迟快照），按当前窗口一次性下载"
             );
         }
 
@@ -1937,11 +2048,9 @@ impl TaskManager {
             sh.total_len = Some(total);
             sh.file_len = total;
         }
-        let path = self.resolve_playlist_path(task, &plan, uri);
 
         // 续传基线：控制文件记录的"已 fsync 连续前缀"
         let (resume_bytes, _) = xfer_http::playlist_resume_point(&path, &plan);
-        let min_split = self.split_options(task).min_split_size;
         // 分片位图：界面上的"分片格子"。总长取第一个可信来源 ——
         //   ① `plan.total`（小清单逐个探测过，精确）；
         //   ② 主清单的 `BANDWIDTH × 总时长`（大清单不预探测，但清单自带码率，
@@ -1984,6 +2093,7 @@ impl TaskManager {
             pieces,
             pieces_from_estimate,
             min_split,
+            false,
         );
         let r = xfer_http::download_playlist(client, &path, &plan, &opts, cancel, stats.clone()).await;
         sampler.abort();
@@ -2430,6 +2540,7 @@ impl TaskManager {
                     | "hls-segment-retries"
                     | "hls-concurrency"
                     | "hls-write-mode"
+                    | "hls-live-stall-timeout"
             ) {
                 // HTTP 分片参数 / BT 连接参数 / BT 做种配置 / 网络发现开关
                 // / 磁力存种子 / 磁盘缓存 / HTTP 续传与客户端配置 / HLS
@@ -2458,6 +2569,15 @@ impl TaskManager {
                     // 空串 = 恢复默认（乱序落盘）
                     if !m.is_empty() && !matches!(m.as_str(), "unordered" | "ordered") {
                         tracing::warn!(value = %v, "hls-write-mode 取值无效（应为 unordered / ordered 或留空），已忽略该键");
+                        continue;
+                    }
+                }
+                if k == "hls-live-stall-timeout" {
+                    // 直播录制的停滞判定（秒）；空串 = 恢复默认（120 秒），
+                    // 0 合法 = 不按停滞自动收尾（一直录到 ENDLIST / 持续不可用）
+                    let t = v.trim();
+                    if !t.is_empty() && t.parse::<u64>().is_err() {
+                        tracing::warn!(value = %v, "hls-live-stall-timeout 取值无效（应为秒数或留空），已忽略该键");
                         continue;
                     }
                 }
@@ -5057,6 +5177,8 @@ fn spawn_playlist_sampler(
     // 点不亮的格子；偏小 → 不够格）。
     pieces_from_estimate: bool,
     piece_len: u64,
+    // 直播录制任务：不建分片位图、总长不估算，只同步进度/速度/已录时长
+    live: bool,
 ) -> tokio::task::JoinHandle<()> {
     let task = task.clone();
     let stats = stats.clone();
@@ -5089,6 +5211,11 @@ fn spawn_playlist_sampler(
                 stats.connections.load(Ordering::Relaxed) as u64,
                 Ordering::Relaxed,
             );
+            if live {
+                // 已录制媒体时长（卡片上的"已录制时长"，独立于下载进度）
+                task.live_recorded_ms
+                    .store(stats.live_recorded_ms(), Ordering::Relaxed);
+            }
             if allow_estimate && !exact_done {
                 // 精确总长（全部段长度已确知）优先，它一到就定格
                 let exact = stats.exact_total.load(Ordering::Relaxed);
@@ -5244,6 +5371,13 @@ fn delete_task_ctrl(task: &Task) {
         let ctrl = xfer_http::ctrl_path(&p);
         if ctrl.exists() {
             let _ = std::fs::remove_file(&ctrl);
+        }
+        // 播放列表的段目录（`<产物>.hlseg/`：乱序落盘的中间段 / 直播录制的
+        // 按序号段文件）。任务都被移除了，这些段永远不会再被拼接 —— 留着
+        // 只是垃圾（以前只在"下载成功收尾"时清理）。
+        let seg_dir = xfer_http::playlist_seg_dir(&p);
+        if seg_dir.is_dir() {
+            let _ = std::fs::remove_dir_all(&seg_dir);
         }
     }
 }
@@ -5686,6 +5820,7 @@ mod tests {
             "hls-concurrency": "32",
             "hls-segment-retries": "5",
             "hls-probe-size": false,
+            "hls-live-stall-timeout": "600",
         }))
         .unwrap();
         let g = mgr.get_global_option();
@@ -5694,27 +5829,46 @@ mod tests {
         assert_eq!(g["hls-concurrency"], serde_json::json!("32"));
         assert_eq!(g["hls-segment-retries"], serde_json::json!("5"));
         assert_eq!(g["hls-probe-size"], serde_json::json!("false"));
+        assert_eq!(g["hls-live-stall-timeout"], serde_json::json!("600"));
 
         // 非法值：跳过该键（保留原值），整批其余键照常生效
         mgr.change_global_option(&serde_json::json!({
             "hls-concurrency": "0",
             "hls-write-mode": "random",
             "hls-variant": "worst",
+            "hls-live-stall-timeout": "two-min",
         }))
         .unwrap();
         let g = mgr.get_global_option();
         assert_eq!(g["hls-concurrency"], serde_json::json!("32"), "非法并发不应覆盖旧值");
         assert_eq!(g["hls-write-mode"], serde_json::json!("ordered"), "非法落盘方式不应覆盖旧值");
+        assert_eq!(
+            g["hls-live-stall-timeout"],
+            serde_json::json!("600"),
+            "非法停滞秒数不应覆盖旧值"
+        );
 
         // 空串 = 恢复默认
         mgr.change_global_option(&serde_json::json!({
             "hls-concurrency": "",
             "hls-write-mode": "",
+            "hls-live-stall-timeout": "",
         }))
         .unwrap();
         let g = mgr.get_global_option();
         assert_eq!(g["hls-concurrency"], serde_json::json!(""), "空串必须被接受（恢复自动）");
         assert_eq!(g["hls-write-mode"], serde_json::json!(""), "空串必须被接受（恢复乱序）");
+        assert_eq!(
+            g["hls-live-stall-timeout"],
+            serde_json::json!(""),
+            "空串必须被接受（恢复默认 120 秒）"
+        );
+
+        // 0 = 合法（不按停滞自动收尾），不能被当成非法值跳过
+        mgr.change_global_option(&serde_json::json!({"hls-live-stall-timeout": "0"}))
+            .unwrap();
+        let g = mgr.get_global_option();
+        assert_eq!(g["hls-live-stall-timeout"], serde_json::json!("0"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

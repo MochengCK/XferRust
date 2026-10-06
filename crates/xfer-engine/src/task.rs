@@ -290,6 +290,13 @@ pub struct Task {
     /// 完成/错误时刻（Unix 毫秒；0 = 未知）。终态转移时设置，
     /// 会话持久化保存，重启恢复后客户端仍可显示完成时间。
     pub finished_at: AtomicU64,
+    /// 这条任务是不是**直播录制**（清单无 ENDLIST / 带着直播现场）。置位后
+    /// 恒为 true：界面据此把卡片下半行换成"录制中 · 已录制时长 · 已录制大小"。
+    pub live: AtomicBool,
+    /// 直播录制：**已录制媒体时长**（毫秒）= 已拼进产物的媒体分片 `#EXTINF`
+    /// 之和。它是"产物这个文件能播多长"，与"从按下录制过去了多久"无关。
+    /// 非直播任务恒为 0。
+    pub live_recorded_ms: AtomicU64,
     /// 平均速度累计——活动下载阶段（Status::Active，不含做种）每秒
     /// 记一次：avg_active_ms += 1000、avg_bytes += 完成字节增量。
     /// averageSpeed = avg_bytes * 1000 / avg_active_ms，随会话持久化，
@@ -357,6 +364,8 @@ impl Task {
             task_ul_limit: AtomicU64::new(ul0),
             http_limiter: OnceLock::new(),
             finished_at: AtomicU64::new(0),
+            live: AtomicBool::new(false),
+            live_recorded_ms: AtomicU64::new(0),
             avg_active_ms: AtomicU64::new(0),
             avg_bytes: AtomicU64::new(0),
         }
@@ -420,6 +429,8 @@ impl Task {
             task_ul_limit: AtomicU64::new(ul0),
             http_limiter: OnceLock::new(),
             finished_at: AtomicU64::new(0),
+            live: AtomicBool::new(false),
+            live_recorded_ms: AtomicU64::new(0),
             avg_active_ms: AtomicU64::new(0),
             avg_bytes: AtomicU64::new(0),
         }
@@ -483,6 +494,8 @@ impl Task {
             task_ul_limit: AtomicU64::new(ul0),
             http_limiter: OnceLock::new(),
             finished_at: AtomicU64::new(0),
+            live: AtomicBool::new(false),
+            live_recorded_ms: AtomicU64::new(0),
             avg_active_ms: AtomicU64::new(0),
             avg_bytes: AtomicU64::new(0),
         }
@@ -996,6 +1009,16 @@ pub fn status_json(task: &Task) -> Value {
     m.insert("files".into(), Value::Array(files));
     m.insert("numSeeders".into(), json!(num_seeders.to_string()));
     m.insert("seeder".into(), json!(seeder.to_string()));
+    // 直播录制：标识 + 已录媒体时长（毫秒）。界面据此把任务卡片换成
+    // "录制中 · 已录制时长 · 已录制大小"形态（非直播任务为 false / "0"）。
+    m.insert(
+        "isLive".into(),
+        json!(task.live.load(Ordering::Relaxed).to_string()),
+    );
+    m.insert(
+        "liveRecordedMs".into(),
+        json!(task.live_recorded_ms.load(Ordering::Relaxed).to_string()),
+    );
     m.insert("numPieces".into(), json!(num_pieces.to_string()));
     m.insert("pieceLength".into(), json!(piece_length.to_string()));
     // 做种分享率（uploaded/total，0 时为 0）
@@ -1128,6 +1151,9 @@ pub fn status_json_native(task: &Task) -> Value {
         "files": files,
         "numSeeders": num_seeders,
         "seeder": seeder,
+        // 直播录制：标识 + 已录媒体时长（毫秒，见 aria2 版同名字段）
+        "isLive": task.live.load(Ordering::Relaxed),
+        "liveRecordedMs": task.live_recorded_ms.load(Ordering::Relaxed),
         "numPieces": num_pieces,
         "pieceLength": piece_length,
         "awaitingSelection": task.awaiting_selection.load(Ordering::Relaxed),

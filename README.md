@@ -251,7 +251,9 @@ the list; `Tab` switches focus between the two tables, arrow keys and
 - *HLS (M3U8)*: segment concurrency (`hls-concurrency`), variant selection
   (`hls-variant` = best / worst), segment size probing (`hls-probe-size`),
   per-segment retries (`hls-segment-retries`), write mode (`hls-write-mode` =
-  unordered assembly / ordered write-through).
+  unordered assembly / ordered write-through), and continuous recording of live
+  playlists (no `#EXT-X-ENDLIST`), wrapped up after `hls-live-stall-timeout`
+  seconds without new segments (`0` = never conclude on inactivity).
 - *Trackers & UI*: the global tracker list, tracker subscriptions, and the UI
   language (Simplified / Traditional / English, persisted to the session).
   The *Engine* card below shows the version, uptime, feature list
@@ -439,7 +441,7 @@ array response; only entries carrying an `id` are answered).
 // Request
 {"jsonrpc": "2.0", "id": 1, "method": "engine.getVersion", "params": {"token": "mytoken"}}
 // Success response
-{"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.3.4",
+{"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.3.5",
  "features": ["http", "resume", "checksum", "bt", "hls", "events", "bitfield",
               "wanted-bitfield", "ban-peer", "change-uri", "get-servers",
               "verify-files"]}}
