@@ -5,7 +5,8 @@
 # XferRust
 
 A high-performance, lightweight standalone download engine written in Rust,
-supporting **HTTP(S)**, **HLS (M3U8)** and **BitTorrent (BT)** downloads. It
+supporting **HTTP(S)**, **HLS (M3U8)**, **HTTP-FLV** and **BitTorrent (BT)**
+downloads. It
 ships with a full-screen terminal UI and can also run as a background daemon
 controlled over JSON-RPC by web apps, desktop applications and other clients.
 
@@ -27,6 +28,15 @@ controlled over JSON-RPC by web apps, desktop applications and other clients.
   probed up front so the total length — and therefore progress and ETA — is
   known, and resume continues from the last fsynced contiguous prefix
   (`hls-probe-size=false` disables probing).
+- **HTTP-FLV live recording**: a `.flv` (or `video/x-flv`) URL served as a
+  chunked response **without a `Content-Length`** is a live stream — the
+  engine records it continuously instead of running a download that can never
+  finish. Timestamps are zero-based and stitched across reconnects, so the
+  output plays as one continuous recording and `liveRecordedMs` reports its
+  real duration; disconnects are reconnected automatically and pausing keeps
+  everything recorded so far. A FLV served **with** a `Content-Length` is a
+  plain file and downloads normally; `flv=false` disables sniffing, `flv=true`
+  forces recording for endpoints that advertise neither type nor extension.
 - **BitTorrent** torrents and magnet links with multi-peer parallel
   downloading and rarest-first piece selection, on top of a complete network
   stack: DHT (BEP 5), IPv6 DHT (BEP 32), peer exchange (BEP 11), local peer
@@ -254,6 +264,9 @@ the list; `Tab` switches focus between the two tables, arrow keys and
   unordered assembly / ordered write-through), and continuous recording of live
   playlists (no `#EXT-X-ENDLIST`), wrapped up after `hls-live-stall-timeout`
   seconds without new segments (`0` = never conclude on inactivity).
+- *HTTP-FLV*: continuous recording of live streams (chunked responses without
+  a `Content-Length`), wrapped up after `flv-live-stall-timeout` seconds
+  without any new data (`0` = never conclude on inactivity).
 - *Trackers & UI*: the global tracker list, tracker subscriptions, and the UI
   language (Simplified / Traditional / English, persisted to the session).
   The *Engine* card below shows the version, uptime, feature list
@@ -442,9 +455,9 @@ array response; only entries carrying an `id` are answered).
 {"jsonrpc": "2.0", "id": 1, "method": "engine.getVersion", "params": {"token": "mytoken"}}
 // Success response
 {"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.3.5",
- "features": ["http", "resume", "checksum", "bt", "hls", "events", "bitfield",
-              "wanted-bitfield", "ban-peer", "change-uri", "get-servers",
-              "verify-files"]}}
+ "features": ["http", "resume", "checksum", "bt", "hls", "flv", "events",
+              "bitfield", "wanted-bitfield", "ban-peer", "change-uri",
+              "get-servers", "verify-files"]}}
 // Error response
 {"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": "Unauthorized"}}
 ```

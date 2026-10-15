@@ -20,12 +20,14 @@ pub const NATIVE_PREFIXES: [&str; 3] = ["task.", "engine.", "events."];
 ///
 /// 应用端"引擎信息"卡片与 TUI 都读它做能力展示——新增传输/协议能力
 /// （如 HLS）时必须同步到这里，否则引擎明明支持、界面上却看不到。
-pub const ENGINE_FEATURES: [&str; 13] = [
+pub const ENGINE_FEATURES: [&str; 14] = [
     "http",
     "resume",
     "checksum",
     "bt",
     "hls",
+    // HTTP-FLV 直播录制（无 Content-Length 的 chunked 长连接持续录成产物）
+    "flv",
     "events",
     "bitfield",
     "wanted-bitfield",

@@ -71,6 +71,14 @@ const DEFAULT_HLS_CONNECTIONS: usize = 16;
 /// 列表"（占线上"假直播"的大头）也靠这一档收尾 —— 设 0 可关掉。
 const HLS_LIVE_STALL_DEFAULT_SECS: u64 = 120;
 
+/// HTTP-FLV 直播录制停滞判定的默认秒数（`flv-live-stall-timeout` 未设置时）。
+///
+/// 比 HLS 短得多（60s vs 120s）：FLV 是**一条连续的数据流**，正常时每秒
+/// 都有多个 tag 在流动，连续一分钟没有任何字节只可能是流死了；而 HLS 的
+/// 分片间隔本身就可以到 10 秒量级，"没有新分片"要多给几倍宽容。设 0 可关掉
+/// （一直录到地址下线或用户暂停）。
+const FLV_LIVE_STALL_DEFAULT_SECS: u64 = 60;
+
 /// 生成 16 字符 hex ID（用于订阅源标识）。
 fn generate_id() -> String {
     let mut buf = [0u8; 8];
@@ -1926,6 +1934,33 @@ impl TaskManager {
         }
     }
 
+    /// 计算 HTTP-FLV 直播录制参数：任务选项 > 全局选项 > 默认值。
+    ///
+    /// 只有一个可调项（停滞收尾的秒数），其余（逐任务头 / 限速器）与
+    /// HTTP 下载共用同一套来源。
+    fn flv_options(
+        &self,
+        task: &Task,
+        headers: &xfer_http::RequestHeaders,
+    ) -> xfer_http::FlvOptions {
+        let g = self.inner.lock().unwrap().global_options.clone();
+        let t = task.options.lock().unwrap().clone();
+        let secs = t
+            .get("flv-live-stall-timeout")
+            .or_else(|| g.get("flv-live-stall-timeout"))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(FLV_LIVE_STALL_DEFAULT_SECS);
+        xfer_http::FlvOptions {
+            headers: headers.clone(),
+            limiter: Some(task.http_task_limiter()),
+            stall_timeout: if secs == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(secs)
+            },
+        }
+    }
+
     /// HLS 任务的一次 URI 尝试：取清单 → 落位 → 并发拉分片顺序拼接。
     ///
     /// 与 [`try_uri`] 同构：探测（这里是取清单）→ 路径解析 → 进度基线
@@ -2171,6 +2206,97 @@ impl TaskManager {
         }
     }
 
+    /// HTTP-FLV 直播录制的一次 URI 尝试（探测已在调用方完成）。
+    ///
+    /// 与 [`Self::try_playlist`] 的直播分支同构：落位 → 续录水位 →
+    /// 持续录制（[`xfer_http::record_flv`]）→ 收尾回填。区别只在产物
+    /// 直接是一条连续文件（没有分片拼接、没有段目录）。
+    ///
+    /// 返回 [`xfer_http::HttpError::NotFlv`] 表示"看着像直播、内容不是
+    /// FLV"（全新任务才会走到这里）：调用方回退普通 HTTP 下载。
+    async fn try_flv(
+        &self,
+        task: &Arc<Task>,
+        client: &reqwest::Client,
+        uri: &str,
+        uri_idx: usize,
+        cancel: &CancellationToken,
+        headers: &xfer_http::RequestHeaders,
+    ) -> Result<(), TaskFailure> {
+        self.apply_task_rate_limits(task);
+        let path = self.resolve_flv_path(task, uri);
+        // 产物旁边有没有**直播现场**（暂停后续录 / 重启恢复）
+        let live_ctrl = xfer_http::flv_has_live_ctrl(&path);
+        task.mark_uri_used(uri_idx);
+        task.live.store(true, Ordering::Relaxed);
+        // 续录水位：产物字节 + 已录媒体时长（与录制器内部共用同一判定）
+        let (resume_bytes, live_ms) =
+            xfer_http::flv_live_resume_point(&path, uri).unwrap_or((0, 0));
+        {
+            let mut sh = task.shared.lock().unwrap();
+            sh.completed = resume_bytes;
+            sh.connections = 0;
+            // 直播没有"总长"（流在生长）：total 留空，界面展示"已录制大小"
+            sh.total_len = None;
+            sh.file_len = resume_bytes;
+        }
+        *task.http_pieces.write().unwrap() = None;
+        task.completed_atomic.store(resume_bytes, Ordering::Relaxed);
+        task.connections_atomic.store(0, Ordering::Relaxed);
+        task.live_recorded_ms.store(live_ms, Ordering::Relaxed);
+        if !live_ctrl {
+            tracing::info!(gid = %task.gid, uri = %uri, "FLV 直播流：开始持续录制");
+        }
+
+        let opts = self.flv_options(task, headers);
+        let stats = xfer_http::FlvStats::new(resume_bytes);
+        let sampler = spawn_flv_sampler(task, &stats);
+        let r =
+            xfer_http::record_flv(client, &path, uri, &opts, cancel, stats.clone()).await;
+        sampler.abort();
+        // 无论成败都把"已录制时长"定格到任务上（卡片一直要显示它）
+        task.live_recorded_ms
+            .store(stats.live_recorded_ms(), Ordering::Relaxed);
+        match r {
+            Ok(done) => {
+                {
+                    let mut sh = task.shared.lock().unwrap();
+                    sh.completed = done.bytes;
+                    sh.connections = 0;
+                    sh.file_len = done.bytes;
+                    // 录完总长才定格为产物长度（录制期间不给百分比分母）
+                    sh.total_len = Some(done.bytes.max(1));
+                }
+                task.completed_atomic.store(done.bytes, Ordering::Relaxed);
+                task.connections_atomic.store(0, Ordering::Relaxed);
+                tracing::info!(
+                    gid = %task.gid, bytes = done.bytes, live_ms = done.live_ms,
+                    file = %path.display(), "FLV 直播录制完成"
+                );
+                finish_http_task(task, &path).await
+            }
+            Err(xfer_http::HttpError::NotFlv) if !live_ctrl && resume_bytes == 0 => {
+                // 看着像直播、内容不是 FLV（全新任务）：撤回"直播"标记，
+                // 交回普通 HTTP 下载（走本函数下方的主路径）
+                task.live.store(false, Ordering::Relaxed);
+                task.live_recorded_ms.store(0, Ordering::Relaxed);
+                Err(TaskFailure::Http(xfer_http::HttpError::NotFlv))
+            }
+            Err(e) => {
+                // 用 `progress()`：已在写出的字节取消/暂停都不会丢
+                let completed = stats.progress();
+                {
+                    let mut sh = task.shared.lock().unwrap();
+                    sh.completed = completed;
+                    sh.connections = 0;
+                }
+                task.completed_atomic.store(completed, Ordering::Relaxed);
+                task.connections_atomic.store(0, Ordering::Relaxed);
+                Err(TaskFailure::Http(e))
+            }
+        }
+    }
+
     /// 计算 BT 下载参数：任务选项 > 全局选项 > 默认值。
     ///
     /// 返回 `(预分配连接数, 是否启用智能调度)`。BT 连接数独立于 HTTP 的 split。
@@ -2368,6 +2494,28 @@ impl TaskManager {
         })
     }
 
+    /// FLV 直播录制任务的目标路径：默认文件名由用户给出的地址推导
+    /// （[`xfer_http::flv_default_filename`]：末段，扩展名归一为 `.flv`）。
+    ///
+    /// 显式 `out` 只有在**没有扩展名**时才补 `.flv`（用户点名要的名字
+    /// 不动）；同名文件只有**存在 FLV 录制现场**时才视为可续录，否则
+    /// 重命名新文件——不能把别人完整的同名视频截断重写。
+    fn resolve_flv_path(&self, task: &Arc<Task>, uri: &str) -> PathBuf {
+        if let Some(p) = task.shared.lock().unwrap().path.clone() {
+            return p;
+        }
+        let base_name = match task.out.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(out) => normalize_flv_out(out),
+            None => xfer_http::flv_default_filename(uri),
+        };
+        let continue_enabled = self.continue_enabled();
+        self.claim_path(task, base_name, |existing, candidate| {
+            continue_enabled
+                && existing > 0
+                && xfer_storage::ctrl_path(candidate).exists()
+        })
+    }
+
     /// 占用一个不与磁盘/其他任务冲突的目标路径。
     ///
     /// `can_resume(existing, candidate)` 判定"同名文件是否可以就地续传"；
@@ -2552,6 +2700,7 @@ impl TaskManager {
                     | "hls-concurrency"
                     | "hls-write-mode"
                     | "hls-live-stall-timeout"
+                    | "flv-live-stall-timeout"
             ) {
                 // HTTP 分片参数 / BT 连接参数 / BT 做种配置 / 网络发现开关
                 // / 磁力存种子 / 磁盘缓存 / HTTP 续传与客户端配置 / HLS
@@ -2589,6 +2738,15 @@ impl TaskManager {
                     let t = v.trim();
                     if !t.is_empty() && t.parse::<u64>().is_err() {
                         tracing::warn!(value = %v, "hls-live-stall-timeout 取值无效（应为秒数或留空），已忽略该键");
+                        continue;
+                    }
+                }
+                if k == "flv-live-stall-timeout" {
+                    // FLV 直播录制的停滞判定（秒）；空串 = 恢复默认（60 秒），
+                    // 0 合法 = 不按停滞自动收尾（一直录到地址下线 / 用户暂停）
+                    let t = v.trim();
+                    if !t.is_empty() && t.parse::<u64>().is_err() {
+                        tracing::warn!(value = %v, "flv-live-stall-timeout 取值无效（应为秒数或留空），已忽略该键");
                         continue;
                     }
                 }
@@ -4806,6 +4964,36 @@ async fn try_uri(
         }
     }
 
+    // HTTP-FLV 直播嗅探：地址/MIME 像 FLV、且**服务器没给总长**（chunked
+    // 长连接）—— 这是直播的传输形态，按普通下载会得到一条永不完成的任务
+    // （服务器永远不回 EOF）。交给 FLV 录制驱动持续落盘，直到流结束。
+    // 有总长的 FLV 是点播文件，普通下载（含多连接/Range）本来就处理得更好；
+    // 显式 `flv=true` 时不再要求"没有总长"（对付不报类型也不带扩展名的地址）。
+    // 产物旁已有**直播现场**的（暂停/重启的任务）也必须继续走录制路径 ——
+    // 不能因为"这次服务器带了总长"就把断点现场丢掉。
+    if matches!(task.kind, TaskKind::Http) && !task.flv_disabled() {
+        let live_ctrl = task
+            .shared
+            .lock()
+            .unwrap()
+            .path
+            .as_ref()
+            .map(|p| xfer_http::flv_has_live_ctrl(p))
+            .unwrap_or(false);
+        let sniff = (probe.is_flv_hint() && probe.total_len.is_none()) || task.flv_forced();
+        if live_ctrl || sniff {
+            match mgr
+                .try_flv(task, client, uri, uri_idx, cancel, &headers)
+                .await
+            {
+                Err(TaskFailure::Http(xfer_http::HttpError::NotFlv)) => {
+                    tracing::info!(gid = %task.gid, "目标内容不是 FLV 直播流，按普通 HTTP 下载");
+                }
+                other => return other,
+            }
+        }
+    }
+
     task.mark_uri_used(uri_idx);
 
     // 总长度回填
@@ -5285,6 +5473,35 @@ fn spawn_playlist_sampler(
     })
 }
 
+/// HTTP-FLV 直播录制进度采样：与 [`spawn_playlist_sampler`] 的直播分支同构
+/// （无锁原子；不建分片位图、不估算总长，只同步进度/速度/连接数/已录时长）。
+fn spawn_flv_sampler(
+    task: &Arc<Task>,
+    stats: &Arc<xfer_http::FlvStats>,
+) -> tokio::task::JoinHandle<()> {
+    let task = task.clone();
+    let stats = stats.clone();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(Duration::from_millis(200));
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            iv.tick().await;
+            task.completed_atomic
+                .store(stats.progress(), Ordering::Relaxed);
+            // 速度走"已接收"（含还没凑成完整 tag 的字节），进度只认已落盘
+            task.received_atomic
+                .store(stats.received.load(Ordering::Relaxed), Ordering::Relaxed);
+            task.connections_atomic.store(
+                stats.connections.load(Ordering::Relaxed) as u64,
+                Ordering::Relaxed,
+            );
+            // 已录制媒体时长（卡片上的"已录制时长"，独立于下载进度）
+            task.live_recorded_ms
+                .store(stats.live_recorded_ms(), Ordering::Relaxed);
+        }
+    })
+}
+
 enum SinkMode {
     Fresh,
     Resume(u64),
@@ -5429,6 +5646,22 @@ fn normalize_playlist_out(out: &str, fmp4: bool) -> String {
         let trimmed = out.trim_end_matches('.').trim_end();
         if !trimmed.is_empty() {
             return format!("{trimmed}.{container}");
+        }
+    }
+    out.to_string()
+}
+
+/// FLV 直播产物名的扩展名归一：**无扩展名**时补 `.flv`，其余原样保留。
+///
+/// 与 HLS 的 [`normalize_playlist_out`] 不同，这里不做"清单扩展名换容器"
+/// 的纠正 —— 用户（或浏览器扩展）给的 `.flv` 本来就对，而刻意要
+/// `.mp4` 之类的名字属于用户自己的选择，不越权改。
+fn normalize_flv_out(out: &str) -> String {
+    let file = out.rsplit(['/', '\\']).next().unwrap_or(out);
+    if !file.contains('.') || file.ends_with('.') {
+        let trimmed = out.trim_end_matches('.').trim_end();
+        if !trimmed.is_empty() {
+            return format!("{trimmed}.flv");
         }
     }
     out.to_string()
@@ -5880,6 +6113,53 @@ mod tests {
             .unwrap();
         let g = mgr.get_global_option();
         assert_eq!(g["hls-live-stall-timeout"], serde_json::json!("0"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FLV 帧停滞收尾全局选项（`flv-live-stall-timeout`）的白名单与校验：
+    /// 正例入库、非法值跳过且不覆盖旧值、空串 = 恢复默认、0 = 不自动收尾。
+    #[tokio::test]
+    async fn flv_live_stall_timeout_validate_and_store() {
+        let dir = std::env::temp_dir().join(format!("xfer-flv-globals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = TaskManager::new(dir.clone(), 1);
+
+        mgr.change_global_option(&serde_json::json!({
+            "flv-live-stall-timeout": "45",
+        }))
+        .unwrap();
+        let g = mgr.get_global_option();
+        assert_eq!(g["flv-live-stall-timeout"], serde_json::json!("45"));
+
+        // 非法值：跳过该键（保留原值）
+        mgr.change_global_option(&serde_json::json!({
+            "flv-live-stall-timeout": "one-minute",
+        }))
+        .unwrap();
+        let g = mgr.get_global_option();
+        assert_eq!(
+            g["flv-live-stall-timeout"],
+            serde_json::json!("45"),
+            "非法停滞秒数不应覆盖旧值"
+        );
+
+        // 空串 = 恢复默认
+        mgr.change_global_option(&serde_json::json!({"flv-live-stall-timeout": ""}))
+            .unwrap();
+        let g = mgr.get_global_option();
+        assert_eq!(
+            g["flv-live-stall-timeout"],
+            serde_json::json!(""),
+            "空串必须被接受（恢复默认 60 秒）"
+        );
+
+        // 0 = 合法（不按停滞自动收尾）
+        mgr.change_global_option(&serde_json::json!({"flv-live-stall-timeout": "0"}))
+            .unwrap();
+        let g = mgr.get_global_option();
+        assert_eq!(g["flv-live-stall-timeout"], serde_json::json!("0"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

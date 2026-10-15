@@ -102,6 +102,26 @@ pub fn hls_option_value(options: &HashMap<String, String>) -> Option<bool> {
     None
 }
 
+/// `flv` / `http-flv` 选项的显式取值（None = 未设置，按响应内容自动判定）。
+///
+/// 与 HLS 不同，FLV **没有独立的任务种类**：点播 FLV 就是普通文件下载，
+/// 只有"服务器没给总长的 chunked 长连接"才是直播、才进录制路径。所以
+/// 这个选项只在**强制**时改变行为：
+///
+/// - `flv=false`：不嗅探（一个像直播的地址按普通文件下载）；
+/// - `flv=true`：不要求"服务器没给总长"也按 FLV 录制（对付不报
+///   `Content-Type` 且不带扩展名的直播地址）。
+pub fn flv_option_value(options: &HashMap<String, String>) -> Option<bool> {
+    for key in ["flv", "http-flv"] {
+        if let Some(v) = options.get(key) {
+            let v = v.trim().to_ascii_lowercase();
+            let off = v == "false" || v == "0" || v == "no" || v == "off";
+            return Some(!off);
+        }
+    }
+    None
+}
+
 /// 从 URIs 与任务选项判定任务种类。
 ///
 /// 新增任务与重启恢复共用同一判据，保证恢复后的任务回到同一条驱动
@@ -507,6 +527,16 @@ impl Task {
     /// 只是把种类改成 HTTP，嗅探又会把任务拽回播放列表路径。
     pub fn hls_disabled(&self) -> bool {
         hls_option_value(&self.options.lock().unwrap()) == Some(false)
+    }
+
+    /// 任务是否被显式关掉 FLV 直播嗅探（`flv=false`）。
+    pub fn flv_disabled(&self) -> bool {
+        flv_option_value(&self.options.lock().unwrap()) == Some(false)
+    }
+
+    /// 任务是否被显式强制按 FLV 直播录制（`flv=true`）。
+    pub fn flv_forced(&self) -> bool {
+        flv_option_value(&self.options.lock().unwrap()) == Some(true)
     }
 
     pub fn status(&self) -> Status {

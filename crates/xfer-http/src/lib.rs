@@ -1,8 +1,10 @@
 //! HTTP(S) 下载：探测（总长度 / 文件名 / Range 支持）、单连接流式下载
 //! 与多连接分片下载（见 [`split`] 模块：单写线程调度 + 工作窃取对冲
-//! + 段级控制文件断点续传）。HLS（M3U8）播放列表下载见 [`playlist`]。
+//! + 段级控制文件断点续传）。HLS（M3U8）播放列表下载见 [`playlist`]，
+//! HTTP-FLV 直播录制见 [`flv`]。
 
 mod adaptive;
+mod flv;
 mod playlist;
 mod rate;
 mod split;
@@ -10,6 +12,10 @@ mod split;
 mod testutil;
 
 pub use adaptive::{AdaptiveConfig, AdaptiveScheduler, ConnPerf, ScheduleAction};
+pub use flv::{
+    default_filename as flv_default_filename, has_live_ctrl as flv_has_live_ctrl,
+    live_resume_point as flv_live_resume_point, record_flv, FlvDone, FlvOptions, FlvStats,
+};
 pub use playlist::{
     default_filename as playlist_default_filename, download_playlist, fetch_plan,
     has_live_ctrl as playlist_has_live_ctrl, live_resume_point as playlist_live_resume_point,
@@ -180,6 +186,10 @@ pub enum HttpError {
     /// 资源"的地址当播放列表处理会把整个响应体下载成产物。
     #[error("目标内容不是 M3U8 播放列表")]
     NotPlaylist,
+    /// 目标地址返回的内容不是 FLV 直播流（无 FLV 文件头，或压根不是
+    /// FLV）。调用方据此回退普通 HTTP 下载。
+    #[error("目标内容不是 FLV 直播流")]
+    NotFlv,
     #[error("本地写入失败: {0}")]
     Io(String),
     #[error("已取消")]
@@ -205,7 +215,8 @@ impl HttpError {
         match self {
             Self::Timeout | Self::Connect(_) | Self::Protocol(_) | Self::ShortRead => true,
             Self::Http(code) => *code >= 500,
-            Self::NotSplittable(_) | Self::NotPlaylist | Self::Io(_) | Self::Cancelled => false,
+            Self::NotSplittable(_) | Self::NotPlaylist | Self::NotFlv | Self::Io(_)
+            | Self::Cancelled => false,
         }
     }
 
@@ -235,13 +246,21 @@ impl HttpError {
             HttpError::Connect(_)
             | HttpError::Protocol(_)
             | HttpError::NotSplittable(_)
-            | HttpError::NotPlaylist => 5,
+            | HttpError::NotPlaylist
+            | HttpError::NotFlv => 5,
             HttpError::Io(_) => 1,
             HttpError::Cancelled => 0,
             HttpError::ShortRead => 5,
         }
     }
 }
+
+/// 探测时的响应体排空上限（见 [`probe_with`]）。
+///
+/// 小请求（`Range: 0-0` 的 1 字节 206、几 KB 的清单）都能整份读完、
+/// 连接得以复用；直播/巨型响应读到上限即断开，探测绝不挂死、也不
+/// 白白吞下整个文件。
+const PROBE_DRAIN_LIMIT: u64 = 64 * 1024;
 
 /// 资源探测结果。
 #[derive(Debug, Clone)]
@@ -295,6 +314,22 @@ impl Probe {
         ];
         HINTS.iter().any(|h| lower.contains(h))
     }
+
+    /// 是否**像是** FLV（HTTP-FLV 直播的形态：`video/x-flv` 家族 MIME，
+    /// 或地址以 `.flv` 结尾）。
+    ///
+    /// 与 HLS 一样这只是"像"：命中后仍要在正文里验证 FLV 文件头
+    /// （`FLV\x01`），不是就回退普通 HTTP 下载（见 [`crate::record_flv`]
+    /// 的 [`HttpError::NotFlv`]）。另外调用方通常还要求"服务器没有给出
+    /// 总长"才算直播候选 —— 有点播实体的 FLV 走普通下载即可。
+    pub fn is_flv_hint(&self) -> bool {
+        if let Some(ct) = &self.content_type {
+            if mime_is_flv(ct) {
+                return true;
+            }
+        }
+        looks_like_flv_url(&self.final_url)
+    }
 }
 
 /// 取 URL 的路径部分（去查询串 / 片段，再去矩阵参数）。
@@ -318,32 +353,57 @@ pub fn mime_is_mpegurl(content_type: &str) -> bool {
     ct.contains("mpegurl") || ct.contains("m3u8") || ct.contains("vnd.apple")
 }
 
+/// MIME 是否属于 FLV 家族（`video/x-flv` / `application/x-flv` / `video/flv` …）。
+pub fn mime_is_flv(content_type: &str) -> bool {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .to_ascii_lowercase();
+    ct.contains("flv")
+}
+
+/// 常见"类型写在查询串里"的参数名（HLS / FLV 嗅探共用）。
+const QUERY_HINT_NAMES: [&str; 12] = [
+    "format",
+    "fmt",
+    "type",
+    "output",
+    "ext",
+    "suffix",
+    "filetype",
+    "file_type",
+    "mediatype",
+    "media_type",
+    "container",
+    "f",
+];
+
 /// 查询串里是否**明确声明**了这一路是 HLS。
 ///
 /// 只认"参数值本身就是 HLS"的组合（`format=hls` / `type=m3u8` / `output=m3u8` …），
 /// 不去猜语义模糊的参数 —— 宁可漏，也不要让一个普通地址被当成清单去解析。
 /// 参数名取自线上常见的中转 / 播放接口。
 pub fn hls_query_hint(query: &str) -> bool {
-    const NAMES: [&str; 12] = [
-        "format",
-        "fmt",
-        "type",
-        "output",
-        "ext",
-        "suffix",
-        "filetype",
-        "file_type",
-        "mediatype",
-        "media_type",
-        "container",
-        "f",
-    ];
+    query_hint_value(query, |v| {
+        v == "hls" || v == "m3u8" || v == "m3u" || mime_is_mpegurl(v)
+    })
+}
+
+/// 查询串里是否明确声明这一路是 FLV（`?format=flv` / `?type=flv` …）。
+pub fn flv_query_hint(query: &str) -> bool {
+    query_hint_value(query, |v| v == "flv" || mime_is_flv(v))
+}
+
+/// 在 [`QUERY_HINT_NAMES`] 限定的参数里找值满足 `pred` 的一项。
+fn query_hint_value(query: &str, pred: impl Fn(&str) -> bool) -> bool {
     for pair in query.split('&') {
         let (k, v) = match pair.split_once('=') {
             Some(kv) => kv,
             None => continue,
         };
-        if !NAMES.contains(&k.trim().to_ascii_lowercase().as_str()) {
+        if !QUERY_HINT_NAMES.contains(&k.trim().to_ascii_lowercase().as_str()) {
             continue;
         }
         let v = v
@@ -352,7 +412,7 @@ pub fn hls_query_hint(query: &str) -> bool {
             .unwrap_or(v)
             .trim()
             .to_ascii_lowercase();
-        if v == "hls" || v == "m3u8" || v == "m3u" || mime_is_mpegurl(&v) {
+        if pred(&v) {
             return true;
         }
     }
@@ -371,6 +431,23 @@ pub fn looks_like_hls_url(url: &str) -> bool {
     let no_frag = url.split('#').next().unwrap_or(url);
     match no_frag.split_once('?') {
         Some((_, q)) => hls_query_hint(q),
+        None => false,
+    }
+}
+
+/// URL 是否像 FLV（后缀 `.flv`，或查询串里写明了 FLV）。
+///
+/// 与 [`looks_like_hls_url`] 同样只回答"要不要按 FLV 直播去试一次"：
+/// 命中后仍必须由正文的文件头确认，且"是不是直播"另由"服务器没给总长"
+/// 判定（点播 FLV 走普通下载）。
+pub fn looks_like_flv_url(url: &str) -> bool {
+    let lower = path_of(url).to_ascii_lowercase();
+    if lower.ends_with(".flv") {
+        return true;
+    }
+    let no_frag = url.split('#').next().unwrap_or(url);
+    match no_frag.split_once('?') {
+        Some((_, q)) => flv_query_hint(q),
         None => false,
     }
 }
@@ -410,10 +487,19 @@ pub async fn probe_with(
     let status = resp.status();
     let headers = resp.headers().clone();
     let final_url = resp.url().to_string();
-    // 排空响应体再释放：连接（与 TLS 会话）随即可被后续下载请求复用；
-    // 直接 drop 未读完的响应会让探测请求白白多付一次握手往返。
+    // 有界排空响应体再释放：小响应（1 字节 206、小清单）读完就能让连接
+    // （与 TLS 会话）被后续下载请求复用；但**绝不能无界追随** —— 直播流
+    // 是永不结束的 chunked 响应，以前这里会把探测挂死（FLV 直播地址，
+    // 以及任何"忽略 Range、整文件重发"的服务器）。上限之外直接断开，
+    // 代价只是一次重新握手。
     let mut resp = resp;
-    while let Ok(Some(_)) = resp.chunk().await {}
+    let mut drained = 0u64;
+    while drained < PROBE_DRAIN_LIMIT {
+        match resp.chunk().await {
+            Ok(Some(c)) => drained += c.len() as u64,
+            _ => break,
+        }
+    }
 
     // 416：bytes=0-0 对零长资源不可满足，Content-Range 携带真实总长。
     if status.as_u16() == 416 {

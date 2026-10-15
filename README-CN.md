@@ -5,7 +5,7 @@
 # XferRust
 
 一个用 Rust 编写的高性能、低资源占用的独立下载引擎，支持 **HTTP(S)**、
-**HLS（M3U8）** 与 **BitTorrent（BT）** 下载。自带全屏终端界面，也可作为
+**HLS（M3U8）**、**HTTP-FLV** 与 **BitTorrent（BT）** 下载。自带全屏终端界面，也可作为
 后台服务运行，供网页端、桌面应用等客户端通过 JSON-RPC 远程控制。
 
 ## 它能做什么
@@ -22,6 +22,12 @@
   分片加密（含密钥轮换；`SAMPLE-AES` 会明确报错而不是静默产出坏文件）。
   分片大小会先预探测一遍，总长因此可知，进度与剩余时间可用；断点续传按
   "已 fsync 的连续前缀"续接（`hls-probe-size=false` 可关闭预探测）。
+- **HTTP-FLV 直播录制**：`.flv`（或 `video/x-flv`）地址以 chunked 形态返回、
+  **没有 `Content-Length`** 时就是直播——引擎持续录成产物，而不是跑一条
+  永远不会完成的下载。时间戳从 0 起算、跨重连首尾相接，产物是一段连续
+  可播的内容，`liveRecordedMs` 给出真实录制时长；断线自动重连续录，暂停
+  保留已录内容。带 `Content-Length` 的 FLV 是点播文件，仍走普通下载；
+  `flv=false` 关闭嗅探，`flv=true` 可强制录制不报类型也不带扩展名的地址。
 - **BitTorrent**：种子与磁力链接，多 peer 并行 + rarest-first 选片；底层是
   完整网络栈：DHT（BEP 5）、IPv6 DHT（BEP 32）、peer 交换（BEP 11）、
   本地节点发现、uTP 与 MSE/PE 加密。
@@ -217,6 +223,8 @@ xfer tui [-d dir] [-j max-concurrent]
   （`hls-segment-retries`）、落盘方式（`hls-write-mode` = 乱序拼接 / 边下边排）、
   直播清单（无 `#EXT-X-ENDLIST`）的持续录制：`hls-live-stall-timeout` 秒无新增
   分片即收尾（`0` = 不按停滞自动收尾）。
+- *HTTP-FLV*：直播流（无 `Content-Length` 的 chunked 长连接）持续录制：
+  `flv-live-stall-timeout` 秒没有新数据即收尾（`0` = 不按停滞自动收尾）。
 - *Tracker 与界面*：全局 tracker 列表、tracker 订阅源、界面语言
   （简体 / 繁体 / English，写入会话持久化）。下方「引擎」卡片显示引擎版本、
   运行时间、能力清单（`engine.getVersion` 的 `features`）、代理与会话文件状态。
@@ -394,9 +402,9 @@ xferrust --rpc-listen-port=6800 --rpc-secret=mytoken
 {"jsonrpc": "2.0", "id": 1, "method": "engine.getVersion", "params": {"token": "mytoken"}}
 // 成功响应
 {"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.3.5",
- "features": ["http", "resume", "checksum", "bt", "events", "bitfield",
-              "wanted-bitfield", "ban-peer", "change-uri", "get-servers",
-              "verify-files"]}}
+ "features": ["http", "resume", "checksum", "bt", "hls", "flv", "events",
+              "bitfield", "wanted-bitfield", "ban-peer", "change-uri",
+              "get-servers", "verify-files"]}}
 // 错误响应
 {"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": "Unauthorized"}}
 ```

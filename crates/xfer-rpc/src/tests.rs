@@ -42,7 +42,7 @@ async fn native_get_version_and_stat() {
     let feats = v["result"]["features"]
         .as_array()
         .expect("features 必须是数组");
-    for expected in ["http", "bt", "hls", "resume", "bitfield"] {
+    for expected in ["http", "bt", "hls", "flv", "resume", "bitfield"] {
         assert!(
             feats.iter().any(|f| f == expected),
             "features 缺少 {expected}：{feats:?}"

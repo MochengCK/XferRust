@@ -1674,7 +1674,9 @@ fn is_volatile_param(k: &str, v: &str) -> bool {
 /// 之后的第二档判据，而且比对的是**有序**的稳定地址序列 —— 两条不同的清单要同时
 /// 满足"路径序列逐项相同 + 语义参数逐项相同 + 段数相同"才会被认成同一条，
 /// 概率低到可以接受；而它换来的收益是"签名轮换/换镜像都不再从零下载"。
-fn stable_url(raw: &str) -> String {
+///
+/// `pub(crate)`：FLV 直播录制的控制文件同样用"稳定形态"判定"还是不是同一条流"。
+pub(crate) fn stable_url(raw: &str) -> String {
     let Ok(u) = Url::parse(raw) else {
         // 解析不了（畸形串）时退回"原文去 fragment"：宁可判成"不同"（退回旧行为），
         // 也不要拿一个猜出来的形态去匹配续传现场。

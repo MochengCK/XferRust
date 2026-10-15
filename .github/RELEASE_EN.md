@@ -6,6 +6,10 @@
 - New global / per-task option `hls-live-stall-timeout` (seconds): how long a live source may go without new segments before the recording wraps up; 120 seconds by default, `0` = never conclude on inactivity
 - Nothing is silently faked: if the live window slides past a segment before it could be fetched, the engine skips it openly (and logs it, without failing the task); if a segment can never be fetched and blocks the splice point, the task fails honestly and a retry continues from the break point
 - The finished output shows the **correct duration**: live segments carry source-side ("since broadcast start") timestamps, so at wrap-up the timeline is shifted to start at zero — players report how long the recording actually is, not "time since the stream began"
+- **HTTP-FLV live recording**: a `.flv` / `video/x-flv` URL served as a chunked response **without a `Content-Length`** is a live stream — the engine records it continuously instead of running a download that can never finish; it reuses the same `isLive` / `liveRecordedMs` shape, so clients need no changes
+- FLV output is one continuously playable recording too: timestamps are zero-based and stitched across reconnects in real time (time lost to drops and pauses never enters the output); a FLV served **with** a `Content-Length` is a plain VOD file and downloads normally
+- New global / per-task option `flv-live-stall-timeout` (seconds): how long the stream may go without new data before wrapping up, 60 seconds by default; `0` = never conclude on inactivity; `flv=false` disables sniffing and `flv=true` forces recording for endpoints that advertise nothing
+- Also fixed: resource probing (`Range: bytes=0-0`) used to **drain the whole response body** from servers that ignore Range — live URLs hung in the probe stage; the drain is now bounded (64 KB)
 
 ## New Features
 
@@ -17,8 +21,18 @@
 - Resuming shares the same on-disk state as regular playlist downloads: the control file gains a live record (bytes on disk, next media sequence to splice, recorded duration, init segment already written). Pausing and failing both keep it; resuming truncates the output to the last flushed watermark, clears stale segment files, and re-fetches the remaining window with `Range` requests.
 - Timeline normalization: when the recording wraps up, sample timestamps are shifted to start at zero — each track is shifted by its own timescale so relative A/V offsets are preserved, and `sidx` presentation times are adjusted as well; live segments are timestamped from the broadcast start, and without this some players would report the duration as "time since the stream began" instead of the actual recording length.
 
+### HTTP-FLV live recording
+
+- Shape detection shares the HLS design language: a URL that looks like FLV (`.flv` suffix / query hint / `video/x-flv` family MIME) **and** has no declared total length (a chunked connection) is recorded continuously; the body is confirmed against the FLV header (`FLV\x01`) and falls back to a plain HTTP download otherwise. VOD FLV (with a length) is not sniffed.
+- Per-tag parsing with **in-place, real-time** timestamp rewriting (only the 4-byte timestamp field changes; tag structure and length are untouched): the first segment starts at zero, and every reconnect (drop, resume, source restart) re-anchors to the end of the current watermark.
+- Reconnects: EOF, read silence and connection errors are treated as a failed attempt with backoff (0.5s up to 8s); persistent 404 / 410 responses, or `flv-live-stall-timeout` seconds (60 by default) without any new data, wrap the recording up.
+- Replay guard: when the server switches to resending the same content from the beginning after the stream ended (archives / finite resources reconnected as live), the segment's first media tag is compared byte-for-byte against the recording's own beginning — the replayed pass is not written at all.
+- Resume scene: the control file stores the byte watermark (always at a **complete tag boundary**), the recorded duration and the replay reference; pausing and failing both keep it. Session persistence reuses the existing `isLive` / `liveRecordedMs` fields.
+- The output timeline is normalized in real time while recording, so a wrapped-up file reports its actual recording length.
+
 ## Behavior Changes
 
+- A `.flv` / `video/x-flv` URL without a `Content-Length` changes from "a download that never completes" to **recording until wrapped up** (which is the point of this release); pause the task to stop it (the scene is kept). FLV with a `Content-Length` is completely unaffected.
 - The default behaviour for live / rolling-window playlists changes from "download the current window snapshot" to **recording until wrapped up**: callers that used such URLs as "grab this window and go" will see the task keep running — which is the point of this release; pause the task to stop it (the state is kept).
 - The output is "what was actually recorded": a window missed during recording is reported as lost (the log says how many segments were skipped), never padded with placeholders, and never fails the task by itself.
 - A plain VOD playlist without `#EXT-X-ENDLIST` also goes through the recording path: it finishes after `hls-live-stall-timeout` (120 seconds by default) with nothing new, instead of finishing instantly.
