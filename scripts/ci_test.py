@@ -150,6 +150,58 @@ class Tester:
         return 0
 
 
+def wait_or_fail(fn, timeout, interval=1.0, desc=""):
+    """轮询直到 fn() 返回真值；**fn 抛异常就立刻失败**（不吞）。
+
+    与 [wait_until] 的区别：那个会把异常吞到超时（沿途异常只在最后当"最近错误"带出来），
+    适合"还没就绪"这类正常中间态；这个用于"任务已经失败"这类**必须立刻收手**的判据 ——
+    再等下去只会把真实原因埋进一句"超时"里（HTTPS 用例踩过：失败后干等 240 秒）。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if fn() is True:
+            return
+        time.sleep(interval)
+    raise AssertionError(f"超时等待 {desc}")
+
+
+# 任务已经"没救了"的状态（引擎 `list` 里的那个词）。
+_FAILED_STATES = {"error", "removed"}
+
+# HTTPS 下载的候选源（按顺序试，前一个失败自动换下一个）。
+# 选源两条硬要求：**同版本字节永不变**（要拿它当哈希基准）+ **不轻易限流**。
+# npm registry 的 tarball 两条都占（版本不可变、全球 CDN 无限流）；
+# example.com 是 IANA 官方的示例页，极小但极稳，当兜底。
+_HTTPS_SOURCES = [
+    "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
+    "https://www.example.com/",
+]
+
+# 单个源的等待预算（秒）。81 KB 的源正常几百毫秒就完；给到 60s 还不成就是真失败，
+# 不必像以前那样干等 240s（等待期间真实原因也会被"超时"盖掉）。
+_HTTPS_TIMEOUT = 60
+
+
+def task_state(t: "Tester", gid: str) -> str:
+    """查任务状态（空串 = 查不到 / 解析不出来）。
+
+    只是"失败时早点收手"的加速器：解析不出来不构成判据，**绝不能因为读不到状态
+    就当作成功**（所以调用方只拿它判失败，不拿它判完成 —— 完成一律看文件）。
+    """
+    if not gid:
+        return ""
+    r = t.rpc("list", ["--scope", "all"])
+    if r.returncode != 0:
+        return ""
+    for line in r.stdout.splitlines():
+        if gid in line:
+            m = re.search(
+                r"\b(active|waiting|paused|error|complete|seeding|merging|removed)\b", line
+            )
+            return m.group(1) if m else ""
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # 用例
 # ---------------------------------------------------------------------------
@@ -203,23 +255,59 @@ def case_http(t: Tester, work: str):
 
 
 def case_https(t: Tester, work: str):
-    """HTTPS 下载：外部 TLS 源，与 urllib 拉取结果 SHA-256 一致。"""
-    url = t.args.https_url
+    """HTTPS 下载：公共 TLS 源（**多源回退**），与 urllib 拉取结果 SHA-256 一致。
+
+    为什么是"公共源 + 多源回退"而不是本地起 TLS 服务：本地要自签证书，而自签证书
+    必须先进**系统信任库**引擎才认（rustls 只认内置根证书与系统库）—— 那一步在三个
+    平台的 CI 上都要动系统设置，比"挑一个稳的源"脆得多。
+
+    为什么把 raw.githubusercontent.com 换掉（2026-10-06 两次 CI 失败都出在这条）：
+    它在 GitHub 共享 runner 的出口 IP 上被限流得很凶（一次直接 429，一次让引擎
+    下载卡到 240s 超时）；在部分网络下连 TLS 都握不上。换成**内容按版本固定、
+    几乎不限流**的源：npm registry 的包 tarball（同版本字节永不变，天然适合做
+    哈希比对），备用 example.com（IANA 官方，577 B）。
+    """
+    # 命令行给了 --https-url 就用它（覆盖），否则用内置候选；两段拼起来按顺序试
+    sources: list[str] = []
+    if t.args.https_url:
+        sources.append(t.args.https_url)
+    sources += [u for u in _HTTPS_SOURCES if u not in sources]
+
+    errors = []
+    for url in sources:
+        try:
+            return _https_from(t, work, url)
+        except AssertionError as e:
+            # 换源的理由：限流 / 抖动的锅不该由门禁背（第一次 429 就是这么挂的）
+            errors.append(f"{url.split('/')[2]}: {e}")
+    raise AssertionError("所有 HTTPS 源都失败 —— " + "；".join(errors))
+
+
+def _https_from(t: Tester, work: str, url: str):
+    """对单个源跑一次 HTTPS 下载（失败抛 AssertionError，由调用方换下一个源）。"""
     try:
-        with urllib.request.urlopen(url, timeout=60) as resp:
+        with urllib.request.urlopen(url, timeout=30) as resp:
             expected = resp.read()
     except urllib.error.URLError as e:
-        raise AssertionError(f"无法访问 HTTPS 源 {url}: {e}") from e
+        raise AssertionError(f"无法访问源: {e}") from e
+    assert expected, "源返回了空内容（拿它做基准没意义）"
+
     out_dir = os.path.join(work, "https-out")
     os.makedirs(out_dir, exist_ok=True)
-    t.add(url, out_dir, out="https-dst.bin")
-
+    gid = t.add(url, out_dir, out="https-dst.bin")
     dst = os.path.join(out_dir, "https-dst.bin")
 
     def done():
-        return os.path.exists(dst) and os.path.getsize(dst) == len(expected)
+        if os.path.exists(dst) and os.path.getsize(dst) == len(expected):
+            return True
+        # **任务已经失败就立刻收手**：以前这里只盯着文件，失败要一直干等到 240s 超时，
+        # 真实原因（429 / 证书 / 断流）全被"超时"两个字盖住，只能靠人翻日志
+        st = task_state(t, gid)
+        if st in _FAILED_STATES:
+            raise AssertionError(f"任务失败（{st}），详见引擎日志 daemon.log")
+        return False
 
-    wait_until(done, timeout=240, desc="HTTPS 下载完成")
+    wait_or_fail(done, timeout=_HTTPS_TIMEOUT, desc=f"HTTPS 下载完成（{url.split('/')[2]}）")
     with open(dst, "rb") as f:
         assert hashlib.sha256(f.read()).hexdigest() == hashlib.sha256(expected).hexdigest(), \
             "HTTPS 下载文件与源不一致"
@@ -286,7 +374,8 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="工作目录（生成测试数据/日志）")
     ap.add_argument("--token", default="ci", help="RPC secret")
     ap.add_argument("--rpc-port", type=int, default=0, help="守护进程 RPC 端口（默认随机）")
-    ap.add_argument("--https-url", required=True, help="HTTPS 下载测试源 URL")
+    ap.add_argument("--https-url", default="",
+                    help="HTTPS 下载测试源（可选；不传则用脚本内置的候选列表，按序回退）")
     ap.add_argument("--keep-daemon", action="store_true", help="测试结束后不杀守护进程（调试用）")
     args = ap.parse_args()
 
@@ -323,6 +412,13 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 daemon.kill()
         logf.close()
+        # **有用例失败就把引擎日志尾部贴出来**：失败原因（429 / 证书 / 断流）都在里面。
+        # 以前只在"进程崩了（Traceback/panic）"时才打印 —— 而"下载失败"这类恰恰不崩，
+        # 于是日志明明在 test-out 里，还得人去翻 artifact 才知道为什么
+        if any(not ok for _, ok, _ in t.results):
+            tail = open(log, "rb").read().decode(errors="replace")
+            print("--- daemon.log 尾部（有用例失败，贴出来方便直接定位）---")
+            print("\n".join(tail.splitlines()[-30:]))
         if daemon.poll() is not None:
             tail = open(log, "rb").read().decode(errors="replace")
             if "Traceback" in tail or "panic" in tail.lower():

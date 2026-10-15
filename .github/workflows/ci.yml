@@ -313,17 +313,18 @@ jobs:
         shell: bash
         env:
           PYTHONUTF8: "1"
-          # HTTPS 测试源：需为公开可访问的稳定文件（私有仓库的 raw 链接会 404）。
-          # 如你有自建镜像/文件源，改这一行即可。
-          HTTPS_URL: https://raw.githubusercontent.com/torvalds/linux/master/README
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then PY=python; else PY=python3; fi
+          # HTTPS 测试源由脚本内置（多源回退），不再从 CI 注入。
+          # 以前钉死在 raw.githubusercontent.com：它在共享 runner 的出口 IP 上会被
+          # 429 限流、在部分网络下连 TLS 都握不上，两次把门禁打挂（详见
+          # scripts/ci_test.py 里 case_https 的说明）。要临时指一个自定义源，
+          # 本地跑时传 --https-url 即可。
           $PY scripts/ci_test.py \
             --xfer "bin/xfer" \
             --xferrust "bin/xferrust" \
             --out "test-out" \
-            --token ci \
-            --https-url "$HTTPS_URL"
+            --token ci
 
       - name: Upload test logs on failure
         if: failure()
