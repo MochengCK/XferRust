@@ -1,0 +1,19 @@
+[package]
+name = "xfer-lan"
+description = "端手互通 · 局域网文件传输（UDP 发现 + ECDH/AES-GCM 加密 TCP 传输）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# 密码学：全部纯 Rust，可交叉编译到 Android（无 OpenSSL / 系统库依赖）
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+p256 = { workspace = true }
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

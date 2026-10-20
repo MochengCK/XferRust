@@ -63,22 +63,75 @@ async fn run(cfg: EngineConfig) -> std::io::Result<()> {
     // CLI 传值应覆盖会话恢复的旧值；Android 等无 CLI 场景不受影响。
     manager.set_initial_options(&cfg.initial_options);
     let events = manager.events();
-    let router = std::sync::Arc::new(xfer_rpc::Router::new(
-        cfg.rpc_secret.clone(),
-        manager.clone(),
-        events,
-    ));
+
+    // 局域网传输：按下载目录（接收落盘）+ 数据目录（设备身份/任务表）拉起。
+    // 启动失败（端口/权限等）只告警，不影响引擎本身可用。
+    let data_dir = lan_data_dir(&cfg);
+    let lan = match xfer_lan::LanService::start(xfer_lan::LanConfig {
+        download_dir: cfg.download_dir.clone(),
+        data_dir: data_dir.clone(),
+    })
+    .await
+    {
+        Ok(lan) => {
+            tracing::info!(
+                device_id = lan.device_id(),
+                device_name = lan.device_name(),
+                tcp_port = lan.port(),
+                data_dir = %data_dir.display(),
+                "局域网传输服务就绪"
+            );
+            Some(lan)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "局域网传输启动失败，本次引擎不提供局域网互传");
+            None
+        }
+    };
+
+    let router = std::sync::Arc::new(match lan.clone() {
+        Some(lan) => xfer_rpc::Router::with_lan(
+            cfg.rpc_secret.clone(),
+            manager.clone(),
+            events,
+            lan,
+        ),
+        None => xfer_rpc::Router::new(cfg.rpc_secret.clone(), manager.clone(), events),
+    });
     let bind: std::net::SocketAddr = ([127, 0, 0, 1], cfg.rpc_listen_port).into();
     let shutdown = manager.shutdown_token();
     let engine_shutdown = shutdown.clone();
     let serve = xfer_rpc::serve(bind, router, shutdown);
-    tokio::select! {
+    let result = tokio::select! {
         r = serve => r,
         _ = engine_shutdown.cancelled() => {
             // 给 shutdown 响应留出回送时间后退出
             tokio::time::sleep(Duration::from_millis(300)).await;
             Ok(())
         }
+    };
+    if let Some(lan) = lan {
+        lan.stop().await;
+    }
+    result
+}
+
+/// 局域网本地状态目录：显式 `--data-dir` 优先；否则跟随会话文件目录
+/// （应用端把会话放在 `<userData>/.xfer/`），再退 `~/.xfer`。
+fn lan_data_dir(cfg: &EngineConfig) -> std::path::PathBuf {
+    if let Some(dir) = &cfg.data_dir {
+        return dir.clone();
+    }
+    if let Some(session) = &cfg.session {
+        if let Some(parent) = session.parent() {
+            if !parent.as_os_str().is_empty() {
+                return parent.to_path_buf();
+            }
+        }
+    }
+    match xfer_types::home_dir() {
+        Some(home) => home.join(".xfer"),
+        None => cfg.download_dir.join(".xfer"),
     }
 }
 

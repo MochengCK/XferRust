@@ -16,6 +16,7 @@ futures-util = "0.3"
 bytes = "1"
 xfer-types = { path = "../xfer-types" }
 xfer-engine = { path = "../xfer-engine" }
+xfer-lan = { path = "../xfer-lan" }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json"] }

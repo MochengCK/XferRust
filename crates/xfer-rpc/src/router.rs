@@ -1,6 +1,6 @@
 //! 协议路由器：按方法命名空间把请求分发给原生/前端兼容分发器。
 //!
-//! - 原生方法（`task.*`/`engine.*`/`events.*`）→ NativeDispatcher；
+//! - 原生方法（`task.*`/`engine.*`/`events.*`/`lan.*`）→ NativeDispatcher；
 //! - 其余（`aria2.*`、无前缀旧名、`system.*`）→ CompatDispatcher；
 //! - 支持 JSON-RPC batch（数组请求 → 数组响应）；
 //! - 每个请求封装统一响应帧（result / error）。
@@ -47,6 +47,20 @@ impl Router {
     ) -> Self {
         Self {
             native: NativeDispatcher::new(secret.clone(), engine.clone()),
+            compat: CompatDispatcher::new(secret, engine),
+            events,
+        }
+    }
+
+    /// 带局域网传输服务的路由器（`lan.*` 可用）。
+    pub fn with_lan(
+        secret: Option<String>,
+        engine: Arc<xfer_engine::TaskManager>,
+        events: broadcast::Sender<EngineEvent>,
+        lan: Arc<xfer_lan::LanService>,
+    ) -> Self {
+        Self {
+            native: NativeDispatcher::with_lan(secret.clone(), engine.clone(), lan),
             compat: CompatDispatcher::new(secret, engine),
             events,
         }

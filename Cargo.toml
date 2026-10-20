@@ -26,6 +26,12 @@ getrandom = "0.3"
 # 字符集解码（中文站点常用 GBK/GB2312 的百分号编码，见 xfer-types::text）
 encoding_rs = "0.8"
 base64 = "0.22"
+# 局域网传输（xfer-lan）：纯 Rust 密码学，可交叉编译到 Android
+# - ecdh：P-256 ECDH（协议 2.1 的会话密钥）
+# - aes：AES-256-GCM 分帧；alloc：密文/明文走 Vec
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "std"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+hkdf = "0.12"
 crossterm = "0.28"
 ratatui = "0.28"
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect"] }
@@ -43,6 +49,7 @@ xfer-types = { path = "crates/xfer-types" }
 xfer-rpc = { path = "crates/xfer-rpc" }
 xfer-engine = { path = "crates/xfer-engine" }
 xfer-geo = { path = "crates/xfer-geo" }
+xfer-lan = { path = "crates/xfer-lan" }
 unicode-width = { version = "0.1", optional = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

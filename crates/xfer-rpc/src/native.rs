@@ -11,16 +11,17 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use xfer_engine::{EngineEvent, TaskManager};
+use xfer_lan::LanService;
 use xfer_types::{Gid, ENGINE_NAME, ENGINE_VERSION};
 
 /// 原生方法命名空间前缀。
-pub const NATIVE_PREFIXES: [&str; 3] = ["task.", "engine.", "events."];
+pub const NATIVE_PREFIXES: [&str; 4] = ["task.", "engine.", "events.", "lan."];
 
 /// 引擎能力清单（`engine.getVersion` 的 `features` 字段）。
 ///
 /// 应用端"引擎信息"卡片与 TUI 都读它做能力展示——新增传输/协议能力
 /// （如 HLS）时必须同步到这里，否则引擎明明支持、界面上却看不到。
-pub const ENGINE_FEATURES: [&str; 14] = [
+pub const ENGINE_FEATURES: [&str; 15] = [
     "http",
     "resume",
     "checksum",
@@ -37,17 +38,40 @@ pub const ENGINE_FEATURES: [&str; 14] = [
     "verify-files",
     // 边下边播：task.setPlayhead（播放头附近的片优先下载）
     "playhead",
+    // 端手互通 · 局域网传输（lan.peers / lan.tasks / lan.send …）
+    "lan",
 ];
 
 /// 原生协议分发器。
 pub struct NativeDispatcher {
     secret: Option<String>,
     engine: Arc<TaskManager>,
+    /// 局域网传输服务（启动失败时为 None，lan.* 返回明确错误）。
+    lan: Option<Arc<LanService>>,
 }
 
 impl NativeDispatcher {
     pub fn new(secret: Option<String>, engine: Arc<TaskManager>) -> Self {
-        Self { secret, engine }
+        Self {
+            secret,
+            engine,
+            lan: None,
+        }
+    }
+
+    /// 带局域网传输的分发器。
+    pub fn with_lan(secret: Option<String>, engine: Arc<TaskManager>, lan: Arc<LanService>) -> Self {
+        Self {
+            secret,
+            engine,
+            lan: Some(lan),
+        }
+    }
+
+    fn lan(&self) -> Result<&Arc<LanService>, String> {
+        self.lan
+            .as_ref()
+            .ok_or_else(|| "局域网传输未启用".to_string())
     }
 
     /// 方法名是否属于原生命名空间。
@@ -334,6 +358,51 @@ impl NativeDispatcher {
             "engine.shutdown" | "engine.forceShutdown" => {
                 e.shutdown();
                 Ok(json!({"ok": true}))
+            }
+            // ---- 端手互通 · 局域网传输 ----
+            // 任务对象结构与协议第 3 节完全一致（见 xfer-lan::LanTask）。
+            "lan.peers" => {
+                let lan = self.lan()?;
+                Ok(json!({"peers": lan.peers()}))
+            }
+            "lan.tasks" => {
+                let lan = self.lan()?;
+                Ok(json!({"tasks": lan.tasks()}))
+            }
+            "lan.send" => {
+                let lan = self.lan()?;
+                let peer = obj
+                    .get("peer")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "参数 peer（设备 id）缺失".to_string())?;
+                let paths: Vec<String> = obj
+                    .get("paths")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "参数 paths（数组）缺失".to_string())?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect();
+                if paths.is_empty() {
+                    return Err("paths 不能为空".into());
+                }
+                lan.send(peer, &paths).map(|tasks| json!({"tasks": tasks}))
+            }
+            "lan.remove" => {
+                let lan = self.lan()?;
+                let id = obj
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "参数 id 缺失".to_string())?;
+                lan.remove(id).map(|_| json!({"ok": true}))
+            }
+            "lan.cancel" => {
+                let lan = self.lan()?;
+                let id = obj
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "参数 id 缺失".to_string())?;
+                lan.cancel(id).map(|_| json!({"ok": true}))
             }
             "events.subscribe" => Ok(json!({"ok": true})),
             _ => Err("Method not found".into()),

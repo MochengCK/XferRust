@@ -26,6 +26,10 @@ pub struct EngineConfig {
     pub log_level: Option<String>,
     /// 会话文件路径（Some 时开启持久化：启动恢复 + 状态转移自动落盘）。
     pub session: Option<PathBuf>,
+    /// 引擎数据目录（设备身份、局域网任务表等本地状态）。
+    ///
+    /// None = 由启动方推导：会话文件所在目录，否则 `~/.xfer`。
+    pub data_dir: Option<PathBuf>,
     /// 命令行携带的运行时全局选项（--key=value），启动时注入
     /// global_options，与 RPC engine.changeOptions 同一存储。
     pub initial_options: Vec<(String, String)>,
@@ -41,6 +45,7 @@ impl Default for EngineConfig {
             log_file: None,
             log_level: None,
             session: None,
+            data_dir: None,
             initial_options: Vec::new(),
         }
     }
@@ -116,6 +121,13 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParsedArgs {
                     cfg.session.get_or_insert_with(|| PathBuf::from(value));
                 }
             }
+            // 引擎数据目录：设备身份、局域网任务表等本地状态。
+            // 不传时由启动方按会话文件目录 / `~/.xfer` 推导。
+            "data-dir" => {
+                if !value.is_empty() {
+                    cfg.data_dir = Some(PathBuf::from(value));
+                }
+            }
             // 应用侧开关 → 引擎运行时选项映射：
             // UPnP/NAT-PMP 端口映射、uTP 传输开关
             "enable-upnp" | "enable-nat-pmp" => {
@@ -177,6 +189,15 @@ mod tests {
         let p = parse_args(["stray".to_string(), "--bt-seed-mode=true".to_string()]);
         assert_eq!(p.ignored, vec!["stray"]);
         assert!(p.config.initial_options.contains(&("bt-seed-mode".to_string(), "true".to_string())));
+    }
+
+    #[test]
+    fn parses_data_dir_option() {
+        let p = parse_args(["--data-dir=/tmp/xfer-data".to_string()]);
+        assert_eq!(p.config.data_dir, Some(PathBuf::from("/tmp/xfer-data")));
+        // 已知选项不再作为外部默认参数重复存储
+        assert!(p.config.initial_options.is_empty());
+        assert_eq!(parse_args([]).config.data_dir, None);
     }
 
     #[test]
