@@ -103,8 +103,10 @@ async fn receive_one(
     };
 
     let name = sanitize_name(&offer.name);
+    // 接收目录在这个任务开始时定下：中途改设置不影响已经在传的文件
+    let recv_dir = svc.recv_dir();
     // ---- 落盘准备：先建 .part，建不出来就拒绝（不要先 accept 再失败）----
-    let (part_path, reserved_final) = reserve_pair(svc.recv_dir(), &name);
+    let (part_path, reserved_final) = reserve_pair(&recv_dir, &name);
     let mut file = match File::create(&part_path).await {
         Ok(file) => file,
         Err(e) => {
@@ -170,7 +172,7 @@ async fn receive_one(
             drop(file); // Windows：文件句柄不关无法 rename
                         // 预留名被并发任务抢走时再让一次（重名一律追加序号，绝不覆盖）
             let final_path = if reserved_final.exists() {
-                unique_final(svc.recv_dir(), &name)
+                unique_final(&recv_dir, &name)
             } else {
                 reserved_final
             };

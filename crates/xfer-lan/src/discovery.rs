@@ -86,10 +86,11 @@ async fn recv(udp: &Option<(UdpSocket, bool)>, buf: &mut [u8]) -> Option<(usize,
 }
 
 async fn broadcast(svc: &LanService, socket: &UdpSocket, targets: &[SocketAddr]) {
+    let name = svc.device_name();
     let msg = DiscoverMsg::new(
         "discover",
         svc.device_id(),
-        svc.device_name(),
+        &name,
         svc.platform(),
         svc.port(),
     );
@@ -141,10 +142,11 @@ async fn handle(
     let Some((socket, _)) = udp else {
         return;
     };
+    let name = svc.device_name();
     let hello = DiscoverMsg::new(
         "hello",
         svc.device_id(),
-        svc.device_name(),
+        &name,
         svc.platform(),
         svc.port(),
     );

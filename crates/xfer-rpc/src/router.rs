@@ -52,12 +52,12 @@ impl Router {
         }
     }
 
-    /// 带局域网传输服务的路由器（`lan.*` 可用）。
+    /// 带局域网传输控制器的路由器（`lan.*` 可用）。
     pub fn with_lan(
         secret: Option<String>,
         engine: Arc<xfer_engine::TaskManager>,
         events: broadcast::Sender<EngineEvent>,
-        lan: Arc<xfer_lan::LanService>,
+        lan: Arc<xfer_lan::LanController>,
     ) -> Self {
         Self {
             native: NativeDispatcher::with_lan(secret.clone(), engine.clone(), lan),

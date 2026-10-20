@@ -12,6 +12,8 @@
 //! **线上的字段名、端口、salt/info、分帧格式必须与对端逐字节一致**；
 //! 改协议先改文档，再改这里。
 
+mod config;
+mod controller;
 mod crypto;
 mod device;
 mod discovery;
@@ -30,6 +32,8 @@ use serde::Serialize;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
+pub use config::{effective_recv_dir, LanUserConfig};
+pub use controller::{LanConfigPatch, LanController, LanStatus};
 pub use tasks::{Direction, LanTask, TaskStatus};
 
 /// 发现端口（协议第 1 节，固定，不协商）。
@@ -41,13 +45,17 @@ pub const DISCOVERY_INTERVAL: Duration = Duration::from_millis(2_000);
 /// 接收目录名：`<下载目录>/LerxuTransfer/`。
 pub const RECV_DIR_NAME: &str = "LerxuTransfer";
 
-/// 启动配置：引擎把下载目录与数据目录传进来，其余都由协议常量决定。
+/// 启动配置：引擎把下载目录与数据目录传进来；设备名与接收目录可选覆盖。
 #[derive(Debug, Clone)]
 pub struct LanConfig {
-    /// 下载目录（接收文件落在其下的 `LerxuTransfer/`）。
+    /// 下载目录（默认接收目录落在其下的 `LerxuTransfer/`）。
     pub download_dir: PathBuf,
-    /// 引擎数据目录（设备身份、任务表）。
+    /// 引擎数据目录（设备身份、任务表、用户配置）。
     pub data_dir: PathBuf,
+    /// 设备名覆盖；None 表示沿用设备身份文件里的名字。
+    pub device_name: Option<String>,
+    /// 接收目录覆盖；None 表示默认 `<下载目录>/LerxuTransfer/`。
+    pub recv_dir: Option<PathBuf>,
 }
 
 impl LanConfig {
@@ -55,6 +63,8 @@ impl LanConfig {
         Self {
             download_dir: download_dir.into(),
             data_dir: data_dir.into(),
+            device_name: None,
+            recv_dir: None,
         }
     }
 }
@@ -115,9 +125,13 @@ pub(crate) struct State {
 
 /// 局域网传输服务。`start` 后由后台任务驱动，`stop` 优雅收尾。
 pub struct LanService {
-    recv_dir: PathBuf,
+    /// 接收目录；运行期可改（已开始的传输仍落在开始时的那份目录）。
+    recv_dir: Mutex<PathBuf>,
     data_dir: PathBuf,
-    device: device::Device,
+    device_id: String,
+    /// 设备名；运行期可改，发现广播每次读最新值。
+    device_name: Mutex<String>,
+    platform: String,
     /// TCP 接收端口（discover.port）。
     port: u16,
     state: Mutex<State>,
@@ -134,19 +148,23 @@ impl LanService {
     ///
     /// UDP 41234 被占用时按协议"只发不收"降级（发现仍可用），不阻断启动。
     pub async fn start(config: LanConfig) -> Result<Arc<Self>, LanError> {
-        let recv_dir = config.download_dir.join(RECV_DIR_NAME);
+        let recv_dir = config
+            .recv_dir
+            .unwrap_or_else(|| config.download_dir.join(RECV_DIR_NAME));
         tokio::fs::create_dir_all(&recv_dir).await?;
         std::fs::create_dir_all(&config.data_dir)?;
-        let device = device::Device::load_or_create(&config.data_dir)?;
+        let device = device::Device::load_or_create(&config.data_dir, config.device_name.as_deref())?;
         let restored_tasks = tasks::load(&config.data_dir);
 
         let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0u16)).await?;
         let port = listener.local_addr()?.port();
 
         let service = Arc::new(Self {
-            recv_dir,
+            recv_dir: Mutex::new(recv_dir),
             data_dir: config.data_dir,
-            device,
+            device_id: device.id,
+            device_name: Mutex::new(device.name),
+            platform: device.platform,
             port,
             state: Mutex::new(State {
                 tasks: restored_tasks,
@@ -175,11 +193,11 @@ impl LanService {
         *service.handles.lock().expect("handles 锁中毒") = handles;
 
         tracing::info!(
-            device_id = %service.device.id,
-            device_name = %service.device.name,
-            platform = %service.device.platform,
+            device_id = %service.device_id,
+            device_name = %service.device_name(),
+            platform = %service.platform,
             tcp_port = port,
-            recv_dir = %service.recv_dir.display(),
+            recv_dir = %service.recv_dir().display(),
             data_dir = %service.data_dir.display(),
             "局域网传输已启动"
         );
@@ -188,17 +206,20 @@ impl LanService {
 
     /// 本机设备 id（持久化，跨重启稳定）。
     pub fn device_id(&self) -> &str {
-        &self.device.id
+        &self.device_id
     }
 
     /// 本机设备名。
-    pub fn device_name(&self) -> &str {
-        &self.device.name
+    pub fn device_name(&self) -> String {
+        self.device_name
+            .lock()
+            .expect("设备名锁中毒")
+            .clone()
     }
 
     /// 平台标识（macos / windows / linux / android）。
     pub fn platform(&self) -> &str {
-        &self.device.platform
+        &self.platform
     }
 
     /// TCP 接收端口（写进 discover 的那个）。
@@ -206,9 +227,26 @@ impl LanService {
         self.port
     }
 
-    /// 接收目录：`<下载目录>/LerxuTransfer/`。
-    pub fn recv_dir(&self) -> &Path {
-        &self.recv_dir
+    /// 当前接收目录（运行期可改）。
+    pub fn recv_dir(&self) -> PathBuf {
+        self.recv_dir.lock().expect("接收目录锁中毒").clone()
+    }
+
+    /// 修改设备名：先落盘设备身份，再更新发现广播使用的最新值。
+    pub fn set_device_name(&self, raw: &str) -> Result<(), LanError> {
+        let device = device::Device::load_or_create(&self.data_dir, Some(raw))?;
+        *self.device_name.lock().expect("设备名锁中毒") = device.name;
+        Ok(())
+    }
+
+    /// 修改接收目录：只影响之后的接收任务，已开始的传输保持原目录。
+    pub fn set_recv_dir(&self, dir: &Path) -> Result<(), LanError> {
+        if !dir.is_absolute() {
+            return Err(LanError::Msg("接收目录必须是绝对路径".to_string()));
+        }
+        std::fs::create_dir_all(dir)?;
+        *self.recv_dir.lock().expect("接收目录锁中毒") = dir.to_path_buf();
+        Ok(())
     }
 
     /// 当前局域网内在线设备（最近活跃在前）。
@@ -613,7 +651,7 @@ mod tests {
             &DiscoverMsg::new(
                 "hello",
                 sender.device_id(),
-                sender.device_name(),
+                &sender.device_name(),
                 sender.platform(),
                 sender.port(),
             ),
@@ -623,7 +661,7 @@ mod tests {
             &DiscoverMsg::new(
                 "hello",
                 receiver.device_id(),
-                receiver.device_name(),
+                &receiver.device_name(),
                 receiver.platform(),
                 receiver.port(),
             ),
@@ -694,7 +732,7 @@ mod tests {
         assert!(out.sas.chars().all(|c| c.is_ascii_digit()));
         let saved = incoming.path.expect("接收任务应记录落盘路径");
         let saved_path = std::path::PathBuf::from(&saved);
-        assert_eq!(saved_path.parent().unwrap(), receiver.recv_dir());
+        assert_eq!(saved_path.parent().unwrap(), receiver.recv_dir().as_path());
         assert_eq!(std::fs::read(&saved_path).unwrap(), payload);
         assert!(!saved_path.with_extension("bin.part").exists());
         // 没有残留的 .part

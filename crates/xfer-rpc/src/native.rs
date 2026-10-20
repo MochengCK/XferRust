@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use xfer_engine::{EngineEvent, TaskManager};
-use xfer_lan::LanService;
+use xfer_lan::{LanConfigPatch, LanController};
 use xfer_types::{Gid, ENGINE_NAME, ENGINE_VERSION};
 
 /// 原生方法命名空间前缀。
@@ -21,7 +21,7 @@ pub const NATIVE_PREFIXES: [&str; 4] = ["task.", "engine.", "events.", "lan."];
 ///
 /// 应用端"引擎信息"卡片与 TUI 都读它做能力展示——新增传输/协议能力
 /// （如 HLS）时必须同步到这里，否则引擎明明支持、界面上却看不到。
-pub const ENGINE_FEATURES: [&str; 15] = [
+pub const ENGINE_FEATURES: [&str; 16] = [
     "http",
     "resume",
     "checksum",
@@ -40,14 +40,16 @@ pub const ENGINE_FEATURES: [&str; 15] = [
     "playhead",
     // 端手互通 · 局域网传输（lan.peers / lan.tasks / lan.send …）
     "lan",
+    // 互传设置（lan.config / lan.setConfig：总开关 / 设备名 / 接收目录）
+    "lan-config",
 ];
 
 /// 原生协议分发器。
 pub struct NativeDispatcher {
     secret: Option<String>,
     engine: Arc<TaskManager>,
-    /// 局域网传输服务（启动失败时为 None，lan.* 返回明确错误）。
-    lan: Option<Arc<LanService>>,
+    /// 局域网传输控制器（关闭时仍保留，设置页可随时重新开启）。
+    lan: Option<Arc<LanController>>,
 }
 
 impl NativeDispatcher {
@@ -59,8 +61,12 @@ impl NativeDispatcher {
         }
     }
 
-    /// 带局域网传输的分发器。
-    pub fn with_lan(secret: Option<String>, engine: Arc<TaskManager>, lan: Arc<LanService>) -> Self {
+    /// 带局域网传输控制器的分发器。
+    pub fn with_lan(
+        secret: Option<String>,
+        engine: Arc<TaskManager>,
+        lan: Arc<LanController>,
+    ) -> Self {
         Self {
             secret,
             engine,
@@ -68,7 +74,7 @@ impl NativeDispatcher {
         }
     }
 
-    fn lan(&self) -> Result<&Arc<LanService>, String> {
+    fn lan(&self) -> Result<&Arc<LanController>, String> {
         self.lan
             .as_ref()
             .ok_or_else(|| "局域网传输未启用".to_string())
@@ -361,16 +367,37 @@ impl NativeDispatcher {
             }
             // ---- 端手互通 · 局域网传输 ----
             // 任务对象结构与协议第 3 节完全一致（见 xfer-lan::LanTask）。
+            "lan.config" => {
+                let status = self.lan()?.status();
+                serde_json::to_value(status).map_err(|e| format!("序列化互传配置失败：{e}"))
+            }
+            "lan.setConfig" => {
+                let controller = self.lan()?.clone();
+                let patch: LanConfigPatch = serde_json::from_value(Value::Object(obj.clone()))
+                    .map_err(|e| format!("参数非法：{e}"))?;
+                let status = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(controller.set_config(patch))
+                })?;
+                serde_json::to_value(status).map_err(|e| format!("序列化互传配置失败：{e}"))
+            }
             "lan.peers" => {
-                let lan = self.lan()?;
+                let controller = self.lan()?;
+                if !controller.enabled() {
+                    return Ok(json!({"peers": []}));
+                }
+                let lan = controller.service()?;
                 Ok(json!({"peers": lan.peers()}))
             }
             "lan.tasks" => {
-                let lan = self.lan()?;
+                let controller = self.lan()?;
+                if !controller.enabled() {
+                    return Ok(json!({"tasks": []}));
+                }
+                let lan = controller.service()?;
                 Ok(json!({"tasks": lan.tasks()}))
             }
             "lan.send" => {
-                let lan = self.lan()?;
+                let lan = self.lan()?.service()?;
                 let peer = obj
                     .get("peer")
                     .and_then(Value::as_str)
@@ -389,7 +416,7 @@ impl NativeDispatcher {
                 lan.send(peer, &paths).map(|tasks| json!({"tasks": tasks}))
             }
             "lan.remove" => {
-                let lan = self.lan()?;
+                let lan = self.lan()?.service()?;
                 let id = obj
                     .get("id")
                     .and_then(Value::as_str)
@@ -397,7 +424,7 @@ impl NativeDispatcher {
                 lan.remove(id).map(|_| json!({"ok": true}))
             }
             "lan.cancel" => {
-                let lan = self.lan()?;
+                let lan = self.lan()?.service()?;
                 let id = obj
                     .get("id")
                     .and_then(Value::as_str)

@@ -67,24 +67,22 @@ async fn run(cfg: EngineConfig) -> std::io::Result<()> {
     // 局域网传输：按下载目录（接收落盘）+ 数据目录（设备身份/任务表）拉起。
     // 启动失败（端口/权限等）只告警，不影响引擎本身可用。
     let data_dir = lan_data_dir(&cfg);
-    let lan = match xfer_lan::LanService::start(xfer_lan::LanConfig {
-        download_dir: cfg.download_dir.clone(),
-        data_dir: data_dir.clone(),
-    })
-    .await
-    {
+    let lan = match xfer_lan::LanController::start(cfg.download_dir.clone(), data_dir.clone()).await {
         Ok(lan) => {
+            let status = lan.status();
             tracing::info!(
-                device_id = lan.device_id(),
-                device_name = lan.device_name(),
-                tcp_port = lan.port(),
+                enabled = status.enabled,
+                running = status.running,
+                device_id = %status.device_id,
+                device_name = %status.device_name,
+                recv_dir = %status.recv_dir,
                 data_dir = %data_dir.display(),
-                "局域网传输服务就绪"
+                "局域网互传控制器就绪"
             );
             Some(lan)
         }
         Err(e) => {
-            tracing::warn!(error = %e, "局域网传输启动失败，本次引擎不提供局域网互传");
+            tracing::warn!(error = %e, "局域网互传控制器启动失败，本次引擎不提供互传设置");
             None
         }
     };

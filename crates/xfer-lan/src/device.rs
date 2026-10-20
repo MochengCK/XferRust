@@ -30,7 +30,20 @@ struct DeviceFile {
 
 impl Device {
     /// 读取已有身份；缺失字段补齐后写回（始终写回，保证 platform 与当前平台一致）。
-    pub(crate) fn load_or_create(data_dir: &Path) -> Result<Self, LanError> {
+    ///
+    /// [name_override] 非空时覆盖并落盘设备名（设置页改的就是这个值）；
+    /// `None` 表示沿用身份文件里的名字。
+    pub(crate) fn load_or_create(data_dir: &Path, name_override: Option<&str>) -> Result<Self, LanError> {
+        let device = Self::peek(data_dir, name_override);
+        if let Err(e) = write_device_file(data_dir, &device) {
+            // 身份写不进去不该阻断传输（本次运行照常可用），只是重启后会换名字
+            tracing::warn!(error = %e, "写入设备身份失败");
+        }
+        Ok(device)
+    }
+
+    /// 只读解析身份（设置页轮询状态时用，不产生写盘）。
+    pub(crate) fn peek(data_dir: &Path, name_override: Option<&str>) -> Self {
         let path = data_dir.join(DEVICE_FILE);
         let mut file = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice::<DeviceFile>(&bytes).unwrap_or_default(),
@@ -43,22 +56,16 @@ impl Device {
         if file.id.trim().is_empty() {
             file.id = crate::random_hex(16);
         }
-        if file.name.trim().is_empty() {
+        if let Some(name) = name_override.map(str::trim).filter(|n| !n.is_empty()) {
+            file.name = clamp_name(name);
+        } else if file.name.trim().is_empty() {
             file.name = default_name();
         }
-        file.name = clamp_name(file.name.trim());
-        file.platform = platform().to_string();
-
-        let device = Device {
+        Self {
             id: file.id,
-            name: file.name,
-            platform: file.platform,
-        };
-        if let Err(e) = write_device_file(data_dir, &device) {
-            // 身份写不进去不该阻断传输（本次运行照常可用），只是重启后会换名字
-            tracing::warn!(error = %e, "写入设备身份失败");
+            name: clamp_name(file.name.trim()),
+            platform: platform().to_string(),
         }
-        Ok(device)
     }
 }
 
@@ -127,8 +134,8 @@ mod tests {
             std::process::id(),
             crate::random_hex(4)
         ));
-        let first = Device::load_or_create(&dir).unwrap();
-        let second = Device::load_or_create(&dir).unwrap();
+        let first = Device::load_or_create(&dir, None).unwrap();
+        let second = Device::load_or_create(&dir, None).unwrap();
         assert_eq!(first.id, second.id);
         assert!(!first.id.is_empty());
         assert!(!first.name.is_empty());
