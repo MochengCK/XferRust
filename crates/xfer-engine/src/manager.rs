@@ -2376,7 +2376,7 @@ impl TaskManager {
 
     /// 发现渠道开关（全局选项）：
     /// - `enable-dht`（DHT，默认开；private 种子恒关）
-    /// - `enable-dht6`（DHT over IPv6，BEP 32，默认开）
+    /// - `enable-dht6`（DHT over IPv6，BEP 32，默认关：无双栈 IPv6 的网络会拖死 IPv4 发现）
     /// - `enable-peer-exchange`（PEX，BEP 11，默认开）
     /// - `bt-enable-lpd`（LSD 本地发现，默认开）
     /// - `bt-port-mapping`（UPnP/NAT-PMP 端口映射，默认开）
@@ -2389,7 +2389,7 @@ impl TaskManager {
         };
         (
             on("enable-dht", true),
-            on("enable-dht6", true),
+            on("enable-dht6", false),
             on("enable-peer-exchange", true),
             on("bt-enable-lpd", true),
             on("bt-port-mapping", true),
@@ -3018,7 +3018,7 @@ impl TaskManager {
         );
         m.insert(
             "enable-dht6".into(),
-            Value::String(on_opt("enable-dht6", true).to_string()),
+            Value::String(on_opt("enable-dht6", false).to_string()),
         );
         m.insert(
             "enable-peer-exchange".into(),

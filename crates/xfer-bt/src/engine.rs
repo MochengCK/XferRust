@@ -3953,6 +3953,53 @@ impl TorrentEngine {
             "对端能力协商完成"
         );
 
+        // Fast Extension (BEP 6)：握手后的**第一条**消息必须是
+        // HaveAll / HaveNone / Bitfield。磁力任务还没有元数据（片数为 0）时
+        // 发 HaveNone；此前这段在 ut_metadata 之后才发，真实客户端会把
+        // 先到的扩展握手当成协议违规并立即断开（表现为握手成功 → Broken pipe）。
+        let fast_ext = cell.state.lock().unwrap().fast_extension;
+        if self.has_metadata() {
+            let (all_done, any_done) = {
+                let guard = self.store.lock().unwrap();
+                let store = guard.as_ref().unwrap();
+                let count = store.piece_count();
+                let all = count > 0 && store.map().all_done();
+                let any = count > 0 && (0..count).any(|p| store.have_piece(p));
+                (all, any)
+            };
+            if fast_ext {
+                if all_done {
+                    peer_stream
+                        .write_all(&Message::HaveAll.encode())
+                        .await
+                        .map_err(|e| format!("HaveAll 发送失败: {e}"))?;
+                } else if !any_done {
+                    peer_stream
+                        .write_all(&Message::HaveNone.encode())
+                        .await
+                        .map_err(|e| format!("HaveNone 发送失败: {e}"))?;
+                } else {
+                    let bf = self.store.lock().unwrap().as_ref().unwrap().bitfield();
+                    peer_stream
+                        .write_all(&Message::Bitfield(bf).encode())
+                        .await
+                        .map_err(|e| format!("bitfield 发送失败: {e}"))?;
+                }
+            } else if any_done {
+                // 非 Fast Extension: 仅在有片时发送 bitfield
+                let bf = self.store.lock().unwrap().as_ref().unwrap().bitfield();
+                peer_stream
+                    .write_all(&Message::Bitfield(bf).encode())
+                    .await
+                    .map_err(|e| format!("bitfield 发送失败: {e}"))?;
+            }
+        } else if fast_ext {
+            // 磁力任务元数据未就绪：store 还不存在，准确的首条消息就是 HaveNone
+            peer_stream
+                .write_all(&Message::HaveNone.encode())
+                .await
+                .map_err(|e| format!("HaveNone 发送失败: {e}"))?;
+        }
         // 磁力模式：元数据未就绪时先用本连接获取元数据。
         // 成功后 **继续** 常规下载流程复用该连接 —— 不能在此断开，否则真实网络下
         // 必须重新 announce 并等下一轮 tracker interval 才能重连（长时间无速度）。
@@ -3976,51 +4023,6 @@ impl TorrentEngine {
             ext_handshake_sent = true;
         }
 
-        // 发送我方 bitfield（Fast Extension: 优先 HaveAll/HaveNone）
-        let all_done = self
-            .store
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .map()
-            .all_done();
-        let any_done = {
-            let guard = self.store.lock().unwrap();
-            let store = guard.as_ref().unwrap();
-            store.piece_count() > 0 && (0..store.piece_count()).any(|p| store.have_piece(p))
-        };
-
-        let fast_ext = cell.state.lock().unwrap().fast_extension;
-        if fast_ext {
-            if all_done {
-                peer_stream
-                    .write_all(&Message::HaveAll.encode())
-                    .await
-                    .map_err(|e| format!("HaveAll 发送失败: {e}"))?;
-            } else if !any_done {
-                peer_stream
-                    .write_all(&Message::HaveNone.encode())
-                    .await
-                    .map_err(|e| format!("HaveNone 发送失败: {e}"))?;
-            } else {
-                let bf = self.store.lock().unwrap().as_ref().unwrap().bitfield();
-                peer_stream
-                    .write_all(&Message::Bitfield(bf).encode())
-                    .await
-                    .map_err(|e| format!("bitfield 发送失败: {e}"))?;
-            }
-        } else {
-            // 非 Fast Extension: 仅在有片时发送 bitfield
-            if any_done {
-                let bf = self.store.lock().unwrap().as_ref().unwrap().bitfield();
-                peer_stream
-                    .write_all(&Message::Bitfield(bf).encode())
-                    .await
-                    .map_err(|e| format!("bitfield 发送失败: {e}"))?;
-            }
-        }
-
         // BEP 10: 扩展协议握手（对端支持扩展协议且元数据阶段未发送过）
         if cell.state.lock().unwrap().extended_messaging && !ext_handshake_sent {
             let ext_handshake = self.build_extension_handshake();
@@ -4036,8 +4038,12 @@ impl TorrentEngine {
             self.ensure_interested(&mut peer_stream, &cell).await?;
         }
 
-        // BEP 5: DHT Port 消息（双方都支持 DHT 时通告端口）
-        if cell.state.lock().unwrap().dht_enabled && self.config.dht_port > 0 {
+        // BEP 5: DHT Port 消息（双方都支持 DHT 时通告端口）。
+        // Fast Extension 对端上消息 id 9 是 HaveAll，绝不能发 Port（会被判协议违规）。
+        if cell.state.lock().unwrap().dht_enabled
+            && !fast_ext
+            && self.config.dht_port > 0
+        {
             peer_stream
                 .write_all(&Message::Port(self.config.dht_port).encode())
                 .await

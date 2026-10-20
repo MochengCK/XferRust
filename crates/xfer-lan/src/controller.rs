@@ -243,7 +243,7 @@ mod tests {
         std::fs::create_dir_all(&download).unwrap();
 
         let controller = LanController::start(&download, &data).await.unwrap();
-        // 默认开启；先关掉，验证设置页开关
+        // 默认关闭；先确认关闭状态下可改设置，再开启
         let status = controller
             .set_config(LanConfigPatch {
                 enabled: Some(false),

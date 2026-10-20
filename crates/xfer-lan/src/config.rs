@@ -24,7 +24,8 @@ pub struct LanUserConfig {
 impl Default for LanUserConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            // 互传涉及本机被发现与接收文件，默认关闭；首次去设置里开启
+            enabled: false,
             device_name: String::new(),
             recv_dir: String::new(),
         }
@@ -91,9 +92,9 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_enabled_with_empty_overrides() {
+    fn defaults_are_disabled_with_empty_overrides() {
         let cfg = LanUserConfig::default();
-        assert!(cfg.enabled);
+        assert!(!cfg.enabled);
         assert!(cfg.device_name.is_empty());
         assert!(cfg.recv_dir.is_empty());
         assert_eq!(cfg.device_name_trimmed(), None);
@@ -102,12 +103,12 @@ mod tests {
     #[test]
     fn missing_or_broken_file_falls_back_to_defaults() {
         let dir = temp_dir("missing");
-        assert!(LanUserConfig::load(&dir).enabled);
+        assert!(!LanUserConfig::load(&dir).enabled);
 
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(CONFIG_FILE), b"{not-json").unwrap();
         let cfg = LanUserConfig::load(&dir);
-        assert!(cfg.enabled);
+        assert!(!cfg.enabled);
         assert!(cfg.device_name.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
