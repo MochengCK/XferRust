@@ -21,7 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 use crate::crypto::{self, SessionCipher};
-use crate::protocol::{Accept, Done, HandshakeReply, Offer, Reject, APP, VERSION};
+use crate::protocol::{Accept, Done, HandshakeReply, Offer, Reject, PROTO, VERSION};
 use crate::tasks::{Direction, LanTask, TaskStatus};
 use crate::{now_ms, random_hex, LanService};
 
@@ -86,9 +86,9 @@ async fn receive_one(
             return Err(format!("offer 解析失败：{e}"));
         }
     };
-    if offer.app != APP || offer.v != VERSION || offer.kind != "offer" {
-        // 兼容性第 4 节：不是 lerxu v1 的报文直接丢弃（不回复）
-        return Err("不是 lerxu v1 offer".to_string());
+    if offer.proto != PROTO || offer.v != VERSION || offer.kind != "offer" {
+        // 兼容性第 4 节：协议标记/版本不符直接丢弃（不回复）
+        return Err("不是 lan-transfer v2 offer".to_string());
     }
     if !offer.is_valid() {
         reject(&mut writer, "size 非法").await;
@@ -120,7 +120,7 @@ async fn receive_one(
         let _ = tokio::fs::remove_file(&part_path).await;
         return Err(format!("发送 accept 失败：{e}"));
     }
-    let cipher = SessionCipher::new(crypto::derive_session_key(&own_key, &peer_key));
+    let crypto::SessionKeys { cipher, sas } = crypto::establish(&own_key, &peer_key);
 
     // ---- 建 in 任务（接受后立刻建；收到第一个字节转 active）----
     let task_id = unique_task_id(svc, &offer.id);
@@ -139,6 +139,7 @@ async fn receive_one(
         peer_name,
         peer_address: addr.ip().to_string(),
         error: String::new(),
+        sas,
         created_at: now_ms(),
         finished_at: None,
         path: None,
@@ -329,8 +330,8 @@ async fn send_one(svc: &Arc<LanService>, task: &LanTask) -> Result<(), String> {
     let own_key = crypto::new_secret_key();
     let own_pk = base64::engine::general_purpose::STANDARD.encode(crypto::encode_public(&own_key));
     let offer = serde_json::json!({
-        "app": crate::protocol::APP,
-        "v": crate::protocol::VERSION,
+        "proto": crate::protocol::PROTO,
+        "v": VERSION,
         "type": "offer",
         "id": task.id,
         "name": task.name,
@@ -367,7 +368,9 @@ async fn send_one(svc: &Arc<LanService>, task: &LanTask) -> Result<(), String> {
         }
         other => return Err(format!("未知握手应答：{other}")),
     };
-    let cipher = SessionCipher::new(crypto::derive_session_key(&own_key, &peer_key));
+    let crypto::SessionKeys { cipher, sas } = crypto::establish(&own_key, &peer_key);
+    // 发送端在收到 accept 后才能算出 SAS，随任务展示给用户比对
+    svc.update_sas(&task.id, sas);
 
     // ---- 加密发帧 ----
     let mut buffer = vec![0u8; crypto::MAX_PLAINTEXT];

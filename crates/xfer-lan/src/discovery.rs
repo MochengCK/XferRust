@@ -227,7 +227,7 @@ mod tests {
         });
     }
 
-    /// 收到 discover 记录对端；自己 id / 非 lerxu 报文一律忽略；超时移除。
+    /// 收到 discover 记录对端；自己 id / 协议标记或版本不符的报文一律忽略；超时移除。
     #[tokio::test]
     async fn records_peer_and_ignores_self_or_foreign() {
         let root = std::env::temp_dir().join(format!(
@@ -256,12 +256,20 @@ mod tests {
         handle(&svc, &None, &serde_json::to_vec(&own).unwrap(), from).await;
         assert!(!svc.peers().iter().any(|p| p.id == svc.device_id()));
 
-        // 不是 lerxu / 版本不符
+        // 协议标记 / 版本不符
         let mut foreign = discover.clone();
-        foreign.app = "other".into();
+        foreign.proto = "other".into();
+        foreign.platform = "other".into();
         handle(&svc, &None, &serde_json::to_vec(&foreign).unwrap(), from).await;
+        // 已记录的 peer-1 不能被这条报文覆盖
+        let peer = svc
+            .peers()
+            .into_iter()
+            .find(|p| p.id == "peer-1")
+            .expect("对端仍在列表里");
+        assert_eq!(peer.platform, "android");
         let mut old = discover.clone();
-        old.v = 2;
+        old.v = 1;
         old.id = "peer-2".into();
         handle(&svc, &None, &serde_json::to_vec(&old).unwrap(), from).await;
         assert!(!svc.peers().iter().any(|p| p.id == "peer-2"));

@@ -1,15 +1,18 @@
-//! 线上报文（协议第 1、2 节）：字段名与协议逐字对应，不做本地化重命名。
+//! 线上报文（协议第 1、2 节）：字段名与协议文档逐字对应。
+//!
+//! v2 起用中立的协议标记 `proto:"lan-transfer"`（不再有应用身份字段），
+//! 任何按文档实现的客户端都能握手；安全性由 ECDH + AES-GCM + SAS 提供。
 
 use serde::{Deserialize, Serialize};
 
-/// 应用身份与协议版本（`app != "lerxu"` 或 `v != 1` 一律丢弃）。
-pub(crate) const APP: &str = "lerxu";
-pub(crate) const VERSION: u32 = 1;
+/// 协议标记（`proto != "lan-transfer"` 或 `v != 2` 一律丢弃）。
+pub(crate) const PROTO: &str = "lan-transfer";
+pub(crate) const VERSION: u32 = 2;
 
 /// UDP 发现报文（`discover` / `hello` 同构）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DiscoverMsg {
-    pub app: String,
+    pub proto: String,
     pub v: u32,
     #[serde(rename = "type")]
     pub kind: String,
@@ -22,7 +25,7 @@ pub(crate) struct DiscoverMsg {
 impl DiscoverMsg {
     pub(crate) fn new(kind: &str, id: &str, name: &str, platform: &str, port: u16) -> Self {
         Self {
-            app: APP.to_string(),
+            proto: PROTO.to_string(),
             v: VERSION,
             kind: kind.to_string(),
             id: id.to_string(),
@@ -33,7 +36,7 @@ impl DiscoverMsg {
     }
 
     pub(crate) fn is_valid(&self) -> bool {
-        self.app == APP && self.v == VERSION && self.port != 0
+        self.proto == PROTO && self.v == VERSION && self.port != 0
     }
 }
 
@@ -41,7 +44,7 @@ impl DiscoverMsg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Offer {
-    pub app: String,
+    pub proto: String,
     pub v: u32,
     #[serde(rename = "type")]
     pub kind: String,
@@ -57,7 +60,7 @@ pub(crate) struct Offer {
 
 impl Offer {
     pub(crate) fn is_valid(&self) -> bool {
-        self.app == APP && self.v == VERSION && self.kind == "offer" && self.size >= -1
+        self.proto == PROTO && self.v == VERSION && self.kind == "offer" && self.size >= -1
     }
 }
 
@@ -139,23 +142,34 @@ mod tests {
     fn discover_fields_match_protocol() {
         let msg = DiscoverMsg::new("discover", "abc", "Mac", "macos", 51234);
         let json: serde_json::Value = serde_json::to_value(&msg).unwrap();
-        assert_eq!(json["app"], "lerxu");
-        assert_eq!(json["v"], 1);
+        assert_eq!(json["proto"], "lan-transfer");
+        assert_eq!(json["v"], 2);
         assert_eq!(json["type"], "discover");
         assert_eq!(json["port"], 51234);
+        assert!(json["app"].is_null());
         assert!(msg.is_valid());
+
         // 未知字段必须被忽略（兼容性第 4 节）
         let parsed: DiscoverMsg = serde_json::from_str(
-            r#"{"app":"lerxu","v":1,"type":"hello","id":"x","name":"n","platform":"linux","port":1,"extra":true}"#,
+            r#"{"proto":"lan-transfer","v":2,"type":"hello","id":"x","name":"n","platform":"linux","port":1,"extra":true}"#,
         )
         .unwrap();
         assert_eq!(parsed.kind, "hello");
+
+        // 旧的 app 字段 / 旧版本号都不再被接受
+        assert!(serde_json::from_str::<DiscoverMsg>(
+            r#"{"app":"lerxu","v":1,"type":"hello","id":"x","name":"n","platform":"linux","port":1}"#
+        )
+        .is_err());
+        let mut old = msg.clone();
+        old.v = 1;
+        assert!(!old.is_valid());
     }
 
     #[test]
     fn offer_size_minus_one_is_valid() {
         let offer: Offer = serde_json::from_str(
-            r#"{"app":"lerxu","v":1,"type":"offer","id":"t1","name":"a.bin","size":-1,
+            r#"{"proto":"lan-transfer","v":2,"type":"offer","id":"t1","name":"a.bin","size":-1,
                 "senderId":"d1","senderName":"Phone","pk":"AAAA"}"#,
         )
         .unwrap();

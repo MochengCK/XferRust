@@ -42,6 +42,9 @@ pub struct LanTask {
     pub peer_name: String,
     pub peer_address: String,
     pub error: String,
+    /// 短认证串（6 位数字）：握手派生会话密钥时写入，供两端用户比对防中间人。
+    /// 发送任务在收到 accept 前为空。
+    pub sas: String,
     pub created_at: i64,
     /// 进入 done / error 的时刻（本地字段，仅用于卡片显示）。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,6 +227,25 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         assert!(load(&dir).is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// RPC 直接返回这个结构，字段名必须与协议第 3 节一致（含本地字段 sas）。
+    #[test]
+    fn task_json_matches_protocol_shape() {
+        let mut task = task("t1", TaskStatus::Done, 1_710_000_000_000);
+        task.sas = "042317".to_string();
+        task.path = Some("/dl/a.bin".to_string());
+        let value = serde_json::to_value(&task).unwrap();
+        assert_eq!(value["id"], "t1");
+        assert_eq!(value["direction"], "in");
+        assert_eq!(value["status"], "done");
+        assert_eq!(value["sas"], "042317");
+        assert_eq!(value["path"], "/dl/a.bin");
+        assert_eq!(value["createdAt"], 1_710_000_000_000i64);
+        // 未设置的本地字段不出现（客户端按可选字段处理）
+        assert!(value.get("finishedAt").is_none());
+        assert!(value.get("sourcePath").is_none());
+        assert!(value.get("peerId").is_none());
     }
 
     fn temp_dir(tag: &str) -> PathBuf {

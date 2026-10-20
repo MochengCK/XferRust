@@ -1,14 +1,16 @@
 //! 端手互通 · 局域网文件传输（引擎端）。
 //!
-//! 实现 `.workbuddy/lan-transfer-protocol.md`（协议 v1 加密版）：
+//! 实现 `.workbuddy/lan-transfer-protocol.md`（协议 **v2**，通用版）：
 //!
 //! - UDP 发现（固定 41234，discover / hello，8s 过期）
 //! - TCP 接收（临时端口，端口写进 discover）
-//! - ECDH P-256 → HKDF-SHA256 → AES-256-GCM 加密分帧
+//! - ECDH P-256 → HKDF-SHA256（salt = SHA-256(排序后的两把临时公钥)）→ AES-256-GCM 加密分帧
+//! - 短认证串 SAS（6 位数字，RPC 任务字段 `sas`）供两端用户比对防中间人
 //! - 任务表（最近 50 条，持久化到 `<data_dir>/lan-tasks.json`）
 //!
-//! **线上的字段名、端口、salt/info、分帧格式必须与对端逐字节一致**，
-//! 客户端（Node / Kotlin）按同一份文档实现；改协议先改文档，再改这里。
+//! 协议对实现开放（`proto:"lan-transfer"`，不校验客户端身份），
+//! **线上的字段名、端口、salt/info、分帧格式必须与对端逐字节一致**；
+//! 改协议先改文档，再改这里。
 
 mod crypto;
 mod device;
@@ -283,6 +285,8 @@ impl LanService {
                 peer_name: peer_name.clone(),
                 peer_address: peer_address.clone(),
                 error: String::new(),
+                // 收到 accept、建立会话后才算出 SAS
+                sas: String::new(),
                 created_at,
                 finished_at: None,
                 path: None,
@@ -457,6 +461,15 @@ impl LanService {
         let mut state = self.lock_state();
         if let Some(task) = state.tasks.iter_mut().find(|t| t.id == id) {
             task.size = size;
+            state.dirty = true;
+        }
+    }
+
+    /// 写入短认证串（发送端在收到 accept、算出会话密钥后调用）。
+    pub(crate) fn update_sas(&self, id: &str, sas: String) {
+        let mut state = self.lock_state();
+        if let Some(task) = state.tasks.iter_mut().find(|t| t.id == id) {
+            task.sas = sas;
             state.dirty = true;
         }
     }
@@ -675,6 +688,10 @@ mod tests {
             .unwrap();
         assert_eq!(incoming.transferred, payload.len() as i64);
         assert_eq!(incoming.peer_address, "127.0.0.1");
+        // SAS：两端必须一致、6 位数字（用户口头/肉眼比对的凭证）
+        assert_eq!(out.sas, incoming.sas);
+        assert_eq!(out.sas.len(), 6, "SAS 应为 6 位：{}", out.sas);
+        assert!(out.sas.chars().all(|c| c.is_ascii_digit()));
         let saved = incoming.path.expect("接收任务应记录落盘路径");
         let saved_path = std::path::PathBuf::from(&saved);
         assert_eq!(saved_path.parent().unwrap(), receiver.recv_dir());

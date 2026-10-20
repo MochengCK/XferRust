@@ -1,7 +1,8 @@
 //! 协议 2.1 / 2.2：会话密钥派生（ECDH P-256 + HKDF-SHA256）与 AES-256-GCM 分帧。
 //!
-//! 这一层的字节语义必须与对端（桌面端 Node / 安卓 Kotlin）逐字节一致：
-//! salt / info 是**应用身份常量**，常量值一改两端就握不上手。
+//! 这一层的字节语义必须与对端（任何按协议文档实现的客户端）逐字节一致。
+//! v2 起**不再使用任何应用私有常量**：HKDF salt 由双方临时公钥派生，
+//! info 是公布的协议标签，因此第三方实现只要照文档写就能算出同一把密钥。
 
 use std::io;
 
@@ -10,13 +11,13 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{PublicKey, SecretKey};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// HKDF salt（ASCII，协议 2.1；26 字节）。
-pub(crate) const SALT: &[u8] = b"lerxu-lan-transfer-v1-salt";
-/// HKDF info（ASCII，协议 2.1）。
-pub(crate) const INFO: &[u8] = b"lerxu-lan-transfer-v1";
+/// HKDF info：会话密钥（ASCII，协议 2.1）。
+pub(crate) const INFO_KEY: &[u8] = b"lan-transfer-v2";
+/// HKDF info：短认证串 SAS（ASCII，协议 2.1）。
+pub(crate) const INFO_SAS: &[u8] = b"lan-transfer-v2-sas";
 
 /// AES-256 密钥长度。
 pub(crate) const KEY_LEN: usize = 32;
@@ -59,20 +60,75 @@ pub(crate) fn parse_public(bytes: &[u8]) -> Option<PublicKey> {
     PublicKey::from_sec1_bytes(bytes).ok()
 }
 
-/// ECDH → 会话密钥。
-pub(crate) fn derive_session_key(secret: &SecretKey, peer: &PublicKey) -> [u8; KEY_LEN] {
-    let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
-    // ecdh 的 raw_secret_bytes 就是共享点的 X 坐标（32 字节定长）
-    hkdf_key(&shared.raw_secret_bytes()[..])
+fn encode_public_point(public: &PublicKey) -> [u8; 65] {
+    let point = public.to_encoded_point(false);
+    let mut out = [0u8; 65];
+    out.copy_from_slice(point.as_bytes());
+    out
 }
 
-/// HKDF-SHA256(ikm = ECDH 共享 X 坐标, salt, info) → 32 字节。
-pub(crate) fn hkdf_key(shared_x: &[u8]) -> [u8; KEY_LEN] {
-    let hkdf = Hkdf::<Sha256>::new(Some(SALT), shared_x);
-    let mut okm = [0u8; KEY_LEN];
-    hkdf.expand(INFO, &mut okm)
-        .expect("32 字节输出不会超出 HKDF 上限");
-    okm
+/// HKDF salt：`SHA-256(min(pkA,pkB) || max(pkA,pkB))`。
+///
+/// 排序按 65 字节编码的**字节序字典序**，两端必然得到同一个顺序；
+/// 两端各自算出的两个公钥集合相同，因此 salt 相同。salt 里绑定了双方
+/// 临时公钥，中间人换掉任意一把公钥都会导致 SAS 不同（见协议第 2.1 节）。
+pub(crate) fn session_salt(a: &[u8; 65], b: &[u8; 65]) -> [u8; 32] {
+    let (first, second) = if a.as_slice() <= b.as_slice() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(first);
+    hasher.update(second);
+    hasher.finalize().into()
+}
+
+/// HKDF-SHA256：ikm = ECDH 共享 X 坐标，salt/info 由协议给定。
+fn hkdf_expand(ikm: &[u8], salt: &[u8], info: &[u8], out: &mut [u8]) {
+    let hkdf = Hkdf::<Sha256>::new(Some(salt), ikm);
+    hkdf.expand(info, out).expect("输出长度不会超出 HKDF 上限");
+}
+
+/// HKDF(shared, salt, info="lan-transfer-v2") → 32 字节 AES-256-GCM 密钥。
+pub(crate) fn hkdf_key(shared_x: &[u8], salt: &[u8]) -> [u8; KEY_LEN] {
+    let mut key = [0u8; KEY_LEN];
+    hkdf_expand(shared_x, salt, INFO_KEY, &mut key);
+    key
+}
+
+/// 短认证串：HKDF(shared, salt, info="lan-transfer-v2-sas") 前 4 字节
+/// 按大端解释后对 1_000_000 取模，左补零成 6 位数字。
+pub(crate) fn sas_code(shared_x: &[u8], salt: &[u8]) -> String {
+    let mut material = [0u8; 4];
+    hkdf_expand(shared_x, salt, INFO_SAS, &mut material);
+    format!("{:06}", u32::from_be_bytes(material) % 1_000_000)
+}
+
+/// 一次握手派生出的会话材料：加密上下文 + 供用户比对的 SAS。
+pub(crate) struct SessionKeys {
+    pub cipher: SessionCipher,
+    pub sas: String,
+}
+
+/// ECDH → salt → 会话密钥 + SAS（两端输入同一对临时公钥，结果必然相同）。
+fn session_material(secret: &SecretKey, peer: &PublicKey) -> ([u8; KEY_LEN], String) {
+    let own_public = encode_public(secret);
+    let peer_public = encode_public_point(peer);
+    let salt = session_salt(&own_public, &peer_public);
+    let shared = p256::ecdh::diffie_hellman(secret.to_nonzero_scalar(), peer.as_affine());
+    // ecdh 的 raw_secret_bytes 就是共享点的 X 坐标（32 字节定长）
+    let shared_x = &shared.raw_secret_bytes()[..];
+    (hkdf_key(shared_x, &salt), sas_code(shared_x, &salt))
+}
+
+/// 建立一条连接的会话：会话密钥决定加解密，SAS 供两端用户比对防中间人。
+pub(crate) fn establish(secret: &SecretKey, peer: &PublicKey) -> SessionKeys {
+    let (key, sas) = session_material(secret, peer);
+    SessionKeys {
+        cipher: SessionCipher::new(key),
+        sas,
+    }
 }
 
 /// 一条连接上的加密上下文（AES-256-GCM，逐帧随机 nonce，无状态计数器）。
@@ -180,45 +236,58 @@ where
 mod tests {
     use super::*;
 
-    /// 已知答案：ikm = 0x00..0x1f，salt/info 取协议常量，
-    /// 期望值由独立实现（Python hmac/hashlib）算出。
+    /// salt = SHA-256(排序后拼接的两把 65 字节公钥)，与顺序无关。
+    /// 期望值由独立实现（Python hashlib）算出。
+    #[test]
+    fn session_salt_binds_both_keys_and_is_order_independent() {
+        let a = [b'A'; 65];
+        let b = [b'B'; 65];
+        let expected =
+            hex_bytes("3726a4cc77593117c68a0d8a5aea37152991b653030bf502008efcd010d858e6");
+        assert_eq!(session_salt(&a, &b).to_vec(), expected);
+        assert_eq!(session_salt(&b, &a).to_vec(), expected);
+    }
+
+    /// 已知答案：ikm = 0x00..0x1f、salt = SHA-256(65*A || 65*B)、
+    /// info = "lan-transfer-v2"。期望值由独立 Python 实现算出。
     #[test]
     fn hkdf_known_answer() {
         let ikm: Vec<u8> = (0u8..32).collect();
-        let key = hkdf_key(&ikm);
+        let salt = session_salt(&[b'A'; 65], &[b'B'; 65]);
         assert_eq!(
-            key.to_vec(),
-            hex_bytes("ec888712509e156756073d0c815216ee83462f0a36833f7033944968db1ac2e4")
+            hkdf_key(&ikm, &salt).to_vec(),
+            hex_bytes("9d002bd300504637df2be5e7fbc16a97f21dacc097147ecce7d61c39d293c151")
         );
     }
 
-    /// 全 0x0b 的 ikm 是 RFC5869 常见测试向量形状，同样对独立实现算出的值。
+    /// SAS 已知答案：同一 ikm/salt，info = "lan-transfer-v2-sas"。
     #[test]
-    fn hkdf_known_answer_repeated_ikm() {
-        let key = hkdf_key(&[0x0b; 32]);
-        assert_eq!(
-            key.to_vec(),
-            hex_bytes("ac502eccb4c50091b9d122933bba760cff6defad77c228a12d0d15477f022896")
-        );
+    fn sas_known_answer_and_shape() {
+        let ikm: Vec<u8> = (0u8..32).collect();
+        let salt = session_salt(&[b'A'; 65], &[b'B'; 65]);
+        assert_eq!(sas_code(&ikm, &salt), "605002");
+        assert_eq!(sas_code(&ikm, &salt).len(), 6);
+        assert!(sas_code(&ikm, &salt).chars().all(|c| c.is_ascii_digit()));
+        // 换 salt（等于换掉任意一把临时公钥）SAS 必须变
+        assert_ne!(sas_code(&ikm, &salt), sas_code(&ikm, &[0u8; 32]));
     }
 
-    /// 两端各自生成临时密钥，ECDH 必须导出一模一样的会话密钥。
+    /// 两端各自生成临时密钥，ECDH 必须导出一模一样的会话密钥与 SAS。
     #[test]
-    fn ecdh_both_sides_derive_same_key() {
+    fn ecdh_both_sides_derive_same_key_and_sas() {
         let a = new_secret_key();
         let b = new_secret_key();
         let a_pub = parse_public(&encode_public(&a)).expect("自己的公钥应可解析");
         let b_pub = parse_public(&encode_public(&b)).expect("自己的公钥应可解析");
-        assert_eq!(
-            derive_session_key(&a, &b_pub),
-            derive_session_key(&b, &a_pub)
-        );
+        let (key_a, sas_a) = session_material(&a, &b_pub);
+        let (key_b, sas_b) = session_material(&b, &a_pub);
+        assert_eq!(key_a, key_b);
+        assert_eq!(sas_a, sas_b);
+        assert_eq!(sas_a.len(), 6);
         // 换一条连接（另一把临时密钥）必须得到不同的密钥
         let c = new_secret_key();
-        assert_ne!(
-            derive_session_key(&a, &b_pub),
-            derive_session_key(&a, &c.public_key())
-        );
+        let (key_c, _) = session_material(&a, &c.public_key());
+        assert_ne!(key_a, key_c);
     }
 
     /// 公钥编码必须是 65 字节未压缩点。
@@ -260,8 +329,8 @@ mod tests {
     #[test]
     fn tampered_frame_fails() {
         let cipher = SessionCipher::new([9u8; KEY_LEN]);
-        let payload = cipher.seal(b"hello lerxu").unwrap();
-        assert_eq!(cipher.open(&payload).unwrap(), b"hello lerxu");
+        let payload = cipher.seal(b"hello lan").unwrap();
+        assert_eq!(cipher.open(&payload).unwrap(), b"hello lan");
         for i in [0usize, NONCE_LEN, payload.len() - 1] {
             let mut bad = payload.clone();
             bad[i] ^= 0x01;
