@@ -909,6 +909,14 @@ struct App {
     verify_rx: Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<(Gid, Result<Value, String>)>>>>,
     /// 新建任务弹窗（地址 + 目录 / 磁力解析 / 文件选择，模态）。
     add_task: Option<AddTaskDialog>,
+    /// 帮助浮层（`?`）：按当前视图列出全部快捷键。
+    help: bool,
+    /// 任务搜索关键字（`/` 输入；空 = 不筛选）。
+    search: String,
+    /// 是否正在编辑搜索框（输入态下字符直接进缓冲）。
+    search_edit: bool,
+    /// 本次启动的 MCP 端点（`--mcp-listen-port` 开启时非空，帮助浮层展示）。
+    mcp_endpoint: Option<String>,
 }
 
 /// 详情页单行连接信息（HTTP 分片任务的逐连接明细，来自 task.getServers）。
@@ -1008,12 +1016,40 @@ fn category_step(cat: Category, delta: i32) -> Category {
 
 /// 当前分类下任务在 app.tasks 中的索引（选中/渲染均以过滤后序号为准）。
 fn filtered_indices(app: &App) -> Vec<usize> {
-    app.tasks
+    filter_task_indices(&app.tasks, app.category, &app.search)
+}
+
+/// 分类 + 搜索过滤（纯函数，便于单测）。
+fn filter_task_indices(tasks: &[Value], category: Category, search: &str) -> Vec<usize> {
+    let q = search.trim().to_lowercase();
+    tasks
         .iter()
         .enumerate()
-        .filter(|(_, t)| app.category.matches(t))
+        .filter(|(_, t)| category.matches(t))
+        // 搜索：文件名 / gid 子串匹配（大小写不敏感），空关键字 = 不过滤
+        .filter(|(_, t)| q.is_empty() || task_matches_query(t, &q))
         .map(|(i, _)| i)
         .collect()
+}
+
+/// 任务是否命中搜索关键字（文件名或 gid）。
+fn task_matches_query(t: &Value, q: &str) -> bool {
+    let name = t["files"][0]["path"].as_str().unwrap_or("");
+    if name.to_lowercase().contains(q) {
+        return true;
+    }
+    // 磁力任务元数据未就绪时还没有 files，用引擎给的名字兜底
+    if t["name"]
+        .as_str()
+        .map(|n| n.to_lowercase().contains(q))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    t["gid"]
+        .as_str()
+        .map(|g| g.to_lowercase().contains(q))
+        .unwrap_or(false)
 }
 
 /// TUI 设置页单行订阅源信息。
@@ -1150,10 +1186,26 @@ fn cmd_tui(args: &[String]) -> i32 {
     let conc: Option<usize> = flag_value(args, "-j")
         .or_else(|| flag_value(args, "--max-concurrent"))
         .and_then(|v| v.parse().ok());
+    // MCP：与守护进程同一套实现，TUI 也直接对外提供（`--mcp-listen-port` 开启）
+    let mcp_port: Option<u16> = flag_value(args, "--mcp-listen-port")
+        .and_then(|v| v.parse().ok())
+        .filter(|p| *p > 0);
     let rt = tokio::runtime::Runtime::new().expect("创建 runtime 失败");
     rt.block_on(async move {
         let mgr = TaskManager::start_with_session(dir, conc, xfer_engine::default_session_path());
-        app_loop(mgr).await
+        let endpoint = mcp_port.map(|port| {
+            let router = Arc::new(xfer_rpc::Router::new(None, mgr.clone(), mgr.events()));
+            let server = Arc::new(xfer_mcp::McpServer::new(router, None));
+            let shutdown = mgr.shutdown_token();
+            let bind: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+            tokio::spawn(async move {
+                if let Err(e) = xfer_mcp::serve(bind, server, shutdown).await {
+                    tracing::error!(error = %e, "MCP 服务退出");
+                }
+            });
+            format!("http://127.0.0.1:{port}/mcp")
+        });
+        app_loop(mgr, endpoint).await
     })
 }
 
@@ -1205,7 +1257,7 @@ fn render_loop(
 }
 
 /// 主界面循环：50ms 轮询键盘，300ms 刷新任务快照；渲染在独立线程。
-async fn app_loop(mgr: Arc<TaskManager>) -> i32 {
+async fn app_loop(mgr: Arc<TaskManager>, mcp_endpoint: Option<String>) -> i32 {
     use crossterm::{cursor, execute, terminal};
     // 终端初始化：启动序列仅约百字节，不会撑满 pty 缓冲
     let _ = execute!(
@@ -1299,6 +1351,10 @@ async fn app_loop(mgr: Arc<TaskManager>) -> i32 {
         uri_scroll: (0, 0),
         verify_rx: None,
         add_task: None,
+        help: false,
+        search: String::new(),
+        search_edit: false,
+        mcp_endpoint,
     };
     refresh_app(&mut app);
     // 启动恢复：上次会话解析完成、等待文件选择的磁力任务重新弹窗
@@ -1705,9 +1761,23 @@ fn refresh_app(app: &mut App) {
 /// 处理一次按键。返回 false 表示退出。
 fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
+    // Ctrl-C 强制退出，不弹确认弹窗（任何视图 / 弹窗里都生效，包括搜索输入态）
+    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+        return false;
+    }
     // 新建任务弹窗（模态，优先处理）
     if let Some(d) = app.add_task.clone() {
         return handle_add_task_key(app, d, k);
+    }
+    // 帮助浮层（模态）：?/Esc/q/Enter 关闭
+    if app.help {
+        match k.code {
+            KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                app.help = false
+            }
+            _ => {}
+        }
+        return true;
     }
     // 输入模式：编辑缓冲（并发数只接受数字）
     if let Some((kind, buf)) = app.input.as_mut() {
@@ -1803,10 +1873,6 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
         }
         return true;
     }
-    // Ctrl-C 强制退出，不弹确认弹窗
-    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
-        return false;
-    }
     // 语言选择弹窗：↑↓ 移动，Enter 确认，Esc/q 取消
     if app.lang_picker.is_some() {
         let sel = app.lang_picker.as_mut().unwrap();
@@ -1836,10 +1902,41 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
         return true;
     }
     match &app.view {
-        MainView::List => match k.code {
+        MainView::List => {
+            // 搜索输入态：字符直接进缓冲并实时过滤（不弹窗，列表跟着变）
+            if app.search_edit {
+                match k.code {
+                    KeyCode::Char(c) => {
+                        app.search.push(c);
+                        app.selected = 0;
+                        return true;
+                    }
+                    KeyCode::Backspace => {
+                        app.search.pop();
+                        app.selected = 0;
+                        return true;
+                    }
+                    KeyCode::Enter => {
+                        app.search_edit = false;
+                        return true;
+                    }
+                    KeyCode::Esc => {
+                        app.search.clear();
+                        app.search_edit = false;
+                        app.selected = 0;
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            match k.code {
             KeyCode::Char('q') => app.confirm_quit = true,
             KeyCode::Esc => {
-                if app.sidebar_focus {
+                if !app.search.is_empty() {
+                    // 先清掉筛选，避免本意是"清关键字"却弹出退出确认
+                    app.search.clear();
+                    app.selected = 0;
+                } else if app.sidebar_focus {
                     app.sidebar_focus = false;
                 } else {
                     app.confirm_quit = true;
@@ -1907,8 +2004,15 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                     std::time::Instant::now(),
                 ));
             }
+            // ? 帮助：按视图列出全部快捷键（新功能都从这里能查到）
+            KeyCode::Char('?') => app.help = true,
+            // / 搜索：输入即过滤，Esc 清空
+            KeyCode::Char('/') => {
+                app.search_edit = true;
+            }
             _ => {}
-        },
+            }
+        }
         MainView::Detail(_) => {
             // BT 任务看 tracker/peer 两表；HTTP/播放列表看连接/地址两表
             let is_bt = current_gid(app)
@@ -2032,6 +2136,7 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                     app.remove_del_files = false;
                 }
             }
+            KeyCode::Char('?') => app.help = true,
             _ => {}
             }
         }
@@ -2283,6 +2388,8 @@ fn handle_key(app: &mut App, k: &crossterm::event::KeyEvent) -> bool {
                 app.message = Some((r, std::time::Instant::now()));
                 refresh_app(app);
             }
+            // ? 帮助：按视图列出全部快捷键
+            KeyCode::Char('?') => app.help = true,
             _ => {}
         },
     }
@@ -3415,6 +3522,97 @@ fn draw_app(f: &mut ratatui::Frame, app: &App) {
     if app.add_task.is_some() {
         draw_add_task_dialog(f, app);
     }
+    if app.help {
+        draw_help_popup(f, app);
+    }
+}
+
+/// 帮助浮层（`?`）：把当前视图的全部快捷键摆出来 —— 新加的功能都能在这里查到，
+/// 不用记键位、也不用翻文档。
+fn draw_help_popup(f: &mut ratatui::Frame, app: &App) {
+    use ratatui::style::Style;
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Clear, Padding, Paragraph};
+
+    let dim = ui_dim();
+    let title = match &app.view {
+        MainView::List => tr(" 帮助 · 任务列表 ", " Help · Tasks "),
+        MainView::Detail(_) => tr(" 帮助 · 任务详情 ", " Help · Task detail "),
+        MainView::Settings => tr(" 帮助 · 设置 ", " Help · Settings "),
+    };
+    let pairs: Vec<(&'static str, String)> = match &app.view {
+        MainView::List => vec![
+            ("1-5", tr("分类", "category").to_string()),
+            ("Tab", tr("侧栏焦点", "sidebar focus").to_string()),
+            ("↑↓", tr("选择任务", "select task").to_string()),
+            ("Enter", tr("任务详情", "task detail").to_string()),
+            ("a", tr("新建任务", "new task").to_string()),
+            ("/", tr("搜索任务（Esc 清空）", "search (Esc clears)").to_string()),
+            ("r", tr("暂停 / 继续", "pause / resume").to_string()),
+            ("S", tr("停止做种", "stop seeding").to_string()),
+            ("x", tr("移除任务", "remove task").to_string()),
+            ("c", tr("清除完成记录", "clear results").to_string()),
+            ("s", tr("设置", "settings").to_string()),
+            ("q", tr("退出", "quit").to_string()),
+        ],
+        MainView::Detail(_) => vec![
+            ("Tab", tr("切换表格", "switch table").to_string()),
+            ("↑↓←→ / PgUp PgDn", tr("滚动", "scroll").to_string()),
+            ("r", tr("暂停 / 继续", "pause / resume").to_string()),
+            ("S", tr("停止做种", "stop seeding").to_string()),
+            ("v", tr("校验文件（sha256）", "verify files").to_string()),
+            ("u", tr("追加镜像地址", "add mirror").to_string()),
+            ("o", tr("单任务限速", "task speed limit").to_string()),
+            ("t", tr("添加 tracker", "add tracker").to_string()),
+            ("x", tr("移除任务", "remove task").to_string()),
+            ("Esc", tr("返回列表", "back").to_string()),
+        ],
+        MainView::Settings => vec![
+            (
+                "Tab",
+                tr("切换区域：参数 / Tracker / 订阅", "switch pane").to_string(),
+            ),
+            ("↑↓", tr("选择", "select").to_string()),
+            ("←→ / +/-", tr("调整数值", "adjust").to_string()),
+            ("Enter", tr("编辑 / 打开选择", "edit").to_string()),
+            ("a", tr("添加 Tracker / 订阅源", "add").to_string()),
+            ("d", tr("删除选中项", "delete").to_string()),
+            ("t", tr("启用 / 禁用订阅源", "toggle subscription").to_string()),
+            ("r / R", tr("刷新选中 / 全部订阅", "refresh").to_string()),
+            ("Esc", tr("返回列表", "back").to_string()),
+        ],
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (k, desc) in &pairs {
+        lines.push(hint_line(&[(k, desc.clone())]));
+    }
+    if let Some(ep) = &app.mcp_endpoint {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("MCP ", ui_accent()),
+            Span::styled(ep.clone(), Style::new()),
+        ]));
+        lines.push(Line::from(Span::styled(
+            tr(
+                "（本机 AI Agent 可用该地址调用引擎）",
+                "(local AI agents can call the engine here)",
+            ),
+            dim,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(hint_line(&[("Esc", tr("关闭帮助", "close help").to_string())]));
+
+    let h = (lines.len() as u16 + 2).min(f.area().height);
+    let area = centered_rect(70, h, f.area());
+    f.render_widget(Clear, area);
+    let help = Paragraph::new(lines).block(
+        ui_card()
+            .title(Span::styled(title, ui_accent()))
+            .padding(Padding::horizontal(1)),
+    );
+    f.render_widget(help, area);
 }
 
 /// 新建任务弹窗：地址 + 目录输入 →（磁力）解析中 → 向下扩展文件选择。
@@ -3762,6 +3960,20 @@ fn message_line(app: &App) -> ratatui::text::Line<'static> {
         Some((m, t)) if t.elapsed() < Duration::from_secs(2) => {
             Line::from(Span::styled(format!(" {m}"), Style::new().fg(Color::Cyan)))
         }
+        // 没有操作反馈时，这一行显示搜索状态（输入态带光标 + 命中数）
+        _ if app.search_edit || !app.search.is_empty() => {
+            let cursor = if app.search_edit { "▌" } else { "" };
+            let n = filtered_indices(app).len();
+            Line::from(Span::styled(
+                format!(
+                    " /{}{cursor}  {} {}",
+                    app.search,
+                    n,
+                    tr("项", "items")
+                ),
+                Style::new().fg(Color::Cyan),
+            ))
+        }
         _ => Line::from(""),
     }
 }
@@ -4009,18 +4221,18 @@ fn draw_list(f: &mut ratatui::Frame, app: &App) {
     // 消息行（2s 内显示操作反馈）
     f.render_widget(Paragraph::new(message_line(app)), rows[2]);
 
-    // 底栏：按键加亮 + 说明弱化
+    // 底栏：按键加亮 + 说明弱化（完整键位见 `?`）
     let foot = Paragraph::new(hint_line(&[
         ("1-5", tr("分类", "category")),
         ("Tab", tr("侧栏", "sidebar")),
         ("a", tr("添加", "add")),
         ("Enter", tr("详情", "detail")),
-        ("↑↓", tr("选择", "select")),
+        ("/", tr("搜索", "search")),
         ("r", tr("暂停/继续", "pause/resume")),
         ("S", tr("停止做种", "stop seed")),
         ("x", tr("移除", "remove")),
-        ("c", tr("清除完成", "clear")),
         ("s", tr("设置", "settings")),
+        ("?", tr("帮助", "help")),
         ("q", tr("退出", "quit")),
     ]))
     .alignment(Alignment::Center);
@@ -4109,6 +4321,7 @@ fn draw_detail(f: &mut ratatui::Frame, app: &App, gid: &Gid) {
         ("v", tr("校验", "verify")),
         ("o", tr("限速", "limit")),
         ("x", tr("移除", "remove")),
+        ("?", tr("帮助", "help")),
         ("q", tr("退出", "quit")),
     ]))
     .alignment(Alignment::Center);
@@ -5249,6 +5462,7 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
             ("Enter", tr("输入", "edit")),
             ("Tab", tr("Tracker", "Trackers")),
             ("Esc", tr("返回", "back")),
+            ("?", tr("帮助", "help")),
             ("q", tr("退出", "quit")),
         ])),
         1 => Paragraph::new(hint_line(&[
@@ -5257,6 +5471,7 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
             ("d", tr("删除", "delete")),
             ("Tab", tr("订阅源", "Subscriptions")),
             ("Esc", tr("返回", "back")),
+            ("?", tr("帮助", "help")),
             ("q", tr("退出", "quit")),
         ])),
         _ => Paragraph::new(hint_line(&[
@@ -5267,6 +5482,7 @@ fn draw_settings(f: &mut ratatui::Frame, app: &App) {
             ("r", tr("刷新", "refresh")),
             ("R", tr("全部刷新", "refresh all")),
             ("Esc", tr("返回", "back")),
+            ("?", tr("帮助", "help")),
             ("q", tr("退出", "quit")),
         ])),
     }
@@ -6316,6 +6532,10 @@ mod tests {
             uri_scroll: (0, 0),
             verify_rx: None,
             add_task: None,
+            help: false,
+            search: String::new(),
+            search_edit: false,
+            mcp_endpoint: None,
         }
     }
 
@@ -7527,6 +7747,77 @@ mod tests {
         assert_eq!(app.conn_scroll.0, before + 1, "滚动应落在连接表");
 
         let _ = app.mgr.remove(&gid);
+    }
+
+    /// 搜索：按文件名 / gid 过滤，大小写不敏感，空关键字不过滤。
+    #[test]
+    fn search_filters_tasks() {
+        let tasks = vec![
+            json!({"gid": "aaa111", "status": "active", "files": [{"path": "/tmp/Movie.MKV"}]}),
+            json!({"gid": "bbb222", "status": "active", "files": [{"path": "/tmp/song.flac"}]}),
+        ];
+        assert_eq!(filter_task_indices(&tasks, Category::All, ""), vec![0, 1]);
+        assert_eq!(filter_task_indices(&tasks, Category::All, "movie"), vec![0]);
+        assert_eq!(filter_task_indices(&tasks, Category::All, "BBB"), vec![1]);
+        assert_eq!(filter_task_indices(&tasks, Category::All, "song.flac"), vec![1]);
+        assert!(filter_task_indices(&tasks, Category::All, "nope").is_empty());
+    }
+
+    /// ? 打开帮助、Esc 关闭；/ 进入搜索态并实时过滤。
+    #[test]
+    fn help_and_search_keys_work() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+        app.tasks = vec![
+            json!({"gid": "aaa111", "status": "active", "files": [{"path": "/tmp/alpha.bin"}]}),
+            json!({"gid": "bbb222", "status": "active", "files": [{"path": "/tmp/beta.bin"}]}),
+        ];
+        let key = |c| crossterm::event::KeyEvent::new(c, crossterm::event::KeyModifiers::NONE);
+
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Char('?'))));
+        assert!(app.help, "? 应打开帮助");
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Esc)));
+        assert!(!app.help, "Esc 应关闭帮助");
+
+        assert!(handle_key(&mut app, &key(crossterm::event::KeyCode::Char('/'))));
+        assert!(app.search_edit, "/ 应进入搜索输入态");
+        for c in "beta".chars() {
+            handle_key(&mut app, &key(crossterm::event::KeyCode::Char(c)));
+        }
+        assert_eq!(filtered_indices(&app), vec![1], "应只剩 beta");
+
+        handle_key(&mut app, &key(crossterm::event::KeyCode::Enter));
+        assert!(!app.search_edit, "Enter 退出输入态");
+        assert_eq!(app.search, "beta", "Enter 应保留关键字");
+        handle_key(&mut app, &key(crossterm::event::KeyCode::Esc));
+        assert!(app.search.is_empty(), "Esc 应清空搜索");
+        assert!(!app.confirm_quit, "清搜索不应触发退出确认");
+    }
+
+    /// 帮助浮层确实画出快捷键，而不是一个空框。
+    #[test]
+    fn help_overlay_lists_shortcuts() {
+        let _g = LANG_LOCK.lock().unwrap();
+        let mut app = app_with_peers(vec![]);
+        app.help = true;
+        let backend = TestBackend::new(80, 30);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_help_popup(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..30)
+            .map(|y| {
+                (0..80)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 宽字符（CJK）在缓冲区里每字占两格（符号 + 空位），比较前先去掉空白
+        let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("帮助"), "标题应含「帮助」:\n{text}");
+        assert!(compact.contains("搜索"), "应列出搜索快捷键:\n{text}");
+        assert!(compact.contains("新建任务"), "应列出新建任务:\n{text}");
     }
 
     /// 回归：刷新快照不得 panic（空引擎也要能安全读取全部新增选项）。
