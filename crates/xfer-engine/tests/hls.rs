@@ -1299,25 +1299,30 @@ async fn hls_total_length_converges_and_can_decrease() {
     let seg_bytes = 32 * 1024usize;
     let real_total = (count * seg_bytes) as u64; // 1.25MB
     // 真实码率：32KB / 4s = 65536 bit/s。清单虚报成 4 倍（262144）→ 初值 5MB
-    let names: Vec<String> = (1..=count).map(|i| format!("s{i}.ts")).collect();
+    //
+    // 分片放在 `/show/seg*` 下并给每段 25ms 响应延迟：1.25MB 走回环只要几十毫秒，
+    // 采样循环（20ms 一轮）在 CI 上很容易**第一帧就看到下载完成后的精确总长**，
+    // 于是「初值偏高」这条断言必挂（本地快慢不一致时最典型的 flake）。
+    // 延迟把整个过程拉到 ~0.5s，采样一定能先看到码率推算值。
+    let names: Vec<String> = (1..=count).map(|i| format!("seg{i}.ts")).collect();
     let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let mut files = HashMap::new();
     files.insert(
-        "/m/master.m3u8".to_string(),
+        "/show/master.m3u8".to_string(),
         "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=262144\nv1.m3u8\n"
             .as_bytes()
             .to_vec(),
     );
-    files.insert("/m/v1.m3u8".to_string(), media_playlist(&refs, true).into_bytes());
+    files.insert("/show/v1.m3u8".to_string(), media_playlist(&refs, true).into_bytes());
     for (i, n) in names.iter().enumerate() {
-        files.insert(format!("/m/{n}"), sample(i as u8 + 1, seg_bytes));
+        files.insert(format!("/show/{n}"), sample(i as u8 + 1, seg_bytes));
     }
-    let srv = start_hls_server(files, HashMap::new(), 0).await;
+    let srv = start_hls_server(files, HashMap::new(), 25).await;
 
     let mgr = TaskManager::start(dir.clone(), 2);
     let gid = mgr
         .add_uri(
-            vec![srv.url("/m/master.m3u8")],
+            vec![srv.url("/show/master.m3u8")],
             &serde_json::json!({"dir": dir}),
             None,
         )
@@ -1331,7 +1336,7 @@ async fn hls_total_length_converges_and_can_decrease() {
     // 旧实现两层 `max` 会让它永远为 false）
     let mut saw_decrease = false;
     let st = loop {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // 先采样再睡：第一帧就拿到初值，别把"立刻完成"的任务漏掉
         let st = tell(&mgr, &gid).await;
         let total = st["totalLength"].as_u64().unwrap_or(0);
         let done = st["completedLength"].as_u64().unwrap_or(0);
@@ -1351,6 +1356,7 @@ async fn hls_total_length_converges_and_can_decrease() {
             "complete" | "error" => break st,
             _ => {}
         }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert_eq!(st["status"], "complete", "任务应下载完成：{st}");
 
