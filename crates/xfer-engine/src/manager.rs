@@ -1487,6 +1487,35 @@ impl TaskManager {
         Ok(gid)
     }
 
+    /// 暂停所有还会继续跑的任务（独立 MCP 引擎"让位"给应用时用）。
+    ///
+    /// 返回实际发出暂停的数量。`Active/Seeding` 先置意图再取消，工作者随后落到
+    /// Paused；`Waiting` 直接从队列摘掉。调用方负责紧接着 `save_session()`
+    /// （会话里 active 本来就序列化成 waiting，恢复时同样变暂停，不会丢状态）。
+    pub fn pause_all(&self) -> usize {
+        let gids: Vec<Gid> = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .tasks
+                .iter()
+                .filter(|(_, task)| {
+                    matches!(
+                        task.status(),
+                        Status::Waiting | Status::Active | Status::Seeding
+                    )
+                })
+                .map(|(gid, _)| gid.clone())
+                .collect()
+        };
+        let mut paused = 0;
+        for gid in gids {
+            if self.pause(&gid).is_ok() {
+                paused += 1;
+            }
+        }
+        paused
+    }
+
     pub fn pause(&self, gid: &Gid) -> Result<(), String> {
         let task = self.task_of(gid)?;
         match task.status() {

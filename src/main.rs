@@ -5,6 +5,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -213,7 +214,7 @@ async fn mcp_stdio(args: &[String]) -> i32 {
 
     let host = xfer_engine::host_config::app_dir(host_dir.as_deref())
         .and_then(|data_dir| xfer_engine::host_config::load(&data_dir));
-    embedded_stdio(dir, session, host).await
+    embedded_stdio(dir, session, host, port, token).await
 }
 
 /// 短超时的 HTTP 客户端：探测本机端点用，别让客户端等太久。
@@ -252,34 +253,50 @@ async fn relay_stdio(
             .and_then(|v| v.get("id").cloned())
             .unwrap_or(serde_json::Value::Null);
 
-        let mut req = client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .body(line.to_string());
-        if let Some(t) = &token {
-            req = req.bearer_auth(t);
-        }
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                if text.is_empty() {
-                    if !status.is_success() {
-                        eprintln!("MCP 请求失败: HTTP {status}");
-                        reply_error(&id, &format!("MCP HTTP {status}"));
-                    }
-                    continue;
-                }
+        match forward_line(&client, &url, token.as_deref(), line).await {
+            Ok(Some(text)) => {
                 println!("{text}");
                 let _ = std::io::stdout().flush();
             }
+            Ok(None) => {}
             Err(e) => {
-                eprintln!("MCP 请求失败: {e}");
-                reply_error(&id, &format!("MCP 请求失败: {e}"));
+                eprintln!("{e}");
+                reply_error(&id, &e);
             }
         }
     }
+}
+
+/// POST 一帧到 MCP 端点：`Ok(Some(text))` 有响应体、`Ok(None)` 是通知（无响应），
+/// `Err` 为传输/HTTP 失败（调用方决定回错误帧还是回落本地引擎）。
+async fn forward_line(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+    line: &str,
+) -> Result<Option<String>, String> {
+    let mut req = client
+        .post(url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(line.to_string());
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("MCP 请求失败: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if text.is_empty() {
+        return if status.is_success() {
+            Ok(None)
+        } else {
+            Err(format!("MCP HTTP {status}"))
+        };
+    }
+    Ok(Some(text))
 }
 
 /// 独立模式：本进程内直接起引擎并处理 stdio，不依赖应用是否在运行。
@@ -288,10 +305,16 @@ async fn relay_stdio(
 /// 用什么代理，必须和界面上显示的一致；会话放在 `<userData>/mcp/session.json`，
 /// 应用下次启动时会把它里面的任务并进自己的会话（见
 /// `xfer_engine::TaskManager::start_with_session`），所以 AI 下的东西能在应用里看到。
+///
+/// 应用**中途启动**时本进程立刻让位：暂停全部任务、保存会话、停掉互传服务，
+/// 之后把请求转发给应用的 MCP（应用开了的话）。两个引擎同时跑同一批任务会
+/// 各写各的文件（断点续传按同一偏移写，直接毁数据），不能让它们并存。
 async fn embedded_stdio(
     dir: Option<PathBuf>,
     session: Option<PathBuf>,
     host: Option<xfer_engine::host_config::HostConfig>,
+    port: u16,
+    token: Option<String>,
 ) -> i32 {
     use tokio::io::AsyncBufReadExt;
 
@@ -355,6 +378,49 @@ async fn embedded_stdio(
         if host.is_some() { "（沿用应用配置）" } else { "" }
     );
 
+    // 让位状态：`relay` 有值 = 应用已接手，请求直接转过去；`handed_over` 只表示
+    // "应用已在跑"，用来拦住那些会被应用看不见的新下载。
+    let relay: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let handed_over = Arc::new(AtomicBool::new(false));
+    if let Some(host) = host.clone() {
+        // 没写端口时按应用默认值探测：刚装好的 system.json 可能只有被改过的键。
+        let rpc_port = host.rpc_port.unwrap_or(16800);
+        {
+            let manager = manager.clone();
+            let lan = lan.clone();
+            let relay = relay.clone();
+            let handed_over = handed_over.clone();
+            let mcp_port = host.mcp_port.unwrap_or(port);
+            let mcp_enabled = host.mcp_enabled;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    if !tcp_alive(rpc_port).await {
+                        continue;
+                    }
+                    // 应用起来了：先停手，再谈接手
+                    let paused = manager.pause_all();
+                    let _ = manager.save_session();
+                    if let Some(lan) = &lan {
+                        // 让出 UDP 41234，应用那边的互传才能发现设备
+                        lan.stop().await;
+                    }
+                    handed_over.store(true, Ordering::SeqCst);
+                    let note = if mcp_enabled && mcp_health_ok(mcp_port).await {
+                        let url = format!("http://127.0.0.1:{mcp_port}/mcp");
+                        *relay.lock().unwrap() = Some(url.clone());
+                        format!("，后续请求转给应用（{url}）")
+                    } else {
+                        "，应用未启用 MCP：后续请求仍由本地引擎处理（新下载会被拒绝）".to_string()
+                    };
+                    eprintln!("[xferrust mcp] 检测到应用已启动：已暂停 {paused} 个任务并保存会话{note}");
+                    break;
+                }
+            });
+        }
+    }
+
+    let forward_client = reqwest::Client::new();
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     loop {
         let line = match lines.next_line().await {
@@ -369,6 +435,31 @@ async fn embedded_stdio(
         let line = line.trim();
         if line.is_empty() {
             continue;
+        }
+        // 应用已接手：整帧转发，本地引擎不再碰任务
+        let relay_url = { relay.lock().unwrap().clone() };
+        if let Some(url) = relay_url {
+            match forward_line(&forward_client, &url, token.as_deref(), line).await {
+                Ok(Some(text)) => {
+                    println!("{text}");
+                    let _ = std::io::stdout().flush();
+                    continue;
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!("[xferrust mcp] 转发失败，改回本地引擎：{e}");
+                    *relay.lock().unwrap() = None;
+                }
+            }
+        }
+        // 应用在跑但没开 MCP：不能再偷偷起一份下载 —— 那样的任务应用看不见，
+        // 两边还会各写一份文件。明确告诉调用方去开 MCP。
+        if handed_over.load(Ordering::SeqCst) && relay.lock().unwrap().is_none() {
+            if let Some(frame) = reject_task_mutation(line) {
+                println!("{frame}");
+                let _ = std::io::stdout().flush();
+                continue;
+            }
         }
         // 真正用到互传服务（发现/任务/发送）时才拉起：平时不占发现端口，也不广播
         // 设备名；只读状态或改配置不需要先起服务（后者自己会按需启动）。
@@ -386,6 +477,67 @@ async fn embedded_stdio(
     }
     let _ = manager.save_session();
     0
+}
+
+/// 应用引擎是否已经在监听（RPC 端口连得上就算起来了）。
+async fn tcp_alive(port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+/// 应用的 MCP 端点是否可用（`/health` 回 2xx）。
+async fn mcp_health_ok(port: u16) -> bool {
+    let Some(client) = probe_client() else {
+        return false;
+    };
+    client
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// 应用接手但不支持转发时，拦下那些"会让本地引擎重新动任务"的调用。
+///
+/// 只拦**新建**与**继续**：这两个动作会让本地引擎和已经把任务并过去的应用
+/// 同时写同一批文件。暂停/删除/查询都是安全的（本地这边本来就没在跑）。
+fn reject_task_mutation(line: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return None;
+    }
+    let name = value
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())?;
+    if !matches!(
+        name,
+        "add_url" | "add_magnet" | "add_torrent" | "resume_task"
+    ) {
+        return None;
+    }
+    let id = value.get("id")?.clone();
+    Some(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "Lerxu 正在运行，但没有启用 MCP 服务：为避免两个引擎同时处理同一个任务，新建/继续下载已被拦截。请在 设置 → 进阶设置 → MCP 服务 打开开关并重启应用后再试。"
+                }],
+                "isError": true
+            }
+        })
+        .to_string(),
+    )
 }
 
 /// 这一帧请求是不是"需要互传服务已在跑"的工具（`lan_status` / `lan_set_config`

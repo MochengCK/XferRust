@@ -373,7 +373,19 @@ impl NativeDispatcher {
             // ---- 局域网文件传输 ----
             // 任务对象结构与协议第 3 节完全一致（见 xfer-lan::LanTask）。
             "lan.config" => {
-                let status = self.lan()?.status();
+                let controller = self.lan()?;
+                let status = controller.status();
+                // 自愈：开关是开的、服务却没在跑（典型是启动那一刻端口被独立
+                // MCP 引擎占着），下一次状态轮询顺手重试一次。独立引擎检测到
+                // 应用起来后会主动让位（停掉自己的互传服务），这里就能恢复。
+                if status.enabled && !status.running {
+                    let controller = controller.clone();
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            let _ = controller.ensure_started().await;
+                        });
+                    }
+                }
                 serde_json::to_value(status).map_err(|e| format!("序列化互传配置失败：{e}"))
             }
             "lan.setConfig" => {

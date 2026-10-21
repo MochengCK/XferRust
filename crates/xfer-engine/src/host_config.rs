@@ -42,6 +42,14 @@ pub struct HostConfig {
     pub download_dir: Option<PathBuf>,
     /// 最大同时下载数。
     pub max_concurrent: Option<usize>,
+    /// 应用引擎的 RPC 端口：独立进程用它判断"应用是不是已经起来了"，
+    /// 起来之后就让位（暂停自己的任务并把请求转给应用）。
+    pub rpc_port: Option<u16>,
+    /// 应用里是否启用了 MCP 服务（只有启用时才可能把请求转过去）。
+    pub mcp_enabled: bool,
+    /// 应用配置的 MCP 端口：与应用实际监听一致（设置里改过端口也能对上，
+    /// 不必依赖客户端配置里那份旧参数）。
+    pub mcp_port: Option<u16>,
     /// 其余全局引擎选项（代理、分片、BT 开关……），已排除 [`BLOCKED_KEYS`]。
     pub options: Vec<(String, String)>,
 }
@@ -107,6 +115,21 @@ pub fn parse(data_dir: &Path, value: &Value) -> HostConfig {
             _ => None,
         })
         .map(|n| (n as usize).max(1));
+    let rpc_port = obj
+        .and_then(|o| o.get("rpc-listen-port"))
+        .and_then(port_value)
+        .filter(|p| *p > 0);
+    let mcp_enabled = obj
+        .and_then(|o| o.get("mcp-enabled"))
+        .map(|v| matches!(v, Value::Bool(true)))
+        .unwrap_or(false);
+    let mcp_port = if mcp_enabled {
+        obj.and_then(|o| o.get("mcp-listen-port"))
+            .and_then(port_value)
+            .filter(|p| *p > 0)
+    } else {
+        None
+    };
 
     let mut options = Vec::new();
     if let Some(obj) = obj {
@@ -131,8 +154,21 @@ pub fn parse(data_dir: &Path, value: &Value) -> HostConfig {
         data_dir: data_dir.to_path_buf(),
         download_dir,
         max_concurrent,
+        rpc_port,
+        mcp_enabled,
+        mcp_port,
         options,
     }
+}
+
+/// 端口类取值：数字或数字字符串，超范围视为无效。
+fn port_value(value: &Value) -> Option<u16> {
+    let n = match value {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }?;
+    (n > 0 && n <= u16::MAX as u64).then_some(n as u16)
 }
 
 /// `~` / `~/xxx` 展开；其余原样（相对路径留给引擎按工作目录解析）。
@@ -163,6 +199,7 @@ mod tests {
             "max-overall-download-limit": "0",
             "rpc-listen-port": 18514,
             "rpc-secret": "secret",
+            "mcp-enabled": true,
             "mcp-listen-port": 16801,
             "log": "/tmp/engine.log",
             "listen-port": 51413,
@@ -178,6 +215,9 @@ mod tests {
         assert_eq!(cfg.data_dir, PathBuf::from("/tmp/host"));
         assert_eq!(cfg.download_dir, Some(PathBuf::from("/Users/demo/Downloads")));
         assert_eq!(cfg.max_concurrent, Some(10));
+        assert_eq!(cfg.rpc_port, Some(18514));
+        assert!(cfg.mcp_enabled);
+        assert_eq!(cfg.mcp_port, Some(16801));
 
         let map: std::collections::HashMap<_, _> = cfg.options.iter().cloned().collect();
         // 普通选项照搬，布尔/数字都转成字符串

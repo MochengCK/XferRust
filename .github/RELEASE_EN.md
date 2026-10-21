@@ -3,6 +3,7 @@
 - Built-in MCP service: local AI agents can add, inspect and control downloads over the standard MCP protocol
 - New `xferrust mcp` entry point: agents keep working when the host app is not running, and requests are relayed to a running engine when it is
 - Standalone mode reuses the host app's download directory and global settings, and its tasks show up in the app after the next launch
+- As soon as the app starts, a standalone engine pauses its tasks and yields (relaying to the app when possible), so the two never write the same files
 - 7 new MCP tools for LAN transfer (discover devices, send files, inspect or cancel transfers)
 - The command-line UI gains a help overlay and task search, and can serve MCP as well
 - MCP listens on loopback only, reuses the RPC secret for authentication, and is off by default
@@ -41,5 +42,5 @@
 
 - MCP is off by default: without `--mcp-listen-port` no extra port is opened.
 - The standalone `xferrust mcp` session lives in `<userData>/mcp/session.json` and is merged into the app session when the host app starts; the two processes never write the same session file, and unfinished standalone tasks come back as paused in the app (they do not restart on their own).
-- Starting the app while an AI-driven standalone download is still running can leave both engines working on the same task; wait for the agent to finish before opening the app.
+- When the host app starts, a standalone engine **yields immediately**: it pauses every task, saves the session, stops its own LAN service (releasing UDP 41234) and then relays requests to the app's MCP when that is enabled. Without MCP enabled, new downloads and resumes are rejected with a hint to turn it on, so the two engines never write the same files.
 - All other command-line arguments and existing RPC semantics are unchanged.
