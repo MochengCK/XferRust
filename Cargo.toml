@@ -19,7 +19,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "rustls-tls-native-roots", "stream"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-sha1 = "0.10"
+# asm：x86/x86_64 上用 SHA-NI 硬件指令（带运行时检测），
+# 大文件校验/做种哈希显著加速；其他架构自动回退纯软件实现
+sha1 = { version = "0.10", features = ["asm"] }
 sha2 = "0.10"
 md-5 = "0.10"
 getrandom = "0.3"

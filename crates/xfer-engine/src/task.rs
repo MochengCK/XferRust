@@ -258,6 +258,11 @@ pub struct Task {
     /// 与 `bt_bitfield` 不同：它只表示"开始时已经验证过的数据"，
     /// 用于在文件表里展示"已验证大小"；普通新任务为空。
     pub bt_verified_bitfield: Mutex<Vec<u8>>,
+    /// 是否正在做已有数据 SHA-1 校验（此时还未联网下载）。
+    pub bt_verifying: AtomicBool,
+    /// 已有数据校验的进度：已处理字节 / 应处理字节（1Hz 同步）。
+    pub bt_verify_checked: AtomicU64,
+    pub bt_verify_total: AtomicU64,
     /// HTTP 任务实时分片位图（下载启动时挂接，写线程按落盘区间增量
     /// 维护；BT 任务不使用——分片信息来自 bt_meta）。暂停后保留最后
     /// 已知状态供 UI 展示；未知总长或不支持 Range 的任务为 None。
@@ -355,6 +360,9 @@ impl Task {
             bt_peers: Mutex::new(Vec::new()),
             bt_bitfield: Mutex::new(Vec::new()),
             bt_verified_bitfield: Mutex::new(Vec::new()),
+            bt_verifying: AtomicBool::new(false),
+            bt_verify_checked: AtomicU64::new(0),
+            bt_verify_total: AtomicU64::new(0),
             http_pieces: RwLock::new(None),
             http_split_stats: RwLock::new(None),
             awaiting_selection: AtomicBool::new(false),
@@ -421,6 +429,9 @@ impl Task {
             bt_peers: Mutex::new(Vec::new()),
             bt_bitfield: Mutex::new(Vec::new()),
             bt_verified_bitfield: Mutex::new(Vec::new()),
+            bt_verifying: AtomicBool::new(false),
+            bt_verify_checked: AtomicU64::new(0),
+            bt_verify_total: AtomicU64::new(0),
             http_pieces: RwLock::new(None),
             http_split_stats: RwLock::new(None),
             awaiting_selection: AtomicBool::new(false),
@@ -487,6 +498,9 @@ impl Task {
             bt_peers: Mutex::new(Vec::new()),
             bt_bitfield: Mutex::new(Vec::new()),
             bt_verified_bitfield: Mutex::new(Vec::new()),
+            bt_verifying: AtomicBool::new(false),
+            bt_verify_checked: AtomicU64::new(0),
+            bt_verify_total: AtomicU64::new(0),
             http_pieces: RwLock::new(None),
             http_split_stats: RwLock::new(None),
             awaiting_selection: AtomicBool::new(false),
@@ -1179,6 +1193,9 @@ pub fn status_json_native(task: &Task) -> Value {
         && s.completed > 0
         && s.total_len.is_some_and(|t| s.completed >= t && t > 0);
     let hash = info_hash_hex(task);
+    let verifying = task.bt_verifying.load(Ordering::Relaxed);
+    let verify_checked = task.bt_verify_checked.load(Ordering::Relaxed);
+    let verify_total = task.bt_verify_total.load(Ordering::Relaxed);
     json!({
         "gid": s.gid,
         "status": s.status.as_str(),
@@ -1186,6 +1203,12 @@ pub fn status_json_native(task: &Task) -> Value {
         "completedLength": s.completed,
         // 本次启动从磁盘已有文件继承并校验通过的大小（普通新任务为 0）
         "verifiedLength": verified_total,
+        // 已有数据校验进行中：checked/total 为实时进度（未校验时为 false/0）
+        "verifying": verifying,
+        "verifyProgress": {
+            "checkedLength": verify_checked,
+            "totalLength": verify_total,
+        },
         "filename": s.filename,
         "uploadLength": s.uploaded,
         "downloadSpeed": s.download_speed,

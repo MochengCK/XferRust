@@ -14,3 +14,6 @@ sha2 = { workspace = true }
 md-5 = { workspace = true }
 
 [dev-dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

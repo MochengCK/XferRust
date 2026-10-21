@@ -19,7 +19,7 @@ pub mod tracker;
 pub use engine::{
     load_saved_torrent, preview_existing_data, torrent_has_existing_data, BtProtocol,
     EncryptionMode, ExistingDataPreview, PeerInfo, PeerSource, PeerStream, TorrentConfig,
-    TorrentEngine, TorrentProgress, TrackerStat,
+    TorrentEngine, TorrentProgress, TrackerStat, VerifyProgress, VerifyProgressSnapshot,
 };
 pub use message::{
     decode_handshake, encode_handshake, supports_dht, supports_extension, supports_fast_extension,

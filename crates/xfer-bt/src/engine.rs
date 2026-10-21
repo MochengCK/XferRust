@@ -12,12 +12,11 @@
 //! Choking 算法（Leecher/Seeder）、Keep-alive 定时优化、Have 广播、
 //! 消息洪泛检测、非活跃连接断开、Allowed Fast Set 计算。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -1043,6 +1042,8 @@ pub struct TorrentEngine {
     /// 本次启动时从已有磁盘文件校验通过的片位图（wire 字节）：
     /// 续接控制文件恢复或新增任务磁盘哈希校验的结果，供状态展示"已验证大小"。
     verified_bitfield: Mutex<Vec<u8>>,
+    /// 已有数据校验的实时进度（任务启动校验时供状态接口读取）。
+    verify_progress: Arc<VerifyProgress>,
     /// 新任务已有数据、需要在本轮启动前做一次磁盘哈希校验。
     verify_existing: AtomicBool,
     /// 哈希校验进行中：暂时不允许选片/请求，避免校验期间 peer 写入同一批片。
@@ -1171,6 +1172,9 @@ impl TorrentEngine {
         let layout =
             PieceLayout::new(meta.info.piece_length, files).with_multi_file(meta.info.multi_file);
         let total_bytes = layout.total_length();
+        // 已有数据判定必须在建库/预分配**之前**：预分配会把新文件补到最终
+        // 长度，之后再 stat 会把空文件误判成"已有数据"并白跑一遍校验。
+        let existing_before = has_existing_data(&config.dir, &meta.info.name, &layout);
         // 按文件选择建库：None 全量；Some(索引) 只建所选文件；
         // Some(空) = 磁力等待勾选占位，不创建任何数据文件
         let mut store = PieceStore::open(
@@ -1195,14 +1199,18 @@ impl TorrentEngine {
             &meta.info.name,
             &mut store,
         );
+        // 续传恢复之后再预分配：让"磁盘空间不足"在联网前暴露，同时不破坏
+        // restore_resume 依据真实文件长度剔除失效片的判断。
+        store
+            .preallocate()
+            .map_err(|e| format!("预分配磁盘空间失败: {e}"))?;
         // 有续传控制文件：位图是上次逐片校验过的结果，直接继承。
         // 没有控制文件但目录里已有数据：run() 启动网络前先做一次磁盘 SHA-1
         // 校验，能继承多少继承多少（不再按文件长度盲标全部完成）。
         let (verified_bitfield, verify_existing) = if restored {
             (store.bitfield(), false)
         } else {
-            let existing = has_existing_data(&config.dir, &meta.info.name, store.layout());
-            (Vec::new(), existing)
+            (Vec::new(), existing_before)
         };
 
         let peer_id = config.peer_id;
@@ -1228,6 +1236,7 @@ impl TorrentEngine {
             actual_listen_port: std::sync::atomic::AtomicU16::new(0),
             store: Mutex::new(Some(store)),
             verified_bitfield: Mutex::new(verified_bitfield),
+            verify_progress: Arc::new(VerifyProgress::default()),
             verify_existing: AtomicBool::new(verify_existing),
             verifying: AtomicBool::new(verify_existing),
             metadata: Mutex::new(MetadataAccum::default()),
@@ -1300,6 +1309,7 @@ impl TorrentEngine {
             actual_listen_port: std::sync::atomic::AtomicU16::new(0),
             store: Mutex::new(None),
             verified_bitfield: Mutex::new(Vec::new()),
+            verify_progress: Arc::new(VerifyProgress::default()),
             verify_existing: AtomicBool::new(false),
             verifying: AtomicBool::new(false),
             metadata: Mutex::new(MetadataAccum::default()),
@@ -1373,6 +1383,10 @@ impl TorrentEngine {
         // 磁力等待勾选期间 selected_files=Some(空) → 不创建任何数据文件，
         // 目录与文件等用户勾选完成、下次启动带真实选择时才创建
         let wanted_files = self.selected_files.lock().unwrap().clone();
+        // 同 TorrentEngine::new：已有数据判定必须早于预分配
+        let selected_has_files = !matches!(&wanted_files, Some(v) if v.is_empty());
+        let existing_before = selected_has_files
+            && has_existing_data(&self.config.dir, &meta.info.name, &layout);
         let mut store =
             PieceStore::open(&self.config.dir, &meta.info.name, layout, wanted_files.as_deref())
                 .map_err(|e| format!("打开 piece 存储失败: {e}"))?;
@@ -1391,17 +1405,17 @@ impl TorrentEngine {
             &meta.info.name,
             &mut store,
         );
+        // 同 TorrentEngine::new：续传恢复之后再预分配
+        store
+            .preallocate()
+            .map_err(|e| format!("预分配磁盘空间失败: {e}"))?;
         let (verified_bitfield, needs_verify) = if restored {
             (store.bitfield(), false)
         } else {
             // 等待文件勾选（空选择）时没有任何落盘文件，等用户选完重启
             // 引擎后再按真实选择校验。其余情况只要磁盘已有数据，就在 run()
             // 进入下载前做逐片 SHA-1 校验。
-            let selected = self.selected_files.lock().unwrap().clone();
-            let selected_has_files = !matches!(&selected, Some(v) if v.is_empty());
-            let existing = selected_has_files
-                && has_existing_data(&self.config.dir, &meta.info.name, store.layout());
-            (Vec::new(), existing)
+            (Vec::new(), existing_before)
         };
         if needs_verify {
             self.verify_existing.store(true, Ordering::SeqCst);
@@ -5837,8 +5851,9 @@ impl TorrentEngine {
         let dir = self.config.dir.clone();
         let name = meta.info.name.clone();
         let hashes = meta.info.pieces.clone();
+        let progress = self.verify_progress.clone();
         let check = tokio::task::spawn_blocking(move || {
-            verify_existing_files_blocking(dir, name, layout, hashes, wanted)
+            verify_existing_files_blocking(dir, name, layout, hashes, wanted, Some(&progress))
         })
         .await
         .unwrap_or_default();
@@ -5863,6 +5878,16 @@ impl TorrentEngine {
     /// 本次启动时校验通过的已有片位图（wire 字节；供状态展示"已验证大小"）。
     pub fn verified_bitfield(&self) -> Vec<u8> {
         self.verified_bitfield.lock().unwrap().clone()
+    }
+
+    /// 已有数据校验的实时进度快照。
+    pub fn verify_progress(&self) -> VerifyProgressSnapshot {
+        self.verify_progress.snapshot()
+    }
+
+    /// 是否正在做已有数据校验（此期间不拉 peer、不请求片）。
+    pub fn is_verifying(&self) -> bool {
+        self.verifying.load(Ordering::Relaxed)
     }
 
     /// 持久化续传控制文件：片完成时节流写入，暂停/停止强制写入。
@@ -6142,6 +6167,62 @@ struct ExistingVerification {
     pieces: u32,
 }
 
+/// 已有数据校验的实时进度（无锁原子计数，供预览轮询与任务状态读取）。
+///
+/// `checked` 是已处理的片/字节（含校验失败与磁盘未覆盖的片），
+/// `verified` 是通过 SHA-1 的部分；前者用于进度条，后者用于"已验证大小"。
+#[derive(Debug, Default)]
+pub struct VerifyProgress {
+    total_bytes: AtomicU64,
+    checked_bytes: AtomicU64,
+    total_pieces: AtomicU32,
+    checked_pieces: AtomicU32,
+    verified_bytes: AtomicU64,
+    verified_pieces: AtomicU32,
+}
+
+/// [`VerifyProgress`] 的一次性快照。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VerifyProgressSnapshot {
+    pub total_bytes: u64,
+    pub checked_bytes: u64,
+    pub total_pieces: u32,
+    pub checked_pieces: u32,
+    pub verified_bytes: u64,
+    pub verified_pieces: u32,
+}
+
+impl VerifyProgress {
+    fn reset(&self, total_bytes: u64, total_pieces: u32) {
+        self.total_bytes.store(total_bytes, Ordering::Relaxed);
+        self.checked_bytes.store(0, Ordering::Relaxed);
+        self.total_pieces.store(total_pieces, Ordering::Relaxed);
+        self.checked_pieces.store(0, Ordering::Relaxed);
+        self.verified_bytes.store(0, Ordering::Relaxed);
+        self.verified_pieces.store(0, Ordering::Relaxed);
+    }
+
+    fn record(&self, piece_len: u64, verified: bool) {
+        self.checked_bytes.fetch_add(piece_len, Ordering::Relaxed);
+        self.checked_pieces.fetch_add(1, Ordering::Relaxed);
+        if verified {
+            self.verified_bytes.fetch_add(piece_len, Ordering::Relaxed);
+            self.verified_pieces.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn snapshot(&self) -> VerifyProgressSnapshot {
+        VerifyProgressSnapshot {
+            total_bytes: self.total_bytes.load(Ordering::Relaxed),
+            checked_bytes: self.checked_bytes.load(Ordering::Relaxed),
+            total_pieces: self.total_pieces.load(Ordering::Relaxed),
+            checked_pieces: self.checked_pieces.load(Ordering::Relaxed),
+            verified_bytes: self.verified_bytes.load(Ordering::Relaxed),
+            verified_pieces: self.verified_pieces.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// 添加任务时的"已有数据"预览（只读，不建目录、不写盘）。
 #[derive(Debug, Default, Clone)]
 pub struct ExistingDataPreview {
@@ -6160,8 +6241,12 @@ pub struct ExistingDataPreview {
 /// 预览 `<dir>` 下某个种子的已有数据：逐片读盘校验，返回可继承的字节。
 ///
 /// **只读**：不创建目录/文件，不做任何写入。大文件哈希耗时较长，
-/// 调用方应放在阻塞线程上执行。
-pub fn preview_existing_data(dir: &Path, meta: &TorrentMeta) -> ExistingDataPreview {
+/// 调用方应放在阻塞线程上执行；`progress` 用于实时上报已处理字节。
+pub fn preview_existing_data(
+    dir: &Path,
+    meta: &TorrentMeta,
+    progress: Option<&VerifyProgress>,
+) -> ExistingDataPreview {
     let files: Vec<(Vec<String>, u64)> = meta
         .info
         .files
@@ -6186,6 +6271,7 @@ pub fn preview_existing_data(dir: &Path, meta: &TorrentMeta) -> ExistingDataPrev
         layout.clone(),
         meta.info.pieces.clone(),
         None,
+        progress,
     );
     let file_verified = layout.files_done_bytes(|i| {
         let bit = i as usize;
@@ -6250,6 +6336,7 @@ fn verify_existing_files_blocking(
     layout: PieceLayout,
     hashes: Vec<[u8; 20]>,
     wanted: Option<PieceMap>,
+    progress: Option<&VerifyProgress>,
 ) -> ExistingVerification {
     let count = layout.piece_count();
     if count == 0 || hashes.len() != count as usize {
@@ -6257,58 +6344,197 @@ fn verify_existing_files_blocking(
     }
     let single = layout.is_single_file();
     let base = dir.join(&name);
-    let mut files: Vec<Option<(File, u64)>> = Vec::with_capacity(layout.files.len());
-    for f in &layout.files {
-        let path = if single {
-            base.clone()
-        } else {
-            base.join(f.path.iter().collect::<PathBuf>())
-        };
-        let opened = std::fs::metadata(&path)
-            .ok()
-            .map(|m| m.len())
-            .and_then(|len| File::open(&path).ok().map(|file| (file, len)));
-        files.push(opened);
-    }
 
-    let mut bitfield = vec![0u8; (count as usize).div_ceil(8)];
-    let mut bytes = 0u64;
-    let mut pieces = 0u32;
+    let mut total_bytes = 0u64;
+    let mut total_pieces = 0u32;
     for idx in 0..count {
         if wanted.as_ref().is_some_and(|m| !m.is_set(idx)) {
             continue;
         }
-        let mut data = Vec::with_capacity(layout.piece_len(idx) as usize);
-        let mut covered = true;
-        for (fi, off, len) in layout.piece_segments(idx) {
-            let Some((file, file_len)) = files.get_mut(fi as usize).and_then(Option::as_mut) else {
-                covered = false;
-                break;
-            };
-            if *file_len < off + len {
-                covered = false;
-                break;
-            }
-            let pos = data.len();
-            data.resize(pos + len as usize, 0);
-            if file.seek(SeekFrom::Start(off)).is_err()
-                || file.read_exact(&mut data[pos..]).is_err()
-            {
-                covered = false;
-                break;
-            }
+        total_bytes += layout.piece_len(idx);
+        total_pieces += 1;
+    }
+    if let Some(p) = progress {
+        p.reset(total_bytes, total_pieces);
+    }
+
+    // 按片分段并行：每个线程拿一段**连续**片号，读盘尽量顺序、哈希互不等待。
+    // 文件句柄按需打开并做小缓存（pread/seek_read 带偏移，不依赖游标）：
+    // 种子文件可能成千上万个，一次性全开会触顶进程 FD 限制——后面的文件
+    // 被当成缺失，表现为"明明下完了却只校验出一小部分"。
+    let workers = verify_workers(count, total_bytes);
+    let chunk = count.div_ceil(workers as u32);
+    let wanted_ref = wanted.as_ref();
+    let verified: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for worker in 0..workers {
+            let verified = &verified;
+            let layout = &layout;
+            let hashes = &hashes;
+            let base = base.clone();
+            scope.spawn(move || {
+                let start = worker as u32 * chunk;
+                let end = (start + chunk).min(count);
+                let mut cache = VerifyFileCache::new(base, single, 8);
+                let mut local = Vec::new();
+                let mut buf = Vec::new();
+                for idx in start..end {
+                    if wanted_ref.is_some_and(|m| !m.is_set(idx)) {
+                        continue;
+                    }
+                    let len = layout.piece_len(idx);
+                    let covered = read_piece_into(&mut cache, layout, idx, &mut buf);
+                    let ok = covered && verify_piece(&buf, &hashes[idx as usize]);
+                    if ok {
+                        local.push(idx);
+                    }
+                    if let Some(p) = progress {
+                        p.record(len, ok);
+                    }
+                }
+                verified.lock().unwrap().extend(local);
+            });
         }
-        if covered && data.len() == layout.piece_len(idx) as usize && verify_piece(&data, &hashes[idx as usize]) {
-            bitfield[idx as usize / 8] |= 0x80u8 >> (idx % 8);
-            bytes += data.len() as u64;
-            pieces += 1;
-        }
+    });
+
+    let verified = verified.into_inner().unwrap();
+    let mut bitfield = vec![0u8; (count as usize).div_ceil(8)];
+    let mut bytes = 0u64;
+    for idx in &verified {
+        bitfield[*idx as usize / 8] |= 0x80u8 >> (*idx % 8);
+        bytes += layout.piece_len(*idx);
     }
     ExistingVerification {
         bitfield,
         bytes,
-        pieces,
+        pieces: verified.len() as u32,
     }
+}
+
+/// 校验并行度：小数据单线程；大数据按 CPU 核数（上限 8，避免磁盘随机读打满）。
+fn verify_workers(count: u32, total_bytes: u64) -> usize {
+    if count < 4 || total_bytes < 2 * 1024 * 1024 {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(2, 8)
+        .min(count as usize)
+}
+
+/// 读取一片的完整内容（跨文件分段按顺序拼接）。任一文件缺失/短于分段
+/// 或读盘失败都返回 false（该片按未完成处理）。
+fn read_piece_into(
+    cache: &mut VerifyFileCache,
+    layout: &PieceLayout,
+    idx: u32,
+    buf: &mut Vec<u8>,
+) -> bool {
+    buf.clear();
+    let need = layout.piece_len(idx) as usize;
+    buf.reserve(need);
+    for (fi, off, len) in layout.piece_segments(idx) {
+        let pos = buf.len();
+        buf.resize(pos + len as usize, 0);
+        let Some(file) = cache.file(&layout.files, fi as usize, off + len) else {
+            return false;
+        };
+        if read_exact_at(file, &mut buf[pos..], off).is_err() {
+            return false;
+        }
+    }
+    buf.len() == need
+}
+
+/// 校验用的按需文件句柄缓存（每个工作线程独立）。
+///
+/// 只保留最近用到的少量句柄：种子可能有成千上万个文件，一次性全开会
+/// 触顶进程 FD 限制，后续文件被当成缺失、校验结果偏小。连续片号通常
+/// 落在同一个文件里，`limit=8` 足够避免反复开关同一文件。
+struct VerifyFileCache {
+    base: PathBuf,
+    single: bool,
+    handles: HashMap<usize, (File, u64)>,
+    order: VecDeque<usize>,
+    limit: usize,
+}
+
+impl VerifyFileCache {
+    fn new(base: PathBuf, single: bool, limit: usize) -> Self {
+        Self {
+            base,
+            single,
+            handles: HashMap::new(),
+            order: VecDeque::new(),
+            limit: limit.max(1),
+        }
+    }
+
+    fn file(&mut self, files: &[xfer_storage::FileLayout], fi: usize, need: u64) -> Option<&File> {
+        if let Some((_, len)) = self.handles.get(&fi) {
+            if *len < need {
+                return None;
+            }
+            return self.handles.get(&fi).map(|(f, _)| f);
+        }
+        let layout_file = files.get(fi)?;
+        let path = if self.single {
+            self.base.clone()
+        } else {
+            self.base.join(layout_file.path.iter().collect::<PathBuf>())
+        };
+        let len = std::fs::metadata(&path).ok()?.len();
+        if len < need {
+            return None;
+        }
+        let file = File::open(&path).ok()?;
+        if self.handles.len() >= self.limit {
+            if let Some(old) = self.order.pop_front() {
+                self.handles.remove(&old);
+            }
+        }
+        self.handles.insert(fi, (file, len));
+        self.order.push_back(fi);
+        self.handles.get(&fi).map(|(f, _)| f)
+    }
+}
+
+/// 带偏移的精确读（不移动共享文件句柄的游标，多线程可同时读同一文件）。
+#[cfg(unix)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !buf.is_empty() {
+        let n = file.read_at(buf, offset)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = &mut buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = file.seek_read(buf, offset)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf = &mut buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(buf)
 }
 
 /// 从续传控制文件恢复已完成片位图。
@@ -7614,6 +7840,7 @@ mod tests {
             layout.clone(),
             hashes.clone(),
             None,
+            None,
         );
         assert_eq!(partial.pieces, 2);
         assert_eq!(partial.bytes, 4);
@@ -7626,6 +7853,7 @@ mod tests {
             name.to_string(),
             layout,
             hashes,
+            None,
             None,
         );
         assert_eq!(corrupt.pieces, 1);
@@ -7684,7 +7912,7 @@ mod tests {
         };
 
         // 没有数据：总长已知，但没有任何已验证字节（无需进入校验）。
-        let empty = preview_existing_data(&root, &meta);
+        let empty = preview_existing_data(&root, &meta, None);
         assert!(!empty.has_existing_data);
         assert_eq!(empty.total_bytes, 8);
         assert_eq!(empty.verified_bytes, 0);
@@ -7694,11 +7922,143 @@ mod tests {
         std::fs::write(root.join("pack/a.bin"), b"abcd").unwrap();
         std::fs::write(root.join("pack/b.bin"), b"ef").unwrap();
         assert!(torrent_has_existing_data(&root, &meta));
-        let preview = preview_existing_data(&root, &meta);
+        let preview = preview_existing_data(&root, &meta, None);
         assert!(preview.has_existing_data);
         assert_eq!(preview.verified_pieces, 3);
         assert_eq!(preview.verified_bytes, 6);
         assert_eq!(preview.file_verified, vec![4, 2]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 跨文件片：分段分别落在两个文件里，必须拼起来校验并按文件归属。
+    #[test]
+    fn verify_existing_data_handles_cross_file_pieces() {
+        use sha1::{Digest, Sha1};
+        use xfer_bencode::{FileEntry, Info, TorrentMeta};
+
+        let root = std::env::temp_dir().join(format!(
+            "xfer-bt-cross-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(root.join("pack")).unwrap();
+        let hash = |chunk: &[u8]| -> [u8; 20] {
+            let mut h = Sha1::new();
+            h.update(chunk);
+            h.finalize().into()
+        };
+        // a 文件 6 字节、b 文件 6 字节，片长 4：片 0 全在 a，片 1 跨
+        // a[4..6]+b[0..2]，片 2 全在 b[2..6]。
+        let meta = TorrentMeta {
+            info: Info {
+                name: "pack".into(),
+                piece_length: 4,
+                pieces: vec![hash(b"abcd"), hash(b"efgh"), hash(b"ijkl")],
+                files: vec![
+                    FileEntry {
+                        path: vec!["a.bin".into()],
+                        length: 6,
+                    },
+                    FileEntry {
+                        path: vec!["b.bin".into()],
+                        length: 6,
+                    },
+                ],
+                multi_file: true,
+                private: false,
+            },
+            info_hash: [8; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            raw_bencode: None,
+            raw_info: None,
+        };
+        std::fs::write(root.join("pack/a.bin"), b"abcdef").unwrap();
+        std::fs::write(root.join("pack/b.bin"), b"gh").unwrap();
+
+        let progress = VerifyProgress::default();
+        let preview = preview_existing_data(&root, &meta, Some(&progress));
+        assert_eq!(preview.verified_pieces, 2);
+        assert_eq!(preview.verified_bytes, 8);
+        assert_eq!(preview.file_verified, vec![6, 2]);
+        let p = progress.snapshot();
+        assert_eq!(p.checked_bytes, 12);
+        assert_eq!(p.checked_pieces, 3);
+        assert_eq!(p.total_bytes, 12);
+        assert_eq!(p.total_pieces, 3);
+        assert_eq!(p.verified_bytes, 8);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 大数据走并行校验：坏一片不影响其余片，进度计数覆盖全部片。
+    #[test]
+    fn verify_existing_data_parallel_keeps_accuracy_and_progress() {
+        use sha1::{Digest, Sha1};
+        use xfer_bencode::{FileEntry, Info, TorrentMeta};
+
+        const PIECE: usize = 512 * 1024;
+        const PIECES: usize = 8;
+        let root = std::env::temp_dir().join(format!(
+            "xfer-bt-parallel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let data: Vec<u8> = (0..PIECE * PIECES).map(|i| (i % 251) as u8).collect();
+        let pieces: Vec<[u8; 20]> = data
+            .chunks(PIECE)
+            .map(|chunk| {
+                let mut h = Sha1::new();
+                h.update(chunk);
+                h.finalize().into()
+            })
+            .collect();
+        let mut on_disk = data.clone();
+        on_disk[PIECE * 3 + 17] ^= 0xFF; // 第 4 片损坏
+        std::fs::write(root.join("big.bin"), &on_disk).unwrap();
+
+        let meta = TorrentMeta {
+            info: Info {
+                name: "big.bin".into(),
+                piece_length: PIECE as u64,
+                pieces,
+                files: vec![FileEntry {
+                    path: vec!["big.bin".into()],
+                    length: data.len() as u64,
+                }],
+                multi_file: false,
+                private: false,
+            },
+            info_hash: [9; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            raw_bencode: None,
+            raw_info: None,
+        };
+
+        let progress = VerifyProgress::default();
+        let preview = preview_existing_data(&root, &meta, Some(&progress));
+        assert_eq!(preview.verified_pieces, (PIECES - 1) as u32);
+        assert_eq!(preview.verified_bytes, (PIECE * (PIECES - 1)) as u64);
+        let p = progress.snapshot();
+        assert_eq!(p.checked_bytes, (PIECE * PIECES) as u64);
+        assert_eq!(p.checked_pieces, PIECES as u32);
+        assert_eq!(p.verified_pieces, (PIECES - 1) as u32);
+        assert_eq!(p.total_bytes, (PIECE * PIECES) as u64);
 
         std::fs::remove_dir_all(&root).ok();
     }

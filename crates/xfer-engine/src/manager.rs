@@ -291,7 +291,8 @@ impl Drop for ClientBuildGuard {
 /// 添加任务弹窗的已有数据预览任务状态。
 #[derive(Clone)]
 enum PreviewJobState {
-    Running,
+    /// 校验进行中：轮询时读取其中的实时进度。
+    Running(Arc<xfer_bt::VerifyProgress>),
     Done(Value),
     Failed(String),
 }
@@ -3193,21 +3194,18 @@ impl TaskManager {
         }
 
         let key = format!("{}|{}", dir.display(), hex::encode(meta.info_hash));
+        let progress = Arc::new(xfer_bt::VerifyProgress::default());
         {
             let mut jobs = self.preview_jobs.lock().unwrap();
             jobs.retain(|_, job| match &job.state {
-                PreviewJobState::Running => true,
+                PreviewJobState::Running(_) => true,
                 _ => job.updated.elapsed() < Duration::from_secs(300),
             });
             if let Some(job) = jobs.get(&key) {
                 return Ok(match &job.state {
-                    PreviewJobState::Running => json!({
-                        "state": "verifying",
-                        "hasMetadata": true,
-                        "hasExistingData": true,
-                        "infoHash": hex::encode(meta.info_hash),
-                        "totalLength": meta.info.files.iter().map(|f| f.length).sum::<u64>(),
-                    }),
+                    PreviewJobState::Running(progress) => {
+                        preview_verifying_json(&meta, progress.snapshot())
+                    }
                     PreviewJobState::Done(v) => v.clone(),
                     PreviewJobState::Failed(e) => {
                         json!({"state": "error", "hasMetadata": true, "error": e})
@@ -3217,7 +3215,7 @@ impl TaskManager {
             jobs.insert(
                 key.clone(),
                 PreviewJob {
-                    state: PreviewJobState::Running,
+                    state: PreviewJobState::Running(progress.clone()),
                     updated: Instant::now(),
                 },
             );
@@ -3228,10 +3226,11 @@ impl TaskManager {
         let check_dir = dir.clone();
         let check_meta = meta.clone();
         let result_meta = meta.clone();
+        let check_progress = progress.clone();
         tokio::spawn(async move {
             let _permit = sem.acquire().await;
             let check = tokio::task::spawn_blocking(move || {
-                xfer_bt::preview_existing_data(&check_dir, &check_meta)
+                xfer_bt::preview_existing_data(&check_dir, &check_meta, Some(&check_progress))
             })
             .await;
             let state = match check {
@@ -3247,13 +3246,7 @@ impl TaskManager {
             }
         });
 
-        Ok(json!({
-            "state": "verifying",
-            "hasMetadata": true,
-            "hasExistingData": true,
-            "infoHash": hex::encode(meta.info_hash),
-            "totalLength": meta.info.files.iter().map(|f| f.length).sum::<u64>(),
-        }))
+        Ok(preview_verifying_json(&meta, progress.snapshot()))
     }
 
     /// 按 info_hash 从仍在任务列表里的 BT 任务复用元数据（磁力预览兜底）。
@@ -4566,6 +4559,42 @@ fn home_dir() -> PathBuf {
 ///
 /// 应用端（开发者模式）常通过 `--dir=~/Downloads` 之类的形式直接传参，
 /// 未经 shell 展开 `~`；此处统一处理，避免在程序目录下创建 `~` 或同名目录。
+/// 把引擎的已有数据校验进度同步到任务字段（1Hz 与任务结束各一次）。
+fn sync_verify_state(engine: &TorrentEngine, task: &Task) {
+    task.bt_verifying
+        .store(engine.is_verifying(), Ordering::Relaxed);
+    let p = engine.verify_progress();
+    task.bt_verify_checked
+        .store(p.checked_bytes, Ordering::Relaxed);
+    task.bt_verify_total
+        .store(p.total_bytes, Ordering::Relaxed);
+}
+
+/// 已有数据预览的进行中结果（含实时进度，前端轮询展示百分比）。
+fn preview_verifying_json(
+    meta: &TorrentMeta,
+    p: xfer_bt::VerifyProgressSnapshot,
+) -> Value {
+    let total = meta.info.files.iter().map(|f| f.length).sum::<u64>();
+    let ratio = if p.total_bytes > 0 {
+        p.checked_bytes as f64 / p.total_bytes as f64
+    } else {
+        0.0
+    };
+    json!({
+        "state": "verifying",
+        "hasMetadata": true,
+        "hasExistingData": true,
+        "infoHash": hex::encode(meta.info_hash),
+        "totalLength": total,
+        "checkedLength": p.checked_bytes,
+        "verifiedLength": p.verified_bytes,
+        "checkedPieces": p.checked_pieces,
+        "totalPieces": p.total_pieces,
+        "progress": ratio,
+    })
+}
+
 /// 已有数据预览的完成结果（`preview=None` 表示磁盘上没有数据）。
 fn preview_done_json(meta: &TorrentMeta, preview: Option<&ExistingDataPreview>) -> Value {
     let files: Vec<Value> = meta
@@ -4880,6 +4909,7 @@ async fn drive_bt_download(
                 if let Some(bf) = engine.bitfield() {
                     *task.bt_bitfield.lock().unwrap() = bf;
                 }
+                sync_verify_state(&engine, &task);
                 *task.bt_verified_bitfield.lock().unwrap() = engine.verified_bitfield();
                 // 磁力任务：元数据就绪即回填 bt_meta（文件列表/详情页立即可见）
                 if task.bt_meta.lock().unwrap().is_none() {
@@ -4951,6 +4981,7 @@ async fn drive_bt_download(
     // 已验证大小同理：继承完立刻完成的任务往往撑不到下一次 1Hz ticker，
     // 不同步的话终态任务会显示"已验证 0"
     *task.bt_verified_bitfield.lock().unwrap() = engine.verified_bitfield();
+    sync_verify_state(&engine, &task);
     // 磁力链接补齐数据路径：引擎运行中拿到元信息后才能确定落盘路径
     {
         let mut sh = task.shared.lock().unwrap();

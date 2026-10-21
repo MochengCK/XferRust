@@ -4,10 +4,75 @@
 //! piece SHA-1 校验、按文件布局随机写（跨文件片切分落盘）。
 
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use sha1::{Digest, Sha1};
+
+/// 把文件预分配到 `len`（不足才扩展，已有数据不截断）。
+///
+/// 优先使用平台真正的空间预留（macOS `F_PREALLOCATE` / Linux·Android
+/// `posix_fallocate`），让"磁盘空间不足"在任务启动时就暴露，而不是下到
+/// 一半才失败；文件系统不支持预留时退化为 `set_len`（至少声明长度）。
+fn preallocate_file(file: &File, len: u64) -> std::io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let cur = file.metadata()?.len();
+    if cur >= len {
+        return Ok(());
+    }
+    preallocate_range(file, len)
+}
+
+#[cfg(target_os = "macos")]
+fn preallocate_range(file: &File, len: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let cur = file.metadata()?.len();
+    let mut store: libc::fstore_t = unsafe { std::mem::zeroed() };
+    store.fst_flags = libc::F_ALLOCATEALL;
+    // F_PEOFPOSMODE：从当前 EOF 往后预留 fst_length 字节
+    store.fst_posmode = libc::F_PEOFPOSMODE;
+    store.fst_offset = 0;
+    store.fst_length = (len - cur) as libc::off_t;
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &mut store) };
+    if rc == -1 {
+        let err = std::io::Error::last_os_error();
+        // 真正没空间：必须让任务失败（这正是预分配要防的场景）
+        if matches!(err.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT)) {
+            return Err(err);
+        }
+        // 文件系统不支持预留（SMB / 部分 FUSE）：至少把逻辑长度补足
+        file.set_len(len)?;
+        return Ok(());
+    }
+    file.set_len(len)?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn preallocate_range(file: &File, len: u64) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len as libc::off_t) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::from_raw_os_error(rc);
+    if matches!(rc, libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL) {
+        // 文件系统不支持 fallocate：退化为声明长度（稀疏文件）
+        file.set_len(len)?;
+        return Ok(());
+    }
+    Err(err)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+fn preallocate_range(file: &File, len: u64) -> std::io::Result<()> {
+    // Windows / 其他平台：扩展文件长度。NTFS 会在扩展时分配簇；
+    // 不支持真正预留的文件系统至少保证逻辑长度正确。
+    file.set_len(len)
+}
 
 /// piece 位图（BEP 3 bitfield 语义：每片 1 bit，字节内高位在前）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,6 +547,25 @@ impl PieceStore {
         })
     }
 
+    /// 把已打开（所选）文件补到种子声明的最终长度并尽量占住磁盘块。
+    ///
+    /// 必须在 `restore_resume` **之后**调用：续传恢复要用磁盘真实长度判断
+    /// 控制文件里的片是否还有效，先补长会让被截断的文件重新"覆盖"到，
+    /// 从而错误地信任旧位图。已有数据不截断，只补足差额。
+    pub fn preallocate(&self) -> std::io::Result<()> {
+        for (i, slot) in self.files.iter().enumerate() {
+            let Some(f) = slot else { continue };
+            let len = self.layout.files[i].length;
+            preallocate_file(&f.file, len).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("预分配 \"{}\"（{} 字节）失败: {e}", f.path.display(), len),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // 磁盘缓存（写回缓冲）
     // ------------------------------------------------------------------
@@ -855,6 +939,44 @@ mod tests {
         assert_eq!(l.piece_segments(0), vec![(0, 0, 10)]);
         assert_eq!(l.piece_segments(1), vec![(0, 10, 5), (1, 0, 5)]);
         assert_eq!(l.piece_segments(2), vec![(1, 5, 5), (2, 0, 5)]);
+    }
+
+    /// BT 预分配：打开存储即把（所选）文件补到最终长度；已有数据原样保留。
+    #[test]
+    fn open_preallocates_files_to_final_length() {
+        let root = std::env::temp_dir().join(format!(
+            "xfer-storage-prealloc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        {
+            let store = PieceStore::open(&root, "pack", layout3(), None).unwrap();
+            store.preallocate().unwrap();
+            let len = |name: &str| std::fs::metadata(root.join("pack").join(name)).unwrap().len();
+            assert_eq!(len("a.bin"), 15);
+            assert_eq!(len("b.bin"), 10);
+            assert_eq!(len("c.bin"), 5);
+        }
+        // 已有数据不能被预分配截断/清零
+        std::fs::write(root.join("pack/a.bin"), [1u8, 2, 3, 4, 5]).unwrap();
+        {
+            let store = PieceStore::open(&root, "pack", layout3(), None).unwrap();
+            store.preallocate().unwrap();
+            let data = std::fs::read(root.join("pack/a.bin")).unwrap();
+            assert_eq!(data.len(), 15);
+            assert_eq!(&data[..5], &[1, 2, 3, 4, 5]);
+        }
+        // 未选择（Some(空)）时不建文件、不预分配
+        let empty_root = root.join("empty");
+        std::fs::create_dir_all(&empty_root).unwrap();
+        let store = PieceStore::open(&empty_root, "pack", layout3(), Some(&[])).unwrap();
+        store.preallocate().unwrap();
+        assert!(!empty_root.join("pack").exists());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

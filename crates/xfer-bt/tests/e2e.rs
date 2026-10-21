@@ -428,7 +428,8 @@ async fn resume_completed_file_skips_download() {
         PeerId::azureus_prefix(&[8u8; 12]),
     ));
 
-    // 已有完整文件：直接标记完成，立即返回
+    // 已有完整文件：新设计在 run() 启动网络前逐片校验，校验通过后直接完成
+    // （构造阶段不再做磁盘哈希，避免大文件阻塞任务添加）
     let engine = TorrentEngine::new(
         meta,
         TorrentConfig {
@@ -461,6 +462,14 @@ async fn resume_completed_file_skips_download() {
         },
     )
     .unwrap();
+    let runner = engine.clone();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        runner.run(CancellationToken::new()),
+    )
+    .await
+    .expect("完整文件的校验超时")
+    .expect("已有完整文件应在校验后直接完成");
     assert!(engine.is_done());
     let _ = std::fs::remove_dir_all(&dir);
 }

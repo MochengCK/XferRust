@@ -2829,6 +2829,7 @@ name = "xfer-storage"
 version = "0.4.0"
 dependencies = [
  "hex",
+ "libc",
  "md-5",
  "sha1",
  "sha2",
