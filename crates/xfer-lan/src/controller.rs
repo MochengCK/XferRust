@@ -58,6 +58,27 @@ impl LanController {
         download_dir: impl Into<PathBuf>,
         data_dir: impl Into<PathBuf>,
     ) -> Result<Arc<Self>, LanError> {
+        Self::start_inner(download_dir, data_dir, true).await
+    }
+
+    /// 只读配置、**不**拉起服务：给"可能与应用的引擎同时活着"的独立进程用。
+    ///
+    /// 发现端口（UDP 41234）同时只能有一个监听者：独立进程先绑走，之后启动的
+    /// 应用就会按协议降级成"只发不收"，界面上表现为两台设备互相看不见。所以
+    /// 独立进程改成按需启动——第一次真正调用互传接口时再 [`Self::ensure_started`]，
+    /// 平时（只下文件）不占用任何端口。
+    pub async fn start_deferred(
+        download_dir: impl Into<PathBuf>,
+        data_dir: impl Into<PathBuf>,
+    ) -> Result<Arc<Self>, LanError> {
+        Self::start_inner(download_dir, data_dir, false).await
+    }
+
+    async fn start_inner(
+        download_dir: impl Into<PathBuf>,
+        data_dir: impl Into<PathBuf>,
+        autostart: bool,
+    ) -> Result<Arc<Self>, LanError> {
         let download_dir = download_dir.into();
         let data_dir = data_dir.into();
         let cfg = LanUserConfig::load(&data_dir);
@@ -69,7 +90,7 @@ impl LanController {
             last_error: Mutex::new(String::new()),
             op_lock: AsyncMutex::new(()),
         });
-        if controller.enabled() {
+        if autostart && controller.enabled() {
             if let Err(e) = controller.start_service().await {
                 let message = e.to_string();
                 tracing::warn!(error = %message, "局域网互传启动失败");
@@ -77,6 +98,29 @@ impl LanController {
             }
         }
         Ok(controller)
+    }
+
+    /// 按需拉起服务（[`Self::start_deferred`] 之后第一次用到互传时调用）。
+    pub async fn ensure_started(&self) -> Result<(), String> {
+        if !self.enabled() {
+            return Err("互传已关闭".to_string());
+        }
+        if self.service.lock().expect("互传服务锁中毒").is_some() {
+            return Ok(());
+        }
+        let _guard = self.op_lock.lock().await;
+        if self.service.lock().expect("互传服务锁中毒").is_some() {
+            return Ok(());
+        }
+        match self.start_service().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let message = e.to_string();
+                tracing::warn!(error = %message, "局域网互传启动失败");
+                *self.last_error.lock().expect("错误信息锁中毒") = message.clone();
+                Err(format!("互传服务启动失败：{message}"))
+            }
+        }
     }
 
     pub fn enabled(&self) -> bool {

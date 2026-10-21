@@ -119,7 +119,8 @@ impl McpServer {
                 "version": ENGINE_VERSION,
             },
             "instructions": "XferRust download engine. Use the tools to add and manage \
-HTTP(S), BitTorrent, magnet and HLS downloads on the local machine.",
+HTTP(S), BitTorrent, magnet and HLS downloads on the local machine, and to send \
+files to other devices over the LAN (Lerxu互传).",
         })
     }
 
@@ -232,6 +233,46 @@ HTTP(S), BitTorrent, magnet and HLS downloads on the local machine.",
                     .ok_or("参数 options（对象）缺失")?;
                 self.native("engine.changeOptions", Value::Object(options))
             }
+            // ---- 局域网互传 ----
+            "lan_status" => self.native("lan.config", json!({})),
+            "lan_set_config" => {
+                let mut p = Map::new();
+                if let Some(enabled) = obj.get("enabled").and_then(Value::as_bool) {
+                    p.insert("enabled".into(), json!(enabled));
+                }
+                // 对外用 snake_case（与其它工具一致），RPC 那层是 camelCase
+                for (from, to) in [("device_name", "deviceName"), ("recv_dir", "recvDir")] {
+                    if let Some(v) = arg(from) {
+                        p.insert(to.into(), json!(v));
+                    }
+                }
+                self.native("lan.setConfig", Value::Object(p))
+            }
+            "lan_peers" => self.native("lan.peers", json!({})),
+            "lan_tasks" => self.native("lan.tasks", json!({})),
+            "lan_send" => {
+                let peer = arg("peer").ok_or("参数 peer（设备 id）缺失")?;
+                let paths: Vec<String> = obj
+                    .get("paths")
+                    .and_then(Value::as_array)
+                    .ok_or("参数 paths（绝对路径数组）缺失")?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect();
+                if paths.is_empty() {
+                    return Err("paths 不能为空".to_string());
+                }
+                self.native("lan.send", json!({ "peer": peer, "paths": paths }))
+            }
+            "lan_cancel" => {
+                let id = arg("id").ok_or("参数 id（互传任务 id）缺失")?;
+                self.native("lan.cancel", json!({ "id": id }))
+            }
+            "lan_remove" => {
+                let id = arg("id").ok_or("参数 id（互传任务 id）缺失")?;
+                self.native("lan.remove", json!({ "id": id }))
+            }
             other => Err(format!("Unknown tool: {other}")),
         }
     }
@@ -283,7 +324,7 @@ fn is_known_tool(name: &str) -> bool {
 }
 
 /// 工具名清单（与 [`tools`] 保持同步）。
-pub const TOOL_NAMES: [&str; 13] = [
+pub const TOOL_NAMES: [&str; 20] = [
     "add_url",
     "add_magnet",
     "add_torrent",
@@ -297,6 +338,13 @@ pub const TOOL_NAMES: [&str; 13] = [
     "get_engine_info",
     "get_options",
     "set_options",
+    "lan_status",
+    "lan_set_config",
+    "lan_peers",
+    "lan_tasks",
+    "lan_send",
+    "lan_cancel",
+    "lan_remove",
 ];
 
 /// `tools/list` 的返回体。
@@ -432,6 +480,67 @@ pub fn tools() -> Value {
                     }
                 },
                 "required": ["options"]
+            }
+        },
+        {
+            "name": "lan_status",
+            "description": "LAN transfer (Lerxu互传) status: enabled, running, this device's name/id, receive directory. 局域网互传状态：开关、设备名与 id、接收目录。",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "lan_set_config",
+            "description": "Turn LAN transfer on/off or set device name / receive directory. Enabling makes this device visible on the LAN. 开启/关闭互传，或改设备名、接收目录。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean", "description": "Enable LAN transfer. 是否启用互传。" },
+                    "device_name": { "type": "string", "description": "Name shown to other devices. 设备名。" },
+                    "recv_dir": { "type": "string", "description": "Directory for received files. 接收目录。" }
+                }
+            }
+        },
+        {
+            "name": "lan_peers",
+            "description": "List devices discovered on the LAN (peer id, name, platform, address). 列出局域网里发现的设备。",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "lan_tasks",
+            "description": "List LAN transfer tasks (send/receive) with progress. 列出互传任务及进度。",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "lan_send",
+            "description": "Send local files or folders to a discovered device. 把本机文件/目录发给某台设备。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "peer": { "type": "string", "description": "Peer id from lan_peers. 设备 id。" },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Absolute paths of files or folders. 要发送的绝对路径列表。"
+                    }
+                },
+                "required": ["peer", "paths"]
+            }
+        },
+        {
+            "name": "lan_cancel",
+            "description": "Cancel a running LAN transfer task. 取消进行中的互传任务。",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "description": "LAN task id." } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "lan_remove",
+            "description": "Remove a finished LAN transfer record. 移除互传任务记录。",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string", "description": "LAN task id." } },
+                "required": ["id"]
             }
         }
     ])

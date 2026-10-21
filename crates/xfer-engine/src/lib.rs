@@ -7,6 +7,9 @@
 mod manager;
 mod task;
 
+/// 宿主（桌面端）配置读取：独立运行的 `xferrust mcp` 沿用它复用应用设置。
+pub mod host_config;
+
 use std::path::PathBuf;
 
 pub use manager::{

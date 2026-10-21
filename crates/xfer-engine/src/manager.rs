@@ -564,7 +564,11 @@ impl TaskManager {
         conc: Option<usize>,
         session: PathBuf,
     ) -> Arc<Self> {
-        let v = read_session_file(&session);
+        let mut session_value = read_session_file(&session);
+        // 应用没开时 AI 经 MCP 下的任务写在独立会话里；启动时并进来，
+        // 否则界面上完全看不到它们（详见 [`import_mcp_tasks`]）。
+        import_mcp_tasks(&mut session_value, &session);
+        let v = session_value;
         let saved_dir = v
             .as_ref()
             .and_then(|v| v["settings"]["dir"].as_str())
@@ -4661,6 +4665,99 @@ pub fn normalize_dir(dir: &str) -> PathBuf {
     }
 }
 
+/// 把独立 MCP 进程（`xferrust mcp`，应用未运行时自起引擎）留下的任务并进会话。
+///
+/// 独立进程写的是 `<session 所在目录>/mcp/session.json`，与应用会话分开（两个进程
+/// 同时写同一份 JSON 会互相覆盖）。应用启动时按 gid 合并一次：终态任务进已停止
+/// 列表、未完成任务按恢复规则一律变成暂停态，所以并进来不会偷偷开始下载。
+///
+/// 已导入的 gid 记在同目录的 `imported.json`：用户在应用里删掉某条记录后，只要
+/// 那份独立会话还在，也不该把它"复活"（与渲染层的 `deletedGids` 同一个诉求）。
+fn import_mcp_tasks(session_value: &mut Option<Value>, session: &Path) {
+    const MAX_IMPORTED: usize = 2000;
+    let Some(dir) = session.parent() else {
+        return;
+    };
+    let mcp_dir = dir.join("mcp");
+    let mcp_session = mcp_dir.join("session.json");
+    if !mcp_session.is_file() {
+        return;
+    }
+    let Some(incoming) = read_session_file(&mcp_session) else {
+        return;
+    };
+    let Some(tasks) = incoming["tasks"].as_array() else {
+        return;
+    };
+    if tasks.is_empty() {
+        return;
+    }
+
+    let imported_path = mcp_dir.join("imported.json");
+    let mut imported: Vec<String> = std::fs::read_to_string(&imported_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<String>>(&text).ok())
+        .unwrap_or_default();
+    let mut known: HashSet<String> = imported.iter().cloned().collect();
+    if let Some(existing) = session_value.as_ref().and_then(|v| v["tasks"].as_array()) {
+        for task in existing {
+            if let Some(gid) = task["gid"].as_str() {
+                known.insert(gid.to_string());
+            }
+        }
+    }
+
+    let mut added: Vec<Value> = Vec::new();
+    for task in tasks {
+        let Some(gid) = task["gid"].as_str() else {
+            continue;
+        };
+        if !known.insert(gid.to_string()) {
+            continue;
+        }
+        imported.push(gid.to_string());
+        added.push(task.clone());
+    }
+    if added.is_empty() {
+        return;
+    }
+    let count = added.len();
+
+    let value = session_value.get_or_insert_with(|| json!({}));
+    if !value["tasks"].is_array() {
+        value["tasks"] = Value::Array(Vec::new());
+    }
+    if let Some(list) = value["tasks"].as_array_mut() {
+        list.extend(added);
+    }
+    write_json_file(session, value);
+    if imported.len() > MAX_IMPORTED {
+        let overflow = imported.len() - MAX_IMPORTED;
+        imported.drain(0..overflow);
+    }
+    write_json_file(&imported_path, &json!(imported));
+    tracing::info!(count, path = %mcp_session.display(), "已并入 MCP 独立任务");
+}
+
+/// 原子写 JSON（临时文件 + rename），失败只告警：导入是锦上添花，不能拦住启动。
+fn write_json_file(path: &Path, value: &Value) {
+    let Ok(text) = serde_json::to_string_pretty(value) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("json.tmp");
+    match std::fs::write(&tmp, text) {
+        Ok(()) => {
+            if let Err(e) = std::fs::rename(&tmp, path) {
+                tracing::warn!(path = %path.display(), error = %e, "写入失败");
+            }
+        }
+        Err(e) => tracing::warn!(path = %tmp.display(), error = %e, "写入失败"),
+    }
+}
+
 /// 读取会话文件（不存在/解析失败返回 None，宽容处理）。
 fn read_session_file(path: &std::path::Path) -> Option<Value> {
     let text = std::fs::read_to_string(path).ok()?;
@@ -5941,6 +6038,63 @@ mod tests {
     fn normalize_dir_resolves_relative_to_cwd() {
         let expected = std::env::current_dir().unwrap().join("rel/dir");
         assert_eq!(normalize_dir("rel/dir"), expected);
+    }
+
+    /// MCP 独立会话 → 应用会话：按 gid 去重、重复启动幂等、删掉的不会复活。
+    #[test]
+    fn imports_mcp_tasks_once_and_never_resurrects() {
+        let root = std::env::temp_dir().join(format!("xfer-mcp-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("mcp")).unwrap();
+        let session = root.join("session.json");
+        std::fs::write(&session, r#"{"tasks":[]}"#).unwrap();
+        std::fs::write(
+            root.join("mcp").join("session.json"),
+            serde_json::to_string_pretty(&json!({
+                "tasks": [
+                    {"gid": "aaa", "status": "complete", "dir": "/tmp/dl",
+                     "uris": ["http://example.com/a"], "completedLength": 10, "totalLength": 10},
+                    {"gid": "bbb", "status": "waiting", "dir": "/tmp/dl",
+                     "uris": ["http://example.com/b"]}
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut value = read_session_file(&session);
+        import_mcp_tasks(&mut value, &session);
+        let merged = value.expect("导入后应得到会话");
+        let gids: Vec<&str> = merged["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["gid"].as_str())
+            .collect();
+        assert_eq!(gids, vec!["aaa", "bbb"]);
+        // 状态原样搬过来：waiting → 暂停是恢复阶段的事，导入不越权
+        assert_eq!(merged["tasks"][1]["status"], "waiting");
+
+        // 第二次启动：已导入的 gid 不再重复进来
+        let mut again = read_session_file(&session);
+        import_mcp_tasks(&mut again, &session);
+        assert_eq!(again.unwrap()["tasks"].as_array().unwrap().len(), 2);
+
+        // 用户在应用里删掉 aaa：MCP 会话里还有也不能复活
+        let mut only_bbb = Some(json!({"tasks": [
+            {"gid": "bbb", "status": "waiting", "dir": "/tmp/dl", "uris": ["http://example.com/b"]}
+        ]}));
+        import_mcp_tasks(&mut only_bbb, &session);
+        let list = only_bbb.unwrap();
+        let gids: Vec<&str> = list["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["gid"].as_str())
+            .collect();
+        assert_eq!(gids, vec!["bbb"]);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// HLS 产物名归一：清单扩展名绝不留在产物名上。

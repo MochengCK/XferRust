@@ -158,6 +158,7 @@ async fn mcp_stdio(args: &[String]) -> i32 {
     let mut token: Option<String> = None;
     let mut dir: Option<PathBuf> = None;
     let mut session: Option<PathBuf> = None;
+    let mut host_dir: Option<String> = None;
     for arg in args {
         let Some(kv) = arg.strip_prefix("--") else {
             continue;
@@ -184,6 +185,13 @@ async fn mcp_stdio(args: &[String]) -> i32 {
                     session = Some(PathBuf::from(v));
                 }
             }
+            // 应用数据目录（`app.getPath('userData')`）：设置页生成的配置会显式带上，
+            // 便携版/自定义安装位置也能找到那份 system.json；不传则按平台惯例找。
+            "host-config" | "data-dir" | "host" => {
+                if !v.is_empty() {
+                    host_dir = Some(v.to_string());
+                }
+            }
             _ => {}
         }
     }
@@ -203,7 +211,9 @@ async fn mcp_stdio(args: &[String]) -> i32 {
         }
     }
 
-    embedded_stdio(dir, session).await
+    let host = xfer_engine::host_config::app_dir(host_dir.as_deref())
+        .and_then(|data_dir| xfer_engine::host_config::load(&data_dir));
+    embedded_stdio(dir, session, host).await
 }
 
 /// 短超时的 HTTP 客户端：探测本机端点用，别让客户端等太久。
@@ -274,41 +284,75 @@ async fn relay_stdio(
 
 /// 独立模式：本进程内直接起引擎并处理 stdio，不依赖应用是否在运行。
 ///
-/// 会话与下载目录与应用分开：应用有自己的会话文件，两个进程写同一份会损坏状态。
-async fn embedded_stdio(dir: Option<PathBuf>, session: Option<PathBuf>) -> i32 {
+/// 会话与下载目录跟着**应用的配置**走（`<userData>/system.json`）：AI 下到哪、
+/// 用什么代理，必须和界面上显示的一致；会话放在 `<userData>/mcp/session.json`，
+/// 应用下次启动时会把它里面的任务并进自己的会话（见
+/// `xfer_engine::TaskManager::start_with_session`），所以 AI 下的东西能在应用里看到。
+async fn embedded_stdio(
+    dir: Option<PathBuf>,
+    session: Option<PathBuf>,
+    host: Option<xfer_engine::host_config::HostConfig>,
+) -> i32 {
     use tokio::io::AsyncBufReadExt;
 
-    let download_dir = dir.unwrap_or_else(default_download_dir);
+    let download_dir = dir
+        .or_else(|| host.as_ref().and_then(|h| h.download_dir.clone()))
+        .unwrap_or_else(default_download_dir);
     if let Err(e) = std::fs::create_dir_all(&download_dir) {
         eprintln!("下载目录不可用 {}: {e}", download_dir.display());
         return 1;
     }
-    let session_path = session.unwrap_or_else(default_mcp_session_path);
+    let session_path = session
+        .or_else(|| {
+            host.as_ref()
+                .map(|h| h.data_dir.join("mcp").join("session.json"))
+        })
+        .unwrap_or_else(default_mcp_session_path);
     if let Some(parent) = session_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
 
+    let conc = host.as_ref().and_then(|h| h.max_concurrent);
     let manager = xfer_engine::TaskManager::start_with_session(
         Some(download_dir.clone()),
-        None,
+        conc,
         session_path.clone(),
     );
-    // 回环地址不走代理：Agent 常见的"下载本机/内网地址"场景不该被系统代理拦下。
-    // 其余流量仍按环境变量/系统代理走（与命令行行为一致）。
-    manager.set_initial_options(&[(
-        "no-proxy".to_string(),
-        "localhost,127.0.0.1,::1".to_string(),
-    )]);
-    let router = std::sync::Arc::new(xfer_rpc::Router::new(
-        None,
-        manager.clone(),
-        manager.events(),
-    ));
+    // 应用的全局选项（代理 / 分片 / BT 开关……）照搬；回环地址额外加进 no-proxy：
+    // Agent 常见的"下载本机/内网地址"场景不该被系统代理拦下。
+    let mut options = host.as_ref().map(|h| h.options.clone()).unwrap_or_default();
+    push_loopback_no_proxy(&mut options);
+    manager.set_initial_options(&options);
+
+    // 互传：只读配置、按需启动（发现端口 41234 只能有一个监听者，独立进程先绑走
+    // 会让之后启动的应用看不见任何设备）。
+    let lan_dir = host
+        .as_ref()
+        .map(|h| h.data_dir.clone())
+        .or_else(|| xfer_types::home_dir().map(|home| home.join(".xfer")));
+    let lan = match lan_dir {
+        Some(data_dir) => match xfer_lan::LanController::start_deferred(download_dir.clone(), data_dir)
+            .await
+        {
+            Ok(lan) => Some(lan),
+            Err(e) => {
+                eprintln!("[xferrust mcp] 互传配置读取失败：{e}");
+                None
+            }
+        },
+        None => None,
+    };
+
+    let router = std::sync::Arc::new(match &lan {
+        Some(lan) => xfer_rpc::Router::with_lan(None, manager.clone(), manager.events(), lan.clone()),
+        None => xfer_rpc::Router::new(None, manager.clone(), manager.events()),
+    });
     let server = xfer_mcp::McpServer::new(router, None);
     eprintln!(
-        "[xferrust mcp] 独立模式：下载目录 {}，会话 {}",
+        "[xferrust mcp] 独立模式：下载目录 {}，会话 {}{}",
         download_dir.display(),
-        session_path.display()
+        session_path.display(),
+        if host.is_some() { "（沿用应用配置）" } else { "" }
     );
 
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
@@ -326,6 +370,15 @@ async fn embedded_stdio(dir: Option<PathBuf>, session: Option<PathBuf>) -> i32 {
         if line.is_empty() {
             continue;
         }
+        // 真正用到互传服务（发现/任务/发送）时才拉起：平时不占发现端口，也不广播
+        // 设备名；只读状态或改配置不需要先起服务（后者自己会按需启动）。
+        if needs_lan_service(line) {
+            if let Some(lan) = &lan {
+                if let Err(e) = lan.ensure_started().await {
+                    eprintln!("[xferrust mcp] {e}");
+                }
+            }
+        }
         if let Some(resp) = server.handle(line) {
             println!("{}", serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()));
             let _ = std::io::stdout().flush();
@@ -333,6 +386,48 @@ async fn embedded_stdio(dir: Option<PathBuf>, session: Option<PathBuf>) -> i32 {
     }
     let _ = manager.save_session();
     0
+}
+
+/// 这一帧请求是不是"需要互传服务已在跑"的工具（`lan_status` / `lan_set_config`
+/// 不需要：前者只读配置，后者自己会按需启动）。
+fn needs_lan_service(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| {
+            v.get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|name| {
+                    matches!(
+                        name,
+                        "lan_peers" | "lan_tasks" | "lan_send" | "lan_cancel" | "lan_remove"
+                    )
+                })
+        })
+        .unwrap_or(false)
+}
+
+/// 把 `localhost` / `127.0.0.1` / `::1` 补进 no-proxy（已有条目保持原样）。
+fn push_loopback_no_proxy(options: &mut Vec<(String, String)>) {
+    const LOOPBACK: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+    let existing = options
+        .iter()
+        .find(|(k, _)| k == "no-proxy")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    let mut parts: Vec<String> = existing
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    for host in LOOPBACK {
+        if !parts.iter().any(|p| p.eq_ignore_ascii_case(host)) {
+            parts.push(host.to_string());
+        }
+    }
+    options.retain(|(k, _)| k != "no-proxy");
+    options.push(("no-proxy".to_string(), parts.join(",")));
 }
 
 /// 独立模式的默认会话文件：`~/.xfer/mcp/session.json`（与应用会话分开）。
