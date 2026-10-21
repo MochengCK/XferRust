@@ -13,6 +13,8 @@
 //! 消息洪泛检测、非活跃连接断开、Allowed Fast Set 计算。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1038,6 +1040,13 @@ pub struct TorrentEngine {
     actual_listen_port: std::sync::atomic::AtomicU16,
     /// 文件存储（元数据就绪前为 None）。
     store: Mutex<Option<PieceStore>>,
+    /// 本次启动时从已有磁盘文件校验通过的片位图（wire 字节）：
+    /// 续接控制文件恢复或新增任务磁盘哈希校验的结果，供状态展示"已验证大小"。
+    verified_bitfield: Mutex<Vec<u8>>,
+    /// 新任务已有数据、需要在本轮启动前做一次磁盘哈希校验。
+    verify_existing: AtomicBool,
+    /// 哈希校验进行中：暂时不允许选片/请求，避免校验期间 peer 写入同一批片。
+    verifying: AtomicBool,
     /// 磁力模式的元数据分片累积器。
     metadata: Mutex<MetadataAccum>,
     /// 已分配未完成片。
@@ -1186,26 +1195,15 @@ impl TorrentEngine {
             &meta.info.name,
             &mut store,
         );
-        if !restored {
-            // 完整性按「逻辑长度 + 磁盘占用」双口径判定：BT 随机写产生
-            // 稀疏文件，逻辑长度（含空洞）达标而磁盘占用不足说明数据
-            // 并未真正落盘，绝不能整文件标记完成（否则以坏数据做种）。
-            let complete = meta.info.files.iter().all(|f| {
-                let path = if !meta.info.multi_file {
-                    config.dir.join(&meta.info.name)
-                } else {
-                    config
-                        .dir
-                        .join(&meta.info.name)
-                        .join(f.path.iter().collect::<PathBuf>())
-                };
-                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= f.length
-                    && xfer_storage::size_on_disk(&path).is_some_and(|d| d >= f.length)
-            });
-            if complete {
-                store.mark_all_done();
-            }
-        }
+        // 有续传控制文件：位图是上次逐片校验过的结果，直接继承。
+        // 没有控制文件但目录里已有数据：run() 启动网络前先做一次磁盘 SHA-1
+        // 校验，能继承多少继承多少（不再按文件长度盲标全部完成）。
+        let (verified_bitfield, verify_existing) = if restored {
+            (store.bitfield(), false)
+        } else {
+            let existing = has_existing_data(&config.dir, &meta.info.name, store.layout());
+            (Vec::new(), existing)
+        };
 
         let peer_id = config.peer_id;
         let download_limit = config.download_limit;
@@ -1229,6 +1227,9 @@ impl TorrentEngine {
             info_hash,
             actual_listen_port: std::sync::atomic::AtomicU16::new(0),
             store: Mutex::new(Some(store)),
+            verified_bitfield: Mutex::new(verified_bitfield),
+            verify_existing: AtomicBool::new(verify_existing),
+            verifying: AtomicBool::new(verify_existing),
             metadata: Mutex::new(MetadataAccum::default()),
             assigned: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
@@ -1298,6 +1299,9 @@ impl TorrentEngine {
             info_hash,
             actual_listen_port: std::sync::atomic::AtomicU16::new(0),
             store: Mutex::new(None),
+            verified_bitfield: Mutex::new(Vec::new()),
+            verify_existing: AtomicBool::new(false),
+            verifying: AtomicBool::new(false),
             metadata: Mutex::new(MetadataAccum::default()),
             assigned: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashMap::new()),
@@ -1387,25 +1391,23 @@ impl TorrentEngine {
             &meta.info.name,
             &mut store,
         );
-        if !restored {
-            // 双口径判定，理由同 TorrentEngine::new：稀疏文件的逻辑
-            // 长度不可信，磁盘占用不足不得整文件标记完成。
-            let complete = meta.info.files.iter().all(|f| {
-                let path = if !meta.info.multi_file {
-                    self.config.dir.join(&meta.info.name)
-                } else {
-                    self.config
-                        .dir
-                        .join(&meta.info.name)
-                        .join(f.path.iter().collect::<PathBuf>())
-                };
-                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) >= f.length
-                    && xfer_storage::size_on_disk(&path).is_some_and(|d| d >= f.length)
-            });
-            if complete {
-                store.mark_all_done();
-            }
+        let (verified_bitfield, needs_verify) = if restored {
+            (store.bitfield(), false)
+        } else {
+            // 等待文件勾选（空选择）时没有任何落盘文件，等用户选完重启
+            // 引擎后再按真实选择校验。其余情况只要磁盘已有数据，就在 run()
+            // 进入下载前做逐片 SHA-1 校验。
+            let selected = self.selected_files.lock().unwrap().clone();
+            let selected_has_files = !matches!(&selected, Some(v) if v.is_empty());
+            let existing = selected_has_files
+                && has_existing_data(&self.config.dir, &meta.info.name, store.layout());
+            (Vec::new(), existing)
+        };
+        if needs_verify {
+            self.verify_existing.store(true, Ordering::SeqCst);
+            self.verifying.store(true, Ordering::SeqCst);
         }
+        *self.verified_bitfield.lock().unwrap() = verified_bitfield;
         *self.store.lock().unwrap() = Some(store);
         self.total_bytes.store(total_bytes, Ordering::Relaxed);
         // 磁力保存为种子（bt-save-metadata）：元数据到手即写
@@ -1537,6 +1539,9 @@ impl TorrentEngine {
 
     /// 某片是否需要下载（无选择 = 全部需要）。
     fn piece_wanted(&self, idx: u32) -> bool {
+        if self.verifying.load(Ordering::Relaxed) {
+            return false;
+        }
         match self.wanted.lock().unwrap().as_ref() {
             None => true,
             Some(m) => m.is_set(idx),
@@ -1872,6 +1877,9 @@ impl TorrentEngine {
 
     /// 运行直到下载完成或取消。
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) -> Result<(), String> {
+        // 新任务且磁盘已有数据：先逐片哈希校验，再开监听/发现。校验期间
+        // 不拉 peer，避免边校验边写造成读到的数据与位图不一致。
+        self.verify_existing_data().await;
         self.spawn_listener().await?;
 
         // UPnP/NAT-PMP 端口映射（TCP+UDP 双映射；实际端口在 bind 后确定）
@@ -1949,6 +1957,9 @@ impl TorrentEngine {
                 return Err(e);
             }
         }
+        // 磁力元数据从 peer 拿到后才第一次具备文件布局：在进入主循环前
+        // 对磁盘已有数据做哈希校验；torrent 任务在上方的首次调用已处理。
+        self.verify_existing_data().await;
 
         let mut tick = tokio::time::interval(COLD_START_RAMP);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5795,6 +5806,65 @@ impl TorrentEngine {
         Some(xfer_storage::ctrl_path(&self.config.dir.join(&m.info.name)))
     }
 
+    /// 启动前校验磁盘已有数据：只标记 SHA-1 通过且所需的分片。
+    ///
+    /// `.torrent` 新任务在 [`Self::run`] 拉起监听/发现之前执行；磁力任务在
+    /// 元数据安装阶段（尚无 store/meta 对外可见时）执行，避免 peer 先开始写。
+    async fn verify_existing_data(self: &Arc<Self>) {
+        if !self.verify_existing.swap(false, Ordering::SeqCst) {
+            self.verifying.store(false, Ordering::SeqCst);
+            return;
+        }
+        let Some(meta) = self.meta.read().unwrap().clone() else {
+            self.verifying.store(false, Ordering::SeqCst);
+            return;
+        };
+        let Some(layout) = self
+            .store
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|store| store.layout().clone())
+        else {
+            self.verifying.store(false, Ordering::SeqCst);
+            return;
+        };
+        let wanted = self.wanted.lock().unwrap().clone();
+        if !has_existing_data(&self.config.dir, &meta.info.name, &layout) {
+            self.verifying.store(false, Ordering::SeqCst);
+            return;
+        }
+        let dir = self.config.dir.clone();
+        let name = meta.info.name.clone();
+        let hashes = meta.info.pieces.clone();
+        let check = tokio::task::spawn_blocking(move || {
+            verify_existing_files_blocking(dir, name, layout, hashes, wanted)
+        })
+        .await
+        .unwrap_or_default();
+        if check.pieces == 0 {
+            self.verifying.store(false, Ordering::SeqCst);
+            return;
+        }
+        if let Some(store) = self.store.lock().unwrap().as_mut() {
+            store.set_bitfield(&check.bitfield);
+        }
+        *self.verified_bitfield.lock().unwrap() = check.bitfield;
+        self.refresh_done_bytes();
+        self.save_resume(true);
+        self.verifying.store(false, Ordering::SeqCst);
+        tracing::info!(
+            pieces = check.pieces,
+            bytes = check.bytes,
+            "已有文件校验完成，继承已下载数据"
+        );
+    }
+
+    /// 本次启动时校验通过的已有片位图（wire 字节；供状态展示"已验证大小"）。
+    pub fn verified_bitfield(&self) -> Vec<u8> {
+        self.verified_bitfield.lock().unwrap().clone()
+    }
+
     /// 持久化续传控制文件：片完成时节流写入，暂停/停止强制写入。
     ///
     /// 节流写入走阻塞线程池：同步 `std::fs` 直接在 async 上下文
@@ -6062,6 +6132,183 @@ fn done_bytes_of(
         .filter(|(i, _)| set.contains(i))
         .map(|(_, v)| *v)
         .sum()
+}
+
+/// 已有文件校验结果：从磁盘实际读回并通过 SHA-1 的片。
+#[derive(Debug, Default)]
+struct ExistingVerification {
+    bitfield: Vec<u8>,
+    bytes: u64,
+    pieces: u32,
+}
+
+/// 添加任务时的"已有数据"预览（只读，不建目录、不写盘）。
+#[derive(Debug, Default, Clone)]
+pub struct ExistingDataPreview {
+    /// 种子总长度（全部文件）。
+    pub total_bytes: u64,
+    /// 数据目录里是否已有非空文件（false 时校验结果恒为空）。
+    pub has_existing_data: bool,
+    /// 已通过 SHA-1 的字节数。
+    pub verified_bytes: u64,
+    /// 已通过 SHA-1 的片数。
+    pub verified_pieces: u32,
+    /// 逐文件已验证字节数（与种子文件顺序一致）。
+    pub file_verified: Vec<u64>,
+}
+
+/// 预览 `<dir>` 下某个种子的已有数据：逐片读盘校验，返回可继承的字节。
+///
+/// **只读**：不创建目录/文件，不做任何写入。大文件哈希耗时较长，
+/// 调用方应放在阻塞线程上执行。
+pub fn preview_existing_data(dir: &Path, meta: &TorrentMeta) -> ExistingDataPreview {
+    let files: Vec<(Vec<String>, u64)> = meta
+        .info
+        .files
+        .iter()
+        .map(|f| (f.path.clone(), f.length))
+        .collect();
+    let layout = PieceLayout::new(meta.info.piece_length, files)
+        .with_multi_file(meta.info.multi_file);
+    let total_bytes = layout.total_length();
+    let file_count = layout.files.len();
+    if !has_existing_data(dir, &meta.info.name, &layout) {
+        return ExistingDataPreview {
+            total_bytes,
+            has_existing_data: false,
+            file_verified: vec![0; file_count],
+            ..Default::default()
+        };
+    }
+    let check = verify_existing_files_blocking(
+        dir.to_path_buf(),
+        meta.info.name.clone(),
+        layout.clone(),
+        meta.info.pieces.clone(),
+        None,
+    );
+    let file_verified = layout.files_done_bytes(|i| {
+        let bit = i as usize;
+        check
+            .bitfield
+            .get(bit / 8)
+            .is_some_and(|b| b & (0x80u8 >> (bit % 8)) != 0)
+    });
+    ExistingDataPreview {
+        total_bytes,
+        has_existing_data: true,
+        verified_bytes: check.bytes,
+        verified_pieces: check.pieces,
+        file_verified,
+    }
+}
+
+/// 数据目录里是否已有该种子的非空文件（只做 stat，不读内容）。
+pub fn torrent_has_existing_data(dir: &Path, meta: &TorrentMeta) -> bool {
+    let files: Vec<(Vec<String>, u64)> = meta
+        .info
+        .files
+        .iter()
+        .map(|f| (f.path.clone(), f.length))
+        .collect();
+    let layout = PieceLayout::new(meta.info.piece_length, files)
+        .with_multi_file(meta.info.multi_file);
+    has_existing_data(dir, &meta.info.name, &layout)
+}
+
+/// 读取 `<dir>/<hex(infohash)>.torrent`（磁力添加时预览已有数据）。
+///
+/// 文件不存在、解析失败或 info_hash 对不上都返回 None。
+pub fn load_saved_torrent(dir: &Path, info_hash: &[u8; 20]) -> Option<TorrentMeta> {
+    let path = dir.join(format!("{}.torrent", hex::encode(info_hash)));
+    let bytes = std::fs::read(path).ok()?;
+    let meta = xfer_bencode::parse_torrent(&bytes).ok()?;
+    (meta.info_hash == *info_hash).then_some(meta)
+}
+
+/// 数据目录里是否已经有该种子的非空文件（单文件或多文件布局）。
+fn has_existing_data(dir: &Path, name: &str, layout: &PieceLayout) -> bool {
+    let base = dir.join(name);
+    if layout.is_single_file() {
+        return std::fs::metadata(&base).map(|m| m.len() > 0).unwrap_or(false);
+    }
+    layout.files.iter().any(|f| {
+        let path = base.join(f.path.iter().collect::<PathBuf>());
+        std::fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false)
+    })
+}
+
+/// 逐片读取磁盘已有文件并校验 SHA-1。
+///
+/// 只校验**所需片**（文件选择掩码）且所有分段都被现有文件长度完全覆盖的片；
+/// 缺文件、短文件、跨文件分段不完整都按未完成处理。这样已有的一半数据
+/// 可以直接继承，损坏/空洞片仍会重新下载。运行在 `spawn_blocking` 上，
+/// 避免大种子哈希阻塞 async 运行时。
+fn verify_existing_files_blocking(
+    dir: PathBuf,
+    name: String,
+    layout: PieceLayout,
+    hashes: Vec<[u8; 20]>,
+    wanted: Option<PieceMap>,
+) -> ExistingVerification {
+    let count = layout.piece_count();
+    if count == 0 || hashes.len() != count as usize {
+        return ExistingVerification::default();
+    }
+    let single = layout.is_single_file();
+    let base = dir.join(&name);
+    let mut files: Vec<Option<(File, u64)>> = Vec::with_capacity(layout.files.len());
+    for f in &layout.files {
+        let path = if single {
+            base.clone()
+        } else {
+            base.join(f.path.iter().collect::<PathBuf>())
+        };
+        let opened = std::fs::metadata(&path)
+            .ok()
+            .map(|m| m.len())
+            .and_then(|len| File::open(&path).ok().map(|file| (file, len)));
+        files.push(opened);
+    }
+
+    let mut bitfield = vec![0u8; (count as usize).div_ceil(8)];
+    let mut bytes = 0u64;
+    let mut pieces = 0u32;
+    for idx in 0..count {
+        if wanted.as_ref().is_some_and(|m| !m.is_set(idx)) {
+            continue;
+        }
+        let mut data = Vec::with_capacity(layout.piece_len(idx) as usize);
+        let mut covered = true;
+        for (fi, off, len) in layout.piece_segments(idx) {
+            let Some((file, file_len)) = files.get_mut(fi as usize).and_then(Option::as_mut) else {
+                covered = false;
+                break;
+            };
+            if *file_len < off + len {
+                covered = false;
+                break;
+            }
+            let pos = data.len();
+            data.resize(pos + len as usize, 0);
+            if file.seek(SeekFrom::Start(off)).is_err()
+                || file.read_exact(&mut data[pos..]).is_err()
+            {
+                covered = false;
+                break;
+            }
+        }
+        if covered && data.len() == layout.piece_len(idx) as usize && verify_piece(&data, &hashes[idx as usize]) {
+            bitfield[idx as usize / 8] |= 0x80u8 >> (idx % 8);
+            bytes += data.len() as u64;
+            pieces += 1;
+        }
+    }
+    ExistingVerification {
+        bitfield,
+        bytes,
+        pieces,
+    }
 }
 
 /// 从续传控制文件恢复已完成片位图。
@@ -7327,6 +7574,133 @@ mod tests {
             busy,
             "端口被占用时应回退系统分配端口"
         );
+    }
+
+    /// 已有文件校验：只认磁盘实际覆盖且 SHA-1 通过的片。
+    #[test]
+    fn existing_files_verify_partial_and_corrupt_pieces() {
+        use sha1::{Digest, Sha1};
+
+        let root = std::env::temp_dir().join(format!(
+            "xfer-bt-existing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let name = "payload.bin";
+        let piece_len = 2u64;
+        let total = 6u64;
+        let layout = PieceLayout::new(
+            piece_len,
+            vec![(vec![name.to_string()], total)],
+        )
+        .with_multi_file(false);
+        let hash = |chunk: &[u8]| -> [u8; 20] {
+            let mut h = Sha1::new();
+            h.update(chunk);
+            h.finalize().into()
+        };
+        let hashes = vec![hash(b"ab"), hash(b"cd"), hash(b"ef")];
+        let path = root.join(name);
+
+        // 只落了前两片：第三片因文件长度不足必须保持未完成。
+        std::fs::write(&path, b"abcd").unwrap();
+        let partial = verify_existing_files_blocking(
+            root.clone(),
+            name.to_string(),
+            layout.clone(),
+            hashes.clone(),
+            None,
+        );
+        assert_eq!(partial.pieces, 2);
+        assert_eq!(partial.bytes, 4);
+        assert_eq!(partial.bitfield, vec![0b1100_0000]);
+
+        // 文件完整但第一片内容损坏：只继承后两片。
+        std::fs::write(&path, b"xbcdZZ").unwrap();
+        let corrupt = verify_existing_files_blocking(
+            root.clone(),
+            name.to_string(),
+            layout,
+            hashes,
+            None,
+        );
+        assert_eq!(corrupt.pieces, 1);
+        assert_eq!(corrupt.bytes, 2);
+        assert_eq!(corrupt.bitfield, vec![0b0100_0000]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 添加阶段预览：逐文件归属已验证字节，无数据时立即返回空结果。
+    #[test]
+    fn preview_existing_data_reports_per_file_verified() {
+        use sha1::{Digest, Sha1};
+        use xfer_bencode::{FileEntry, Info, TorrentMeta};
+
+        let root = std::env::temp_dir().join(format!(
+            "xfer-bt-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(root.join("pack")).unwrap();
+        let hash = |chunk: &[u8]| -> [u8; 20] {
+            let mut h = Sha1::new();
+            h.update(chunk);
+            h.finalize().into()
+        };
+        let meta = TorrentMeta {
+            info: Info {
+                name: "pack".into(),
+                piece_length: 2,
+                pieces: vec![hash(b"ab"), hash(b"cd"), hash(b"ef"), hash(b"gh")],
+                files: vec![
+                    FileEntry {
+                        path: vec!["a.bin".into()],
+                        length: 4,
+                    },
+                    FileEntry {
+                        path: vec!["b.bin".into()],
+                        length: 4,
+                    },
+                ],
+                multi_file: true,
+                private: false,
+            },
+            info_hash: [7; 20],
+            announce: None,
+            announce_list: Vec::new(),
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            raw_bencode: None,
+            raw_info: None,
+        };
+
+        // 没有数据：总长已知，但没有任何已验证字节（无需进入校验）。
+        let empty = preview_existing_data(&root, &meta);
+        assert!(!empty.has_existing_data);
+        assert_eq!(empty.total_bytes, 8);
+        assert_eq!(empty.verified_bytes, 0);
+        assert_eq!(empty.file_verified, vec![0, 0]);
+
+        // a.bin 完整、b.bin 只有前 2 字节：只继承前 3 片，并按文件归属。
+        std::fs::write(root.join("pack/a.bin"), b"abcd").unwrap();
+        std::fs::write(root.join("pack/b.bin"), b"ef").unwrap();
+        assert!(torrent_has_existing_data(&root, &meta));
+        let preview = preview_existing_data(&root, &meta);
+        assert!(preview.has_existing_data);
+        assert_eq!(preview.verified_pieces, 3);
+        assert_eq!(preview.verified_bytes, 6);
+        assert_eq!(preview.file_verified, vec![4, 2]);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// v4-mapped 源地址统一还原为 IPv4（双栈监听/收发路径的公共形态）。

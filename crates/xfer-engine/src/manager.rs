@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, Notify};
 use tokio_util::sync::CancellationToken;
-use xfer_bencode::{parse_magnet, parse_torrent};
-use xfer_bt::{TorrentConfig, TorrentEngine};
+use xfer_bencode::{parse_magnet, parse_torrent, TorrentMeta};
+use xfer_bt::{ExistingDataPreview, TorrentConfig, TorrentEngine};
 use xfer_types::{Gid, PeerId};
 
 // M6: catch_unwind for async futures
@@ -288,8 +288,29 @@ impl Drop for ClientBuildGuard {
     }
 }
 
+/// 添加任务弹窗的已有数据预览任务状态。
+#[derive(Clone)]
+enum PreviewJobState {
+    Running,
+    Done(Value),
+    Failed(String),
+}
+
+struct PreviewJob {
+    state: PreviewJobState,
+    updated: Instant,
+}
+
 pub struct TaskManager {
     inner: Mutex<Inner>,
+    /// `task.previewBt` 的后台校验结果（key = 目录 + info_hash）。
+    ///
+    /// 校验要逐片读盘哈希，放在 RPC 线程上做会卡住整条 WebSocket 连接
+    /// （进度轮询/事件推送全停）。首次请求起后台任务并返回 `verifying`，
+    /// 前端轮询同一参数取结果。
+    preview_jobs: Arc<Mutex<HashMap<String, PreviewJob>>>,
+    /// 预览校验串行执行：一次只读一份数据，避免批量粘贴磁力时磁盘被并发哈希打满。
+    preview_sem: Arc<tokio::sync::Semaphore>,
     /// 活动 BT 引擎注册表（gid → 引擎）：全局限速变更时下发
     /// [`TorrentEngine::set_rate_limits`]，任务结束时移除。
     bt_engines: Mutex<HashMap<Gid, Arc<TorrentEngine>>>,
@@ -365,6 +386,8 @@ impl TaskManager {
                 auto_update_trackers: true,
                 bt_bans: HashMap::new(),
             }),
+            preview_jobs: Arc::new(Mutex::new(HashMap::new())),
+            preview_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             bt_engines: Mutex::new(HashMap::new()),
             kick: Notify::new(),
             sub_kick: Notify::new(),
@@ -3126,6 +3149,134 @@ impl TaskManager {
             .unwrap_or_else(|| Value::Array(vec![])))
     }
 
+    /// 添加任务前预览已有数据（原生 task.previewBt）。
+    ///
+    /// 参数：`torrent`（.torrent base64）或 `magnet`（磁力链接）+ 可选 `dir`。
+    /// 磁力链接优先读目标目录里保存的 `<infohash>.torrent`，其次复用仍在
+    /// 任务列表里的同 info_hash 元数据；两者都没有时返回
+    /// `state=no-metadata`（添加阶段无法凭空拿到文件布局）。
+    ///
+    /// 有已有数据时返回 `state=verifying` 并在后台逐片校验，前端用同一参数
+    /// 轮询即可取到 `state=done` 的结果。
+    pub fn preview_bt(self: &Arc<Self>, options: &Value) -> Result<Value, String> {
+        let opts = options.as_object().cloned().unwrap_or_default();
+        let dir = match opts.get("dir").and_then(Value::as_str) {
+            Some(d) if !d.trim().is_empty() => normalize_dir(d),
+            _ => self.inner.lock().unwrap().download_dir.clone(),
+        };
+        let meta = if let Some(b64) = opts.get("torrent").and_then(Value::as_str) {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .map_err(|e| format!("torrent base64 解码失败: {e}"))?;
+            parse_torrent(&bytes).map_err(|e| format!("torrent 解析失败: {e}"))?
+        } else if let Some(magnet) = opts.get("magnet").and_then(Value::as_str) {
+            let m = parse_magnet(magnet.trim()).map_err(|e| format!("磁力链接解析失败: {e}"))?;
+            match xfer_bt::load_saved_torrent(&dir, &m.info_hash)
+                .or_else(|| self.find_bt_meta_by_hash(&m.info_hash))
+            {
+                Some(meta) => meta,
+                None => {
+                    return Ok(json!({
+                        "state": "no-metadata",
+                        "hasMetadata": false,
+                        "infoHash": hex::encode(m.info_hash),
+                    }))
+                }
+            }
+        } else {
+            return Err("参数 torrent 或 magnet 缺失".into());
+        };
+
+        if !xfer_bt::torrent_has_existing_data(&dir, &meta) {
+            return Ok(preview_done_json(&meta, None));
+        }
+
+        let key = format!("{}|{}", dir.display(), hex::encode(meta.info_hash));
+        {
+            let mut jobs = self.preview_jobs.lock().unwrap();
+            jobs.retain(|_, job| match &job.state {
+                PreviewJobState::Running => true,
+                _ => job.updated.elapsed() < Duration::from_secs(300),
+            });
+            if let Some(job) = jobs.get(&key) {
+                return Ok(match &job.state {
+                    PreviewJobState::Running => json!({
+                        "state": "verifying",
+                        "hasMetadata": true,
+                        "hasExistingData": true,
+                        "infoHash": hex::encode(meta.info_hash),
+                        "totalLength": meta.info.files.iter().map(|f| f.length).sum::<u64>(),
+                    }),
+                    PreviewJobState::Done(v) => v.clone(),
+                    PreviewJobState::Failed(e) => {
+                        json!({"state": "error", "hasMetadata": true, "error": e})
+                    }
+                });
+            }
+            jobs.insert(
+                key.clone(),
+                PreviewJob {
+                    state: PreviewJobState::Running,
+                    updated: Instant::now(),
+                },
+            );
+        }
+
+        let jobs = self.preview_jobs.clone();
+        let sem = self.preview_sem.clone();
+        let check_dir = dir.clone();
+        let check_meta = meta.clone();
+        let result_meta = meta.clone();
+        tokio::spawn(async move {
+            let _permit = sem.acquire().await;
+            let check = tokio::task::spawn_blocking(move || {
+                xfer_bt::preview_existing_data(&check_dir, &check_meta)
+            })
+            .await;
+            let state = match check {
+                Ok(preview) => PreviewJobState::Done(preview_done_json(
+                    &result_meta,
+                    Some(&preview),
+                )),
+                Err(e) => PreviewJobState::Failed(format!("已有数据校验失败: {e}")),
+            };
+            if let Some(job) = jobs.lock().unwrap().get_mut(&key) {
+                job.state = state;
+                job.updated = Instant::now();
+            }
+        });
+
+        Ok(json!({
+            "state": "verifying",
+            "hasMetadata": true,
+            "hasExistingData": true,
+            "infoHash": hex::encode(meta.info_hash),
+            "totalLength": meta.info.files.iter().map(|f| f.length).sum::<u64>(),
+        }))
+    }
+
+    /// 按 info_hash 从仍在任务列表里的 BT 任务复用元数据（磁力预览兜底）。
+    fn find_bt_meta_by_hash(&self, hash: &[u8; 20]) -> Option<TorrentMeta> {
+        let tasks: Vec<Arc<Task>> = self
+            .inner
+            .lock()
+            .unwrap()
+            .tasks
+            .values()
+            .cloned()
+            .collect();
+        for task in tasks {
+            let meta = task.bt_meta.lock().unwrap().clone();
+            if let Some(meta) = meta {
+                if meta.info_hash == *hash {
+                    return Some((*meta).clone());
+                }
+            }
+        }
+        None
+    }
+
     /// 单任务文件校验（原生 task.verifyFiles）。
     ///
     /// 下载完成后的完整性检查在引擎侧执行：存在性 / 大小 / 哈希（流式），
@@ -4415,6 +4566,40 @@ fn home_dir() -> PathBuf {
 ///
 /// 应用端（开发者模式）常通过 `--dir=~/Downloads` 之类的形式直接传参，
 /// 未经 shell 展开 `~`；此处统一处理，避免在程序目录下创建 `~` 或同名目录。
+/// 已有数据预览的完成结果（`preview=None` 表示磁盘上没有数据）。
+fn preview_done_json(meta: &TorrentMeta, preview: Option<&ExistingDataPreview>) -> Value {
+    let files: Vec<Value> = meta
+        .info
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            json!({
+                "index": i + 1,
+                "path": meta.info.file_rel_path(f),
+                "length": f.length,
+                "verifiedLength": preview
+                    .and_then(|p| p.file_verified.get(i).copied())
+                    .unwrap_or(0),
+            })
+        })
+        .collect();
+    let total = preview
+        .map(|p| p.total_bytes)
+        .unwrap_or_else(|| meta.info.files.iter().map(|f| f.length).sum());
+    json!({
+        "state": "done",
+        "hasMetadata": true,
+        "hasExistingData": preview.is_some_and(|p| p.has_existing_data),
+        "infoHash": hex::encode(meta.info_hash),
+        "name": meta.info.name,
+        "totalLength": total,
+        "verifiedLength": preview.map(|p| p.verified_bytes).unwrap_or(0),
+        "numPieces": meta.info.piece_count(),
+        "files": files,
+    })
+}
+
 pub fn normalize_dir(dir: &str) -> PathBuf {
     let expanded = if dir == "~" {
         home_dir()
@@ -4695,6 +4880,7 @@ async fn drive_bt_download(
                 if let Some(bf) = engine.bitfield() {
                     *task.bt_bitfield.lock().unwrap() = bf;
                 }
+                *task.bt_verified_bitfield.lock().unwrap() = engine.verified_bitfield();
                 // 磁力任务：元数据就绪即回填 bt_meta（文件列表/详情页立即可见）
                 if task.bt_meta.lock().unwrap().is_none() {
                     if let Some(m) = engine.meta() {
@@ -4762,6 +4948,9 @@ async fn drive_bt_download(
     if let Some(bf) = engine.bitfield() {
         *task.bt_bitfield.lock().unwrap() = bf;
     }
+    // 已验证大小同理：继承完立刻完成的任务往往撑不到下一次 1Hz ticker，
+    // 不同步的话终态任务会显示"已验证 0"
+    *task.bt_verified_bitfield.lock().unwrap() = engine.verified_bitfield();
     // 磁力链接补齐数据路径：引擎运行中拿到元信息后才能确定落盘路径
     {
         let mut sh = task.shared.lock().unwrap();
@@ -6372,5 +6561,71 @@ mod tests {
             "分片下载路径未带上逐任务头"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 添加阶段预览：没有已有数据立即 done；有半成品时异步轮询到 done。
+    #[tokio::test]
+    async fn preview_bt_reports_existing_data_asynchronously() {
+        use sha1::{Digest, Sha1};
+        use std::collections::BTreeMap;
+        use xfer_bencode::{bytes, dict, encode, int};
+
+        let root = std::env::temp_dir().join(format!(
+            "xfer-preview-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let data = b"abcd";
+        let mut hashes = Vec::new();
+        for chunk in data.chunks(2) {
+            let mut h = Sha1::new();
+            h.update(chunk);
+            hashes.extend_from_slice(&h.finalize());
+        }
+        let info = dict(BTreeMap::from([
+            (b"name".to_vec(), bytes("payload.bin")),
+            (b"piece length".to_vec(), int(2)),
+            (b"length".to_vec(), int(4)),
+            (b"pieces".to_vec(), bytes(hashes)),
+        ]));
+        let top = dict(BTreeMap::from([(b"info".to_vec(), info)]));
+        use base64::Engine;
+        let tb64 = base64::engine::general_purpose::STANDARD.encode(encode(&top));
+        let dir = root.to_string_lossy().to_string();
+        let call = || {
+            serde_json::json!({"torrent": tb64.clone(), "dir": dir.clone()})
+        };
+        let mgr = TaskManager::new(root.clone(), 1);
+
+        // 磁盘上没有数据：不需要后台校验，首包就是 done。
+        let r = mgr.preview_bt(&call()).unwrap();
+        assert_eq!(r["state"], "done");
+        assert_eq!(r["hasExistingData"], false);
+        assert_eq!(r["verifiedLength"], 0);
+        assert_eq!(r["totalLength"], 4);
+
+        // 只有前一片：首包 verifying，轮询到 done 后继承 2 字节。
+        std::fs::write(root.join("payload.bin"), b"ab").unwrap();
+        let r = mgr.preview_bt(&call()).unwrap();
+        assert_eq!(r["state"], "verifying");
+        let mut done = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let r = mgr.preview_bt(&call()).unwrap();
+            if r["state"] == "done" {
+                done = Some(r);
+                break;
+            }
+        }
+        let done = done.expect("预览轮询应在超时前完成");
+        assert_eq!(done["verifiedLength"], 2);
+        assert_eq!(done["hasExistingData"], true);
+        assert_eq!(done["files"][0]["verifiedLength"], 2);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -254,6 +254,10 @@ pub struct Task {
     /// status 查询时序列化为 aria2 兼容 hex 字符串）。任务暂停后保留
     /// 最后已知状态供 UI 展示；非 BT 任务恒为空。
     pub bt_bitfield: Mutex<Vec<u8>>,
+    /// 本次启动从磁盘已有文件校验/续传控制文件继承的片位图（wire 字节）。
+    /// 与 `bt_bitfield` 不同：它只表示"开始时已经验证过的数据"，
+    /// 用于在文件表里展示"已验证大小"；普通新任务为空。
+    pub bt_verified_bitfield: Mutex<Vec<u8>>,
     /// HTTP 任务实时分片位图（下载启动时挂接，写线程按落盘区间增量
     /// 维护；BT 任务不使用——分片信息来自 bt_meta）。暂停后保留最后
     /// 已知状态供 UI 展示；未知总长或不支持 Range 的任务为 None。
@@ -350,6 +354,7 @@ impl Task {
             bt_trackers: Mutex::new(Vec::new()),
             bt_peers: Mutex::new(Vec::new()),
             bt_bitfield: Mutex::new(Vec::new()),
+            bt_verified_bitfield: Mutex::new(Vec::new()),
             http_pieces: RwLock::new(None),
             http_split_stats: RwLock::new(None),
             awaiting_selection: AtomicBool::new(false),
@@ -415,6 +420,7 @@ impl Task {
             bt_trackers: Mutex::new(Vec::new()),
             bt_peers: Mutex::new(Vec::new()),
             bt_bitfield: Mutex::new(Vec::new()),
+            bt_verified_bitfield: Mutex::new(Vec::new()),
             http_pieces: RwLock::new(None),
             http_split_stats: RwLock::new(None),
             awaiting_selection: AtomicBool::new(false),
@@ -480,6 +486,7 @@ impl Task {
             bt_trackers: Mutex::new(trackers),
             bt_peers: Mutex::new(Vec::new()),
             bt_bitfield: Mutex::new(Vec::new()),
+            bt_verified_bitfield: Mutex::new(Vec::new()),
             http_pieces: RwLock::new(None),
             http_split_stats: RwLock::new(None),
             awaiting_selection: AtomicBool::new(false),
@@ -930,12 +937,17 @@ pub fn status_json(task: &Task) -> Value {
         None => true,
         Some(v) => v.contains(&i),
     };
+    let mut verified_total = 0u64;
     let files = if let Some(meta) = &*task.bt_meta.lock().unwrap() {
         // 每文件已完成字节由 piece 位图推导（未选文件恒 0），
         // 不再按「文件占比 × 总进度」估算
         let bitfield = task.bt_bitfield.lock().unwrap().clone();
+        let verified_bitfield = task.bt_verified_bitfield.lock().unwrap().clone();
         let complete = s.total_len.is_some_and(|t| t > 0 && s.completed >= t);
         let per_file = bt_files_done_bytes(&meta.info, &bitfield, sel.as_deref(), complete);
+        let per_file_verified =
+            bt_files_done_bytes(&meta.info, &verified_bitfield, sel.as_deref(), false);
+        verified_total = per_file_verified.iter().sum();
         meta.info
             .files
             .iter()
@@ -946,6 +958,7 @@ pub fn status_json(task: &Task) -> Value {
                     "path": meta.info.file_rel_path(f),
                     "length": f.length.to_string(),
                     "completedLength": per_file.get(i).copied().unwrap_or(0).to_string(),
+                    "verifiedLength": per_file_verified.get(i).copied().unwrap_or(0).to_string(),
                     "selected": is_selected(i).to_string(),
                     "uris": [],
                 })
@@ -1015,6 +1028,8 @@ pub fn status_json(task: &Task) -> Value {
         json!(s.total_len.unwrap_or(0).to_string()),
     );
     m.insert("completedLength".into(), json!(s.completed.to_string()));
+    // 本次启动从磁盘已有文件继承并校验通过的大小（普通新任务为 0）
+    m.insert("verifiedLength".into(), json!(verified_total.to_string()));
     m.insert("uploadLength".into(), json!(s.uploaded.to_string()));
     m.insert("downloadSpeed".into(), json!(s.download_speed.to_string()));
     m.insert("uploadSpeed".into(), json!(s.upload_speed.to_string()));
@@ -1079,12 +1094,18 @@ pub fn status_json_native(task: &Task) -> Value {
         None => true,
         Some(v) => v.contains(&i),
     };
+    let mut verified_total = 0u64;
     let files = if let Some(meta) = &*task.bt_meta.lock().unwrap() {
         // 每文件已完成字节由 piece 位图推导（未选文件恒 0），
         // 不再按「文件占比 × 总进度」估算
         let bitfield = task.bt_bitfield.lock().unwrap().clone();
+        let verified_bitfield = task.bt_verified_bitfield.lock().unwrap().clone();
         let complete = s.total_len.is_some_and(|t| t > 0 && s.completed >= t);
         let per_file = bt_files_done_bytes(&meta.info, &bitfield, sel.as_deref(), complete);
+        // 已验证大小：只统计本次启动从磁盘已有文件继承/续传的片
+        let per_file_verified =
+            bt_files_done_bytes(&meta.info, &verified_bitfield, sel.as_deref(), false);
+        verified_total = per_file_verified.iter().sum();
         meta.info
             .files
             .iter()
@@ -1095,6 +1116,7 @@ pub fn status_json_native(task: &Task) -> Value {
                     "path": meta.info.file_rel_path(f),
                     "length": f.length,
                     "completedLength": per_file.get(i).copied().unwrap_or(0),
+                    "verifiedLength": per_file_verified.get(i).copied().unwrap_or(0),
                     "selected": is_selected(i),
                     "uris": [],
                 })
@@ -1162,6 +1184,8 @@ pub fn status_json_native(task: &Task) -> Value {
         "status": s.status.as_str(),
         "totalLength": s.total_len.unwrap_or(0),
         "completedLength": s.completed,
+        // 本次启动从磁盘已有文件继承并校验通过的大小（普通新任务为 0）
+        "verifiedLength": verified_total,
         "filename": s.filename,
         "uploadLength": s.uploaded,
         "downloadSpeed": s.download_speed,

@@ -186,6 +186,9 @@ impl NativeDispatcher {
                 .remove_download_result(&gid("gid")?)
                 .map(|_| json!({"ok": true})),
             "task.getFiles" => e.get_files(&gid("gid")?),
+            // 添加任务前预览已有数据：立即返回；校验在引擎后台逐片执行，
+            // 前端轮询同一参数取最终结果（不阻塞 RPC 连接）。
+            "task.previewBt" => e.preview_bt(params),
             "task.verifyFiles" => {
                 let gid = gid("gid")?;
                 let algorithm = obj
