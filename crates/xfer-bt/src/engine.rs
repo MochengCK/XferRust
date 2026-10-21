@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use xfer_bencode::TorrentMeta;
@@ -40,7 +41,9 @@ use crate::message::{
 };
 use crate::mse::EncryptedStream;
 use crate::scheduler::{PeerSample, PeerScheduler, PeerSchedulerConfig, ScheduleAction};
-use crate::tracker::{announce, announce_via_ipv6, AnnounceRequest, AnnounceResponse};
+use crate::tracker::{
+    announce, announce_via_ipv6, has_global_ipv6_route, AnnounceRequest, AnnounceResponse,
+};
 
 /// 统一 peer 流：明文 TCP 或 MSE 加密流。
 /// EncryptedStream 已实现 AsyncRead + AsyncWrite，可直接传递给 PeerReader。
@@ -162,6 +165,8 @@ const MSE_TIMEOUT: Duration = Duration::from_secs(8);
 const UTP_DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 /// 冷启动突发倍数（§7.8：首轮 3 倍突发）。
 const COLD_START_BURST: usize = 3;
+/// 冷启动抢节点窗口：窗口内按 3 倍连接上限并发握手，之后回落到正常上限。
+const COLD_START_WINDOW: Duration = Duration::from_secs(10);
 /// 冷启动爬坡周期（§7.8：1s）。
 const COLD_START_RAMP: Duration = Duration::from_secs(1);
 /// 慢速节点淘汰周期。
@@ -1077,8 +1082,16 @@ pub struct TorrentEngine {
     /// 污染成 0（peer 明明在传输）。字节级计数与 peer 级 disp 采样
     /// 同源，任务速度不再归零。
     received_bytes: AtomicU64,
-    /// 冷启动突发标记（首轮连接后清除）。
-    cold_start_done: AtomicBool,
+    /// peer 发现唤醒：tracker / DHT / PEX / LSD 新节点入池时立即拨号，
+    /// 不再等主循环的 1s tick。
+    peer_kick: Notify,
+    /// 后台 announce 是否在跑：避免定时器与元数据循环重复发起。
+    announce_busy: AtomicBool,
+    /// DHT get_peers 是否在途：单次查询可能十几秒，冷启动 2s 重试若
+    /// 不设闸会同时叠出多个查询，白耗 DHT 流量/节点配额。
+    dht_lookup_busy: AtomicBool,
+    /// 引擎启动时刻：前 `COLD_START_WINDOW` 用 3 倍连接上限抢节点。
+    cold_start_at: Instant,
     /// BT 智能调度器（按吞吐边际收益动态调整目标连接数）。
     scheduler: Mutex<PeerScheduler>,
     /// choking 决策纪元（轮次由墙钟推导 `(elapsed/10s)%3`，所有会话在
@@ -1253,7 +1266,10 @@ impl TorrentEngine {
             ul_limit: AtomicU64::new(upload_limit),
             uploaded_bytes: AtomicU64::new(0),
             received_bytes: AtomicU64::new(0),
-            cold_start_done: AtomicBool::new(false),
+            peer_kick: Notify::new(),
+            announce_busy: AtomicBool::new(false),
+            dht_lookup_busy: AtomicBool::new(false),
+            cold_start_at: Instant::now(),
             scheduler: Mutex::new(PeerScheduler::new(sched_cfg)),
             choke_epoch: Instant::now(),
             optimistic_unchoke: Mutex::new(None),
@@ -1326,7 +1342,10 @@ impl TorrentEngine {
             ul_limit: AtomicU64::new(upload_limit),
             uploaded_bytes: AtomicU64::new(0),
             received_bytes: AtomicU64::new(0),
-            cold_start_done: AtomicBool::new(false),
+            peer_kick: Notify::new(),
+            announce_busy: AtomicBool::new(false),
+            dht_lookup_busy: AtomicBool::new(false),
+            cold_start_at: Instant::now(),
             scheduler: Mutex::new(PeerScheduler::new(sched_cfg)),
             choke_epoch: Instant::now(),
             optimistic_unchoke: Mutex::new(None),
@@ -1940,31 +1959,21 @@ impl TorrentEngine {
             None
         };
 
-        // 首次 announce（started）
-        let mut last_announce = Instant::now() - Duration::from_secs(120);
-        if let Some(r) = self.announce_all(Some("started")).await {
-            self.add_peers(r.peers, PeerSource::Tracker).await;
-            last_announce = Instant::now();
-        }
-
-        // 首次 DHT get_peers（后台执行，不阻塞主流程）
-        let mut last_dht = Instant::now() - Duration::from_secs(120);
+        // 首次 DHT get_peers：立即后台执行（bootstrap 本身也在后台），
+        // 不再排在 tracker announce 后面。
+        let mut last_dht = Instant::now();
         if let Some(d) = dht.as_ref() {
-            // DHT bootstrap 可能需要时间，不阻塞 cold_start
-            let engine_ref = self.clone();
-            let dht_clone = d.clone();
-            tokio::spawn(async move {
-                engine_ref.dht_get_peers(&dht_clone).await;
-            });
-            // 给 DHT 一点 bootstrap 时间
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            last_dht = Instant::now();
+            self.spawn_dht_lookup(d);
         }
 
-        // 冷启动突发连接：首轮 3 倍突发
-        self.cold_start_burst_connect().await;
+        // 首次 tracker announce：种子任务放后台，peers 一到即 add_peers 并唤醒拨号；
+        // 磁力任务由 fetch_metadata 负责（它开头就会 announce），避免双重 announce。
+        // 旧实现这里 await 最多 3 秒，IPv6 附加路径还会更久——冷启动首连被硬生生拖住。
+        if self.has_metadata() {
+            self.spawn_announce(Some("started"));
+        }
 
-        // 磁力模式：元数据未就绪时先经 ut_metadata 获取（冷启动连接已在路上）
+        // 磁力模式：元数据未就绪时先经 ut_metadata 获取（DHT/tracker 已在后台跑）
         if !self.has_metadata() {
             if let Err(e) = self.fetch_metadata(&cancel).await {
                 self.stop_background();
@@ -1974,6 +1983,8 @@ impl TorrentEngine {
         // 磁力元数据从 peer 拿到后才第一次具备文件布局：在进入主循环前
         // 对磁盘已有数据做哈希校验；torrent 任务在上方的首次调用已处理。
         self.verify_existing_data().await;
+        // 元数据阶段的 announce 可能已经跑过；从此刻重新计时周期 announce
+        let mut last_announce = Instant::now();
 
         let mut tick = tokio::time::interval(COLD_START_RAMP);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1998,6 +2009,10 @@ impl TorrentEngine {
                     self.announce_all_sync(Some("stopped"));
                     return Err("BT 任务已取消".into());
                 }
+                _ = self.peer_kick.notified() => {
+                    // tracker/DHT/PEX/LSD 新节点入池：马上拨号，不等 1s tick
+                    self.connect_pending().await;
+                }
                 _ = tick.tick() => {
                     if self.is_done() {
                         self.finish();
@@ -2017,34 +2032,30 @@ impl TorrentEngine {
                     }
                     // 低水位重试：无活跃 peer 时缩短 announce 间隔
                     let active = self.peers.read().unwrap().len();
+                    let cold = self.cold_start_at.elapsed() < COLD_START_WINDOW;
                     let interval = self.last_interval.load(Ordering::Relaxed).max(15);
-                    let eff = if active == 0 { 5 } else { interval };
+                    let eff = if active == 0 { if cold { 3 } else { 5 } } else { interval };
                     if last_announce.elapsed() >= Duration::from_secs(eff) {
-                        // announce 最长可阻塞 15s：取消优先，暂停不被 tracker I/O 挡住
-                        let r = tokio::select! {
-                            biased;
-                            _ = cancel.cancelled() => None,
-                            r = self.announce_all(None) => r,
-                        };
-                        if cancel.is_cancelled() {
-                            continue; // 下一轮进入取消收尾分支
+                        // announce 全程后台执行：tracker 再慢也不阻塞拨号/选片/调度；
+                        // 新 peer 由 add_peers 唤醒主循环立即连接。
+                        if self.spawn_announce(None) {
+                            last_announce = Instant::now();
                         }
-                        if let Some(r) = r {
-                            self.add_peers(r.peers, PeerSource::Tracker).await;
-                        }
-                        last_announce = Instant::now();
                     }
                     // DHT get_peers 重试（§7.8：5s/30s/2min 三档）
                     if let Some(dht) = &dht {
                         let active = self.peers.read().unwrap().len();
-                        let dht_interval = if active == 0 { 5 } else if active < 5 { 30 } else { 120 };
+                        let cold = self.cold_start_at.elapsed() < COLD_START_WINDOW;
+                        let dht_interval = if active == 0 {
+                            if cold { 2 } else { 5 }
+                        } else if active < 5 {
+                            30
+                        } else {
+                            120
+                        };
                         if last_dht.elapsed() >= Duration::from_secs(dht_interval) {
-                            // 后台执行，不阻塞主循环
-                            let engine_ref = self.clone();
-                            let dht_clone = dht.clone();
-                            tokio::spawn(async move {
-                                engine_ref.dht_get_peers(&dht_clone).await;
-                            });
+                            // 后台执行，不阻塞主循环；在途查询未结束则跳过
+                            self.spawn_dht_lookup(dht);
                             last_dht = Instant::now();
                         }
                     }
@@ -2087,6 +2098,9 @@ impl TorrentEngine {
         );
         // announce 节流：每轮循环都发会形成 tracker 洪水，统一按 5s 间隔补充
         let mut last_announce = Instant::now() - Duration::from_secs(METADATA_ANNOUNCE_INTERVAL);
+        // 元数据阶段也要持续补 DHT：首次 get_peers 可能在 bootstrap 未完成时
+        // 返回空，旧实现此后直到元数据到手都不再查 DHT，磁力冷启动因此干等。
+        let mut last_dht = Instant::now();
         loop {
             if cancel.is_cancelled() {
                 return Err("BT 任务已取消".into());
@@ -2100,65 +2114,46 @@ impl TorrentEngine {
             // 补充 announce 拿新 peer（低水位加速）。announce 最长可阻塞
             // 到 tracker 超时，取消优先，暂停不被 tracker I/O 挡住
             if last_announce.elapsed() >= Duration::from_secs(METADATA_ANNOUNCE_INTERVAL) {
-                let r = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => return Err("BT 任务已取消".into()),
-                    r = self.announce_all(None) => r,
-                };
-                if let Some(r) = r {
-                    self.add_peers(r.peers, PeerSource::Tracker).await;
+                // 后台 announce；不阻塞元数据循环（peer_kick 唤醒拨号）
+                if self.spawn_announce(None) {
+                    last_announce = Instant::now();
                 }
-                last_announce = Instant::now();
             }
             self.connect_pending().await;
+            if let Some(dht) = self.dht.lock().unwrap().clone() {
+                let active = self.peers.read().unwrap().len();
+                // 无 peer 时 2s 一轮，有少量 peer 时 5s，足够多后放慢
+                let interval = if active == 0 { 2 } else if active < 5 { 5 } else { 30 };
+                if last_dht.elapsed() >= Duration::from_secs(interval) {
+                    self.spawn_dht_lookup(&dht);
+                    last_dht = Instant::now();
+                }
+            }
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err("BT 任务已取消".into()),
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                // 新 peer 入池立即重连；500ms 仅作 announce/超时的兜底
+                _ = self.peer_kick.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
         }
     }
 
-    /// 冷启动突发连接：首轮 3 倍并发连接。
-    async fn cold_start_burst_connect(self: &Arc<Self>) {
-        if self.cold_start_done.load(Ordering::Relaxed) {
-            return;
+    /// 后台发起一轮 announce（不阻塞下载/元数据循环）。
+    /// 返回 false 表示上一轮还没结束，本次跳过。
+    fn spawn_announce(self: &Arc<Self>, event: Option<&str>) -> bool {
+        if self.announce_busy.swap(true, Ordering::Relaxed) {
+            return false;
         }
-        self.cold_start_done.store(true, Ordering::Relaxed);
-
-        let target = (self.config.max_peers * COLD_START_BURST).min(self.pending_count());
-        tracing::info!(target, "冷启动突发连接");
-
-        let mut spawned = 0;
-        for _ in 0..target {
-            let next = {
-                let pending = self.pending.lock().unwrap();
-                pending
-                    .iter()
-                    .find(|(a, _)| !is_unroutable(a) && a.port() != 0)
-                    .map(|(a, s)| (*a, *s))
-            };
-            let Some((addr, source)) = next else { break };
-            self.pending.lock().unwrap().remove(&addr);
-
-            let cell = self.register_peer(addr, source);
-            let e2 = self.clone();
-            let e3 = self.clone();
-            spawned += 1;
-            tokio::spawn(async move {
-                let outcome = e2.dial_and_run(addr, cell.clone()).await;
-                e3.unregister_peer(&addr, cell.clone());
-                // 失败地址回填 pending 重试（引擎主动淘汰不重试）
-                if matches!(outcome, DialOutcome::Failed) && !cell.kill.is_cancelled() {
-                    e3.retry_later(addr, cell.source);
-                }
-            });
-        }
-        tracing::info!(spawned, "冷启动突发连接已派发");
-    }
-
-    fn pending_count(&self) -> usize {
-        self.pending.lock().unwrap().len()
+        let engine = self.clone();
+        let event = event.map(str::to_string);
+        tokio::spawn(async move {
+            if let Some(r) = engine.announce_all(event.as_deref()).await {
+                engine.add_peers(r.peers, PeerSource::Tracker).await;
+            }
+            engine.announce_busy.store(false, Ordering::Relaxed);
+        });
+        true
     }
 
     /// 并发 announce 全部 tracker（HTTP + UDP），聚合所有成功响应的 peers。
@@ -2168,7 +2163,7 @@ impl TorrentEngine {
     /// 冷启动首轮必须尽量拿全 peer 池，只取第一个 tracker 会显著缩小候选集。
     ///
     /// 所有 tracker 请求并发发送，总体超时 15 秒，避免串行等待不可用的 tracker 阻塞主循环。
-    async fn announce_all(&self, event: Option<&str>) -> Option<AnnounceResponse> {
+    async fn announce_all(self: &Arc<Self>, event: Option<&str>) -> Option<AnnounceResponse> {
         let done = self.done_bytes.load(Ordering::Relaxed);
         let left = self
             .total_bytes
@@ -2209,6 +2204,39 @@ impl TorrentEngine {
             // 引擎统计了 uploaded_bytes 却上报 0 —— 私有 tracker 的
             // 分享率恒为 0 可能被判作弊封号
             let uploaded_now = self.uploaded_bytes.load(Ordering::Relaxed);
+            // IPv6 附加 announce 放到后台：tracker 只把 IPv6 peer 回给 IPv6
+            // 来源（BEP 7），这路能补到公网 IPv6 seeder；但它经常比 IPv4 慢
+            // 得多（DNS + 客户端构建），不能拖着 IPv4 结果一起等。
+            if !first_only && has_global_ipv6_route() {
+                let engine = self.clone();
+                let url6 = url.clone();
+                let info_hash6 = info_hash;
+                let peer_id6 = peer_id;
+                let event6 = event.map(|s| s.to_string());
+                tokio::spawn(async move {
+                    let req = AnnounceRequest {
+                        info_hash: &info_hash6,
+                        peer_id: &peer_id6,
+                        port,
+                        uploaded: uploaded_now,
+                        downloaded: done,
+                        left,
+                        event: event6.as_deref(),
+                        numwant,
+                    };
+                    match announce_via_ipv6(&url6, &req).await {
+                        Ok(r6) if r6.failure.is_none() => {
+                            engine.record_tracker_success(&url6, &r6);
+                            if !r6.peers.is_empty() {
+                                engine.add_peers(r6.peers, PeerSource::Tracker).await;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::debug!(url = %url6, error = %e, "IPv6 附加 announce 失败"),
+                    }
+                });
+            }
+            let engine = self.clone();
             join_set.spawn(async move {
                 let req = AnnounceRequest {
                     info_hash: &info_hash,
@@ -2220,30 +2248,17 @@ impl TorrentEngine {
                     event: event_owned.as_deref(),
                     numwant,
                 };
-                // 同一 tracker 同时经 IPv4（默认解析顺序）与 IPv6 各 announce
-                // 一次并合并 peer：tracker 只把 IPv6 peer 回给 IPv6 来源
-                // （BEP 7），缺 IPv6 这路会丢掉全部公网 IPv6 seeder——它们
-                // 正是热门种子的主要高速来源。
-                let (r4, r6) = tokio::join!(
-                    announce(&client, &url, &req),
-                    announce_via_ipv6(&url, &req),
-                );
-                let (mut resp, extra6) = match (r4, r6) {
-                    (Ok(r), r6) => (r, r6.ok()),
-                    (Err(e), Ok(r6)) => {
-                        tracing::debug!(url = %url, error = %e, "IPv4 announce 失败，使用 IPv6 结果");
-                        (r6, None)
-                    }
-                    (Err(e), Err(_)) => return Err((url, e)),
-                };
-                if let Some(r6) = extra6 {
-                    for p in r6.peers {
-                        if !resp.peers.contains(&p) {
-                            resp.peers.push(p);
+                match announce(&client, &url, &req).await {
+                    Ok(resp) => {
+                        // 每拿到一个 tracker 的 peer 就先入池并唤醒拨号，
+                        // 不等其余慢 tracker 聚合完成（冷启动关键）。
+                        if !first_only && !resp.peers.is_empty() {
+                            engine.add_peers(resp.peers.clone(), PeerSource::Tracker).await;
                         }
+                        Ok((url, resp))
                     }
+                    Err(e) => Err((url, e)),
                 }
-                Ok((url, resp))
             });
         }
 
@@ -2270,6 +2285,7 @@ impl TorrentEngine {
                 Some("stopped") => xfer_discovery::udp_tracker::UdpEvent::Stopped,
                 _ => xfer_discovery::udp_tracker::UdpEvent::None,
             };
+            let engine = self.clone();
             join_set.spawn(async move {
                 let Some(addr) = resolve_udp_tracker_url(&url).await else {
                     return Err((url, "URL 无法解析（缺端口或域名解析失败）".into()));
@@ -2288,17 +2304,22 @@ impl TorrentEngine {
                     numwant,
                 };
                 match tracker.announce(addr, &req).await {
-                    Ok(r) => Ok((
-                        url,
-                        AnnounceResponse {
-                            interval: r.interval as u64,
-                            min_interval: None,
-                            peers: r.peers,
-                            failure: None,
-                            complete: Some(r.seeders as u64),
-                            incomplete: Some(r.leechers as u64),
-                        },
-                    )),
+                    Ok(r) => {
+                        if !first_only && !r.peers.is_empty() {
+                            engine.add_peers(r.peers.clone(), PeerSource::Tracker).await;
+                        }
+                        Ok((
+                            url,
+                            AnnounceResponse {
+                                interval: r.interval as u64,
+                                min_interval: None,
+                                peers: r.peers,
+                                failure: None,
+                                complete: Some(r.seeders as u64),
+                                incomplete: Some(r.leechers as u64),
+                            },
+                        ))
+                    }
                     Err(e) => Err((url, format!("announce 失败: {e}"))),
                 }
             });
@@ -2378,6 +2399,20 @@ impl TorrentEngine {
         } else {
             None
         }
+    }
+
+    /// 后台发起一次 DHT get_peers；上一轮未结束时跳过（防查询叠加）。
+    fn spawn_dht_lookup(self: &Arc<Self>, dht: &Arc<Dht>) {
+        if self.dht_lookup_busy.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let engine = self.clone();
+        let dht = dht.clone();
+        tokio::spawn(async move {
+            // 单次查询内部已有超时；这里再兜底，避免异常路径把闸门卡死
+            let _ = tokio::time::timeout(Duration::from_secs(45), engine.dht_get_peers(&dht)).await;
+            engine.dht_lookup_busy.store(false, Ordering::Relaxed);
+        });
     }
 
     /// 通过 DHT get_peers 获取 peer 列表。
@@ -2586,6 +2621,8 @@ impl TorrentEngine {
             for a in fresh {
                 fails.remove(&a);
             }
+            // 新节点入池：立即唤醒主循环/元数据等待，马上拨号（不等 1s tick）
+            self.peer_kick.notify_one();
         }
     }
 
@@ -2599,7 +2636,7 @@ impl TorrentEngine {
     async fn connect_pending_limited(self: &Arc<Self>, limit: usize) {
         // 连接上限：启用智能调度时取调度器目标（不超过预分配连接数），
         // 否则直接用预分配连接数（旧行为：连满为止）。
-        let cap = if self.config.adaptive {
+        let base_cap = if self.config.adaptive {
             self.scheduler
                 .lock()
                 .unwrap()
@@ -2608,6 +2645,15 @@ impl TorrentEngine {
         } else {
             self.config.max_peers
         };
+        // 冷启动窗口内多拨 3 倍候选，尽快筛出快节点；窗口结束后回到正常上限。
+        // 候选池本身有 max_peers*2 的上限，不会无限膨胀。
+        let cold = self.cold_start_at.elapsed() < COLD_START_WINDOW;
+        let cap = if cold {
+            (self.config.max_peers * COLD_START_BURST).max(base_cap)
+        } else {
+            base_cap
+        };
+        let limit = if cold { usize::MAX } else { limit };
         let mut new_peers: Vec<(SocketAddr, Arc<PeerCell>)> = Vec::new();
         {
             let connected = self.peers.read().unwrap().len();

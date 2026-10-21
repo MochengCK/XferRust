@@ -4848,7 +4848,9 @@ async fn drive_bt_download(
         listen_port,
         max_peers,
         adaptive,
-        numwant: 50,
+        // 一次 announce 尽量多要候选节点（tracker 会自行封顶）；
+        // 连接数仍由 max_peers 控制，多出来的候选只用于筛快节点。
+        numwant: (max_peers as u32).clamp(50, 200),
         announce_urls,
         udp_announce_urls,
         pipeline: 0, // 自适应 16→256

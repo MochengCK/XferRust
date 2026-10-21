@@ -1,10 +1,26 @@
 //! HTTP tracker announce（BEP 3）：请求构造与响应解析（compact/非 compact）。
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use xfer_bencode::{decode, Value};
 use xfer_types::{InfoHash, PeerId};
+
+/// 当前主机是否有可用的公网 IPv6 路由。
+///
+/// UDP `connect()` 只让内核选路、不发包：没有 IPv6 默认路由时立即失败。
+/// 用于跳过 HTTP tracker 的附加 IPv6 announce —— IPv4-only 网络里那一路
+/// 只会等到 10~15 秒超时，正好卡住冷启动的 peer 获取。
+pub fn has_global_ipv6_route() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        UdpSocket::bind("[::]:0")
+            .and_then(|s| s.connect("[2001:4860:4860::8888]:53"))
+            .is_ok()
+    })
+}
 
 /// announce 请求参数。
 pub struct AnnounceRequest<'a> {
@@ -226,15 +242,34 @@ pub async fn announce_via_ipv6(
         .filter(|a| a.is_ipv6())
         .next()
         .ok_or_else(|| "tracker 无 IPv6 地址".to_string())?;
+    let client = ipv6_client_for(&host, v6)?;
+    announce(&client, url, req).await
+}
+
+/// IPv6 tracker 客户端缓存（按 host+地址）。
+///
+/// reqwest 构建带原生根证书的客户端在 macOS 上可能耗时 0.5~2.5 秒；
+/// 每次 announce 都重建会把 IPv6 附加路径变成纯负担。
+fn ipv6_client_for(host: &str, v6: SocketAddr) -> Result<reqwest::Client, String> {
+    static CACHE: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
+    let key = format!("{host}|{v6}");
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(client) = cache.lock().unwrap().get(&key) {
+        return Ok(client.clone());
+    }
     let ua = format!("XferRust/{}", xfer_types::ENGINE_VERSION);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .connect_timeout(Duration::from_secs(10))
         .user_agent(ua)
-        .resolve(&host, v6)
+        .resolve(host, v6)
         .build()
         .map_err(|e| format!("IPv6 HTTP 客户端构建失败: {e}"))?;
-    announce(&client, url, req).await
+    cache
+        .lock()
+        .unwrap()
+        .insert(key, client.clone());
+    Ok(client)
 }
 
 /// 百分号编码（tracker 查询参数要求）。
