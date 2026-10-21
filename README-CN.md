@@ -31,6 +31,9 @@
 - **BitTorrent**：种子与磁力链接，多 peer 并行 + rarest-first 选片；底层是
   完整网络栈：DHT（BEP 5）、IPv6 DHT（BEP 32）、peer 交换（BEP 11）、
   本地节点发现、uTP 与 MSE/PE 加密。
+- **局域网文件传输**：同网段的任意两台设备（电脑 ↔ 电脑、电脑 ↔ 手机等）
+  自动发现并点对点发送 / 接收文件，两端用 6 位短认证码比对防中间人；
+  总开关默认关闭，可配置设备名与接收目录（`lan.*`）。
 - **磁力链接按需选文件**：粘贴磁力链接后引擎立即解析元数据，解析完成弹出文件表格
   （勾选 + 文件大小 + 已选汇总），确认后才开始下载——不必为几个文件下载整个种子。
 - **做种控制**：可保持做种或完成后停止，并支持分享率与时间双条件
@@ -52,6 +55,8 @@
   打通入向连接。
 - **Tracker**：任务级 tracker 列表、全局列表，以及每日自动刷新的订阅源。
   刷新是"同步"而非"只增"，远端返回空列表会被当作异常处理，不会误清你的 tracker。
+- **冷启动加速**：tracker / DHT / IPv6 announce 并行，候选节点边到边连；
+  冷启动前 10 秒放宽连接上限，之后回到 `bt-max-peers`。
 
 **存储与校验**
 
@@ -59,6 +64,10 @@
   做 SHA-1 校验，续传位图始终不领先于真正落盘的内容。
 - **校验**：完成后的自动校验支持 sha-1 / sha-256 / sha-512 / md5；
   `task.verifyFiles` 可对已有任务随时重新校验。
+- **已有数据校验与续接**：新任务会逐片 SHA-1 校验磁盘上已有的同名 / 部分文件，
+  只继承真正可用的片；`task.previewBt` 可预览每个文件的存在状态与已校验 /
+  已验证字节（并行校验，支持 SHA-NI）。
+- **磁盘预分配**：BT 任务联网前按最终长度预分配文件，空间不足在启动时立即失败。
 - **瞬态失败重试**：HTTP 请求失败会对同一 URI 重试（最多 3 次），并沿用断点
   续传语义；4xx 响应与本地 I/O 错误不重试。
 - **磁力元数据缓存**：可选把解析出的种子元数据写到
@@ -404,7 +413,7 @@ xferrust --rpc-listen-port=6800 --rpc-secret=mytoken
 {"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.4.0",
  "features": ["http", "resume", "checksum", "bt", "hls", "flv", "events",
               "bitfield", "wanted-bitfield", "ban-peer", "change-uri",
-              "get-servers", "verify-files"]}}
+              "get-servers", "verify-files", "playhead", "lan", "lan-config"]}}
 // 错误响应
 {"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": "Unauthorized"}}
 ```

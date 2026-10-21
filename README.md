@@ -41,6 +41,11 @@ controlled over JSON-RPC by web apps, desktop applications and other clients.
   downloading and rarest-first piece selection, on top of a complete network
   stack: DHT (BEP 5), IPv6 DHT (BEP 32), peer exchange (BEP 11), local peer
   discovery, uTP and MSE/PE encryption.
+- **LAN file transfer**: any two devices on the same network (computer to
+  computer, computer to phone, and so on) discover each other and send /
+  receive files peer to peer, with a 6-digit short authentication code shown
+  on both ends to prevent man-in-the-middle attacks; the master switch defaults
+  to off, and the device name and receive directory are configurable (`lan.*`).
 - **Selective magnet downloads**: paste a magnet link and metadata is parsed
   immediately; once parsed, a file table pops up (checkboxes + file sizes +
   selection summary) and the download starts only after you confirm — no need
@@ -70,6 +75,9 @@ controlled over JSON-RPC by web apps, desktop applications and other clients.
   subscriptions refreshed daily. Refreshes are synchronised rather than
   add-only, and an empty remote list is treated as an anomaly instead of
   wiping your trackers.
+- **Faster cold start**: tracker / DHT / IPv6 announces run in parallel and
+  peers are connected as they arrive; the connection cap is widened for the
+  first 10 seconds, then returns to `bt-max-peers`.
 
 **Storage & integrity**
 
@@ -79,6 +87,12 @@ controlled over JSON-RPC by web apps, desktop applications and other clients.
   what is durably on disk.
 - **Verification**: automatic checks after completion — `sha-1` / `sha-256` /
   `sha-512` / `md5`; `task.verifyFiles` re-verifies an existing task on demand.
+- **Existing-data verification and resume**: a new task verifies same-name /
+  partial files already on disk piece by piece with SHA-1 and inherits only
+  the usable pieces; `task.previewBt` previews per-file existence plus checked /
+  verified bytes (parallel verification, SHA-NI when available).
+- **Disk preallocation**: BT tasks reserve the final size before going online
+  and fail at startup when space is insufficient.
 - **Transient failure retry**: a failed HTTP attempt is retried against the
   same URI (up to 3 times) using resume semantics; 4xx responses and local I/O
   errors are not retried.
@@ -457,7 +471,7 @@ array response; only entries carrying an `id` are answered).
 {"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.4.0",
  "features": ["http", "resume", "checksum", "bt", "hls", "flv", "events",
               "bitfield", "wanted-bitfield", "ban-peer", "change-uri",
-              "get-servers", "verify-files"]}}
+              "get-servers", "verify-files", "playhead", "lan", "lan-config"]}}
 // Error response
 {"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": "Unauthorized"}}
 ```

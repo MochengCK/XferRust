@@ -1,40 +1,62 @@
 **Summary**
 
-- HLS streams (a playlist with no `#EXT-X-ENDLIST`) are now **recorded continuously**: instead of downloading the current window and stopping, the engine follows new segments as the manifest grows and appends them in order until the stream ends or the source stops publishing
-- Recording is **resumable**: pausing (or failing and retrying) keeps everything recorded so far, and resuming continues from the break point — signed URLs that rotate on every fetch do not get in the way
-- Task status reports live recording: `isLive` marks a recording task (kept through pause / completion and restarts, so clients always render it as a recording), and `liveRecordedMs` is the **recorded media duration** (how much of the output is playable), so clients can show "recording · elapsed"
-- New global / per-task option `hls-live-stall-timeout` (seconds): how long a live source may go without new segments before the recording wraps up; 120 seconds by default, `0` = never conclude on inactivity
-- Nothing is silently faked: if the live window slides past a segment before it could be fetched, the engine skips it openly (and logs it, without failing the task); if a segment can never be fetched and blocks the splice point, the task fails honestly and a retry continues from the break point
-- The finished output shows the **correct duration**: live segments carry source-side ("since broadcast start") timestamps, so at wrap-up the timeline is shifted to start at zero — players report how long the recording actually is, not "time since the stream began"
-- **HTTP-FLV live recording**: a `.flv` / `video/x-flv` URL served as a chunked response **without a `Content-Length`** is a live stream — the engine records it continuously instead of running a download that can never finish; it reuses the same `isLive` / `liveRecordedMs` shape, so clients need no changes
-- FLV output is one continuously playable recording too: timestamps are zero-based and stitched across reconnects in real time (time lost to drops and pauses never enters the output); a FLV served **with** a `Content-Length` is a plain VOD file and downloads normally
-- New global / per-task option `flv-live-stall-timeout` (seconds): how long the stream may go without new data before wrapping up, 60 seconds by default; `0` = never conclude on inactivity; `flv=false` disables sniffing and `flv=true` forces recording for endpoints that advertise nothing
-- Also fixed: resource probing (`Range: bytes=0-0`) used to **drain the whole response body** from servers that ignore Range — live URLs hung in the probe stage; the drain is now bounded (64 KB)
+- Added LAN file transfer: any two devices on the same network (computer to computer, computer to phone, and so on) discover each other and send / receive files, with a 6-digit short authentication code shown on both ends to prevent man-in-the-middle attacks
+- Transfers need no internet account or third-party server; transfer records and settings (master switch / device name / receive directory) persist across restarts
+- Adding a BT task now verifies existing data on disk piece by piece and inherits only what is actually usable, so partial downloads no longer start from zero
+- New `task.previewBt`: inspect whether each file exists, how many bytes are checked / verified, and live progress before adding the task
+- Verification is now parallel and uses SHA-NI when available, with live per-file progress; large and multi-file torrents verify faster with unchanged accuracy
+- BT tasks preallocate disk space before going online and fail immediately when space is insufficient, instead of running out of space mid-download
+- Faster cold start: tracker / DHT / IPv6 announces run in parallel, peers are dialed as soon as they arrive, and candidates are both more numerous and quicker to connect
+- Fixed magnet / torrent sessions dropping real clients such as qBittorrent right after the handshake (Fast Extension first-message ordering)
 
 ## New Features
 
-### HLS live recording
+### LAN file transfer (`lan.*`)
 
-- A playlist without `#EXT-X-ENDLIST` is treated as an ongoing recording: the manifest is reloaded at half the `#EXT-X-TARGETDURATION` (clamped to 0.5–30 seconds) and new segments are recognised by their **media sequence** — hotlink-protected streams whose URLs rotate on every fetch are unaffected.
-- Segments are downloaded concurrently and spliced strictly in order: out-of-order segments land in per-segment files first and are moved into place at the splice point, so the output always stays a playable prefix; `#EXT-X-MAP` init segments (including ones replaced mid-recording) are handled too.
-- The recording wraps up when: the manifest gains `#EXT-X-ENDLIST`; no new segment shows up for `hls-live-stall-timeout` seconds (the source stopped publishing, or the playlist was never really live); the manifest keeps returning 404 / 410; or the task is paused / removed.
-- Resuming shares the same on-disk state as regular playlist downloads: the control file gains a live record (bytes on disk, next media sequence to splice, recorded duration, init segment already written). Pausing and failing both keep it; resuming truncates the output to the last flushed watermark, clears stale segment files, and re-fetches the remaining window with `Range` requests.
-- Timeline normalization: when the recording wraps up, sample timestamps are shifted to start at zero — each track is shifted by its own timescale so relative A/V offsets are preserved, and `sidx` presentation times are adjusted as well; live segments are timestamped from the broadcast start, and without this some players would report the duration as "time since the stream began" instead of the actual recording length.
+- Devices on the same LAN are discovered automatically and files are sent / received peer to peer, with no internet service or third-party account; device type does not matter — computer to computer and computer to phone both work.
+- Both ends display the same 6-digit short authentication code; the user compares them before the transfer to prevent man-in-the-middle attacks.
+- The transfer task table includes direction, file name, size, transferred bytes, status, peer device, and creation / finish times; records survive restarts, and unfinished records are closed as "interrupted".
+- Active transfers can be cancelled and records removed; completed incoming records can delete their on-disk file at the same time, while outgoing records never delete the source file.
+- Incoming file names are stripped of paths and control characters; existing files in the destination are never overwritten — a unique name is chosen instead.
+- New `lan.peers` / `lan.tasks` / `lan.send` / `lan.cancel` / `lan.remove` / `lan.config` / `lan.setConfig`; `engine.getVersion.features` adds `lan` and `lan-config`.
+- Transfer settings (master switch / local device name / receive directory) persist and apply immediately; turning the master switch off interrupts active transfers.
 
-### HTTP-FLV live recording
+### Existing-data verification and resume (`task.previewBt`, `verifiedLength`)
 
-- Shape detection shares the HLS design language: a URL that looks like FLV (`.flv` suffix / query hint / `video/x-flv` family MIME) **and** has no declared total length (a chunked connection) is recorded continuously; the body is confirmed against the FLV header (`FLV\x01`) and falls back to a plain HTTP download otherwise. VOD FLV (with a length) is not sniffed.
-- Per-tag parsing with **in-place, real-time** timestamp rewriting (only the 4-byte timestamp field changes; tag structure and length are untouched): the first segment starts at zero, and every reconnect (drop, resume, source restart) re-anchors to the end of the current watermark.
-- Reconnects: EOF, read silence and connection errors are treated as a failed attempt with backoff (0.5s up to 8s); persistent 404 / 410 responses, or `flv-live-stall-timeout` seconds (60 by default) without any new data, wrap the recording up.
-- Replay guard: when the server switches to resending the same content from the beginning after the stream ended (archives / finite resources reconnected as live), the segment's first media tag is compared byte-for-byte against the recording's own beginning — the replayed pass is not written at all.
-- Resume scene: the control file stores the byte watermark (always at a **complete tag boundary**), the recorded duration and the replay reference; pausing and failing both keep it. Session persistence reuses the existing `isLive` / `liveRecordedMs` fields.
-- The output timeline is normalized in real time while recording, so a wrapped-up file reports its actual recording length.
+- When adding a BT task, existing same-name / partial files in the destination are verified piece by piece with SHA-1, and only pieces actually present on disk and passing the hash are inherited; files with the right length but corrupted content are no longer mistaken for complete.
+- New `task.previewBt`: verification runs in the background and clients poll for results; it returns `done` / `verifying`, checked / verified bytes, and piece counts.
+- Preview and task status both include per-file data: `exists` / `checkedLength` / `verifiedLength` in `files[]`; missing or corrupted files do not advance progress.
+- Task status adds `verifying` and `verifyProgress`, with progress consistently measured as verified bytes / total bytes — the same basis used by subsequent download progress.
+- Verification runs in parallel over contiguous piece ranges (up to 8 workers), opens files on demand with a bounded handle cache, enables SHA-NI on supported CPUs, and falls back to a software implementation elsewhere; results remain per-piece SHA-1.
+- When a saved `.torrent` with the same info_hash exists, magnet tasks reuse its file layout before verification and resume.
+
+### BT disk preallocation
+
+- New and resumed BT tasks preallocate every file to its final length before going online; insufficient space fails the task at startup instead of mid-download.
+- Existing-data detection happens before preallocation, so freshly allocated empty files are not mistaken for existing data and inherited content is not truncated.
+- Preallocation happens after the resume bitfield is restored and before the network starts, so verification and resume see exactly the same content as before.
+
+### BT cold start and peer discovery
+
+- Tracker announces, DHT get_peers, and IPv6 supplemental announces no longer serialize startup; whichever path returns peers first feeds the pool and triggers dialing immediately.
+- Peers from each tracker are connected as they arrive instead of waiting for every tracker to time out; the first 10 seconds allow 3x the connection cap, then the engine returns to `bt-max-peers`.
+- The candidate request per announce is raised to `bt-max-peers` (50–200); unreachable candidates do not occupy connection slots indefinitely.
+- IPv6 supplemental announces are skipped when there is no public IPv6 route; when IPv6 is available, the tracker client is cached instead of rebuilt every round.
+- DHT lookups start immediately during cold start and retry after 2 / 5 seconds, without stacking duplicate in-flight queries.
+
+## Bug Fixes
+
+- Fixed magnet / torrent sessions dropping real clients such as qBittorrent immediately after the handshake: Fast Extension requires the first message after the handshake to be HaveAll / HaveNone / Bitfield, but the extension handshake was sent first and treated as a protocol violation; messages now follow BEP 6 ordering, with HaveNone sent for magnets before metadata is available.
+- Fixed DHT Port being sent to Fast Extension peers where message id 9 means HaveAll and could be treated as a violation; DHT Port is no longer sent to peers that support Fast Extension.
+- Fixed DHT finding no peers on networks without public IPv6: DHT over IPv6 was enabled by default, causing dual-stack bootstrap / get_peers to time out and stall IPv4 discovery; it is now off by default and IPv6 trackers are only tried when a usable IPv6 route exists.
+- Fixed under-reading when verifying existing data for multi-file / large torrents: opening every torrent file at once hit the process file-handle limit and later files were treated as missing (manifesting as "many bytes downloaded but only a fraction verified"); files are now opened on demand with a bounded handle cache.
+- Fixed verification progress overshooting and then falling back: progress used to be based on processed bytes, so corrupt or missing pieces pushed it to 100% before dropping to the real value; it is now based on verified bytes.
+- Fixed LAN transfer exposing the host by default: the master switch now defaults to off and must be explicitly enabled.
 
 ## Behavior Changes
 
-- A `.flv` / `video/x-flv` URL without a `Content-Length` changes from "a download that never completes" to **recording until wrapped up** (which is the point of this release); pause the task to stop it (the scene is kept). FLV with a `Content-Length` is completely unaffected.
-- The default behaviour for live / rolling-window playlists changes from "download the current window snapshot" to **recording until wrapped up**: callers that used such URLs as "grab this window and go" will see the task keep running — which is the point of this release; pause the task to stop it (the state is kept).
-- The output is "what was actually recorded": a window missed during recording is reported as lost (the log says how many segments were skipped), never padded with placeholders, and never fails the task by itself.
-- A plain VOD playlist without `#EXT-X-ENDLIST` also goes through the recording path: it finishes after `hls-live-stall-timeout` (120 seconds by default) with nothing new, instead of finishing instantly.
-
-(Low-latency playlists consisting only of `#EXT-X-PART` are outside the scope of continuous recording: their parts do not have stable identities, so they keep the current-window snapshot behaviour.)
+- LAN transfer defaults to off, so upgrading does not automatically accept files from the network; existing configuration keeps its current value.
+- DHT over IPv6 defaults to off; enable it explicitly when the network has public IPv6 and IPv6 DHT is desired.
+- BT tasks with existing data verify on disk before going online, adding a verification phase at startup that is more noticeable for larger files.
+- Preallocation reserves the full final size before downloading, so observable free space drops earlier, while preallocated empty files are not counted as downloaded content.
+- During verification the task status is `verifying` and progress advances by verified bytes; clients should present `verifying` separately from ordinary download progress.

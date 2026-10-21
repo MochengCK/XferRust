@@ -38,7 +38,7 @@ pub const ENGINE_FEATURES: [&str; 16] = [
     "verify-files",
     // 边下边播：task.setPlayhead（播放头附近的片优先下载）
     "playhead",
-    // 端手互通 · 局域网传输（lan.peers / lan.tasks / lan.send …）
+    // 局域网文件传输（lan.peers / lan.tasks / lan.send …）
     "lan",
     // 互传设置（lan.config / lan.setConfig：总开关 / 设备名 / 接收目录）
     "lan-config",
@@ -368,7 +368,7 @@ impl NativeDispatcher {
                 e.shutdown();
                 Ok(json!({"ok": true}))
             }
-            // ---- 端手互通 · 局域网传输 ----
+            // ---- 局域网文件传输 ----
             // 任务对象结构与协议第 3 节完全一致（见 xfer-lan::LanTask）。
             "lan.config" => {
                 let status = self.lan()?.status();

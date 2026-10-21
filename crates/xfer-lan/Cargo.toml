@@ -1,6 +1,6 @@
 [package]
 name = "xfer-lan"
-description = "端手互通 · 局域网文件传输（UDP 发现 + ECDH/AES-GCM 加密 TCP 传输）"
+description = "局域网文件传输（UDP 发现 + ECDH/AES-GCM 加密 TCP 传输）"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
