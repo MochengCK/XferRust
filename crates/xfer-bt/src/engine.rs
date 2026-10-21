@@ -6179,10 +6179,66 @@ pub struct VerifyProgress {
     checked_pieces: AtomicU32,
     verified_bytes: AtomicU64,
     verified_pieces: AtomicU32,
+    /// 逐文件进度（校验开始时按种子文件顺序建立）。
+    files: Mutex<Option<Arc<FileVerifyProgress>>>,
+}
+
+/// 逐文件校验进度（文件内字节口径；`exists=false` 表示磁盘上没有该文件）。
+#[derive(Debug, Default)]
+struct FileVerifyProgress {
+    lengths: Vec<u64>,
+    exists: Vec<bool>,
+    checked: Vec<AtomicU64>,
+    verified: Vec<AtomicU64>,
+}
+
+impl FileVerifyProgress {
+    fn new(lengths: Vec<u64>, exists: Vec<bool>) -> Self {
+        let count = lengths.len();
+        Self {
+            lengths,
+            exists,
+            checked: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            verified: (0..count).map(|_| AtomicU64::new(0)).collect(),
+        }
+    }
+
+    fn record_segments(&self, segments: &[(usize, u64, u64)], verified: bool) {
+        for (fi, _, len) in segments {
+            if let Some(v) = self.checked.get(*fi) {
+                v.fetch_add(*len, Ordering::Relaxed);
+            }
+            if verified {
+                if let Some(v) = self.verified.get(*fi) {
+                    v.fetch_add(*len, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    fn snapshots(&self) -> Vec<FileVerifySnapshot> {
+        (0..self.lengths.len())
+            .map(|i| FileVerifySnapshot {
+                length: self.lengths[i],
+                exists: self.exists.get(i).copied().unwrap_or(false),
+                checked_bytes: self.checked[i].load(Ordering::Relaxed),
+                verified_bytes: self.verified[i].load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+}
+
+/// 单个文件的校验进度快照。
+#[derive(Debug, Default, Clone)]
+pub struct FileVerifySnapshot {
+    pub length: u64,
+    pub exists: bool,
+    pub checked_bytes: u64,
+    pub verified_bytes: u64,
 }
 
 /// [`VerifyProgress`] 的一次性快照。
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct VerifyProgressSnapshot {
     pub total_bytes: u64,
     pub checked_bytes: u64,
@@ -6190,16 +6246,23 @@ pub struct VerifyProgressSnapshot {
     pub checked_pieces: u32,
     pub verified_bytes: u64,
     pub verified_pieces: u32,
+    pub files: Vec<FileVerifySnapshot>,
 }
 
 impl VerifyProgress {
-    fn reset(&self, total_bytes: u64, total_pieces: u32) {
+    fn reset(
+        &self,
+        total_bytes: u64,
+        total_pieces: u32,
+        files: Option<Arc<FileVerifyProgress>>,
+    ) {
         self.total_bytes.store(total_bytes, Ordering::Relaxed);
         self.checked_bytes.store(0, Ordering::Relaxed);
         self.total_pieces.store(total_pieces, Ordering::Relaxed);
         self.checked_pieces.store(0, Ordering::Relaxed);
         self.verified_bytes.store(0, Ordering::Relaxed);
         self.verified_pieces.store(0, Ordering::Relaxed);
+        *self.files.lock().unwrap() = files;
     }
 
     fn record(&self, piece_len: u64, verified: bool) {
@@ -6212,6 +6275,7 @@ impl VerifyProgress {
     }
 
     pub fn snapshot(&self) -> VerifyProgressSnapshot {
+        let files = self.files.lock().unwrap().clone();
         VerifyProgressSnapshot {
             total_bytes: self.total_bytes.load(Ordering::Relaxed),
             checked_bytes: self.checked_bytes.load(Ordering::Relaxed),
@@ -6219,6 +6283,7 @@ impl VerifyProgress {
             checked_pieces: self.checked_pieces.load(Ordering::Relaxed),
             verified_bytes: self.verified_bytes.load(Ordering::Relaxed),
             verified_pieces: self.verified_pieces.load(Ordering::Relaxed),
+            files: files.map(|f| f.snapshots()).unwrap_or_default(),
         }
     }
 }
@@ -6236,6 +6301,8 @@ pub struct ExistingDataPreview {
     pub verified_pieces: u32,
     /// 逐文件已验证字节数（与种子文件顺序一致）。
     pub file_verified: Vec<u64>,
+    /// 逐文件在磁盘上是否存在（不存在/空文件为 false）。
+    pub file_exists: Vec<bool>,
 }
 
 /// 预览 `<dir>` 下某个种子的已有数据：逐片读盘校验，返回可继承的字节。
@@ -6257,11 +6324,14 @@ pub fn preview_existing_data(
         .with_multi_file(meta.info.multi_file);
     let total_bytes = layout.total_length();
     let file_count = layout.files.len();
+    let paths = layout_paths(dir, &meta.info.name, &layout);
+    let file_exists = file_exists_flags(&paths, &layout);
     if !has_existing_data(dir, &meta.info.name, &layout) {
         return ExistingDataPreview {
             total_bytes,
             has_existing_data: false,
             file_verified: vec![0; file_count],
+            file_exists,
             ..Default::default()
         };
     }
@@ -6286,6 +6356,7 @@ pub fn preview_existing_data(
         verified_bytes: check.bytes,
         verified_pieces: check.pieces,
         file_verified,
+        file_exists,
     }
 }
 
@@ -6310,6 +6381,34 @@ pub fn load_saved_torrent(dir: &Path, info_hash: &[u8; 20]) -> Option<TorrentMet
     let bytes = std::fs::read(path).ok()?;
     let meta = xfer_bencode::parse_torrent(&bytes).ok()?;
     (meta.info_hash == *info_hash).then_some(meta)
+}
+
+/// 按布局生成每个文件的落盘路径（单文件为 `<dir>/<name>`）。
+fn layout_paths(dir: &Path, name: &str, layout: &PieceLayout) -> Vec<PathBuf> {
+    let base = dir.join(name);
+    if layout.is_single_file() {
+        return vec![base];
+    }
+    layout
+        .files
+        .iter()
+        .map(|f| base.join(f.path.iter().collect::<PathBuf>()))
+        .collect()
+}
+
+/// 每个文件在磁盘上是否“有数据”（不存在或空文件为 false；种子声明为 0 字节的算存在）。
+fn file_exists_flags(paths: &[PathBuf], layout: &PieceLayout) -> Vec<bool> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(i, path)| {
+            let expected = layout.files.get(i).map(|f| f.length).unwrap_or(0);
+            if expected == 0 {
+                return true;
+            }
+            std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
+        })
+        .collect()
 }
 
 /// 数据目录里是否已经有该种子的非空文件（单文件或多文件布局）。
@@ -6342,8 +6441,10 @@ fn verify_existing_files_blocking(
     if count == 0 || hashes.len() != count as usize {
         return ExistingVerification::default();
     }
-    let single = layout.is_single_file();
-    let base = dir.join(&name);
+    let paths: Arc<[PathBuf]> = layout_paths(&dir, &name, &layout).into();
+    let exists = file_exists_flags(&paths, &layout);
+    let lengths: Vec<u64> = layout.files.iter().map(|f| f.length).collect();
+    let file_progress = Arc::new(FileVerifyProgress::new(lengths, exists));
 
     let mut total_bytes = 0u64;
     let mut total_pieces = 0u32;
@@ -6355,7 +6456,11 @@ fn verify_existing_files_blocking(
         total_pieces += 1;
     }
     if let Some(p) = progress {
-        p.reset(total_bytes, total_pieces);
+        p.reset(
+            total_bytes,
+            total_pieces,
+            Some(file_progress.clone()),
+        );
     }
 
     // 按片分段并行：每个线程拿一段**连续**片号，读盘尽量顺序、哈希互不等待。
@@ -6371,11 +6476,12 @@ fn verify_existing_files_blocking(
             let verified = &verified;
             let layout = &layout;
             let hashes = &hashes;
-            let base = base.clone();
+            let paths = paths.clone();
+            let file_progress = file_progress.clone();
             scope.spawn(move || {
                 let start = worker as u32 * chunk;
                 let end = (start + chunk).min(count);
-                let mut cache = VerifyFileCache::new(base, single, 8);
+                let mut cache = VerifyFileCache::new(paths, 8);
                 let mut local = Vec::new();
                 let mut buf = Vec::new();
                 for idx in start..end {
@@ -6383,11 +6489,13 @@ fn verify_existing_files_blocking(
                         continue;
                     }
                     let len = layout.piece_len(idx);
+                    let segments = layout.piece_segments(idx);
                     let covered = read_piece_into(&mut cache, layout, idx, &mut buf);
                     let ok = covered && verify_piece(&buf, &hashes[idx as usize]);
                     if ok {
                         local.push(idx);
                     }
+                    file_progress.record_segments(&segments, ok);
                     if let Some(p) = progress {
                         p.record(len, ok);
                     }
@@ -6437,7 +6545,7 @@ fn read_piece_into(
     for (fi, off, len) in layout.piece_segments(idx) {
         let pos = buf.len();
         buf.resize(pos + len as usize, 0);
-        let Some(file) = cache.file(&layout.files, fi as usize, off + len) else {
+        let Some(file) = cache.file(fi as usize, off + len) else {
             return false;
         };
         if read_exact_at(file, &mut buf[pos..], off).is_err() {
@@ -6453,38 +6561,31 @@ fn read_piece_into(
 /// 触顶进程 FD 限制，后续文件被当成缺失、校验结果偏小。连续片号通常
 /// 落在同一个文件里，`limit=8` 足够避免反复开关同一文件。
 struct VerifyFileCache {
-    base: PathBuf,
-    single: bool,
+    paths: Arc<[PathBuf]>,
     handles: HashMap<usize, (File, u64)>,
     order: VecDeque<usize>,
     limit: usize,
 }
 
 impl VerifyFileCache {
-    fn new(base: PathBuf, single: bool, limit: usize) -> Self {
+    fn new(paths: Arc<[PathBuf]>, limit: usize) -> Self {
         Self {
-            base,
-            single,
+            paths,
             handles: HashMap::new(),
             order: VecDeque::new(),
             limit: limit.max(1),
         }
     }
 
-    fn file(&mut self, files: &[xfer_storage::FileLayout], fi: usize, need: u64) -> Option<&File> {
+    fn file(&mut self, fi: usize, need: u64) -> Option<&File> {
         if let Some((_, len)) = self.handles.get(&fi) {
             if *len < need {
                 return None;
             }
             return self.handles.get(&fi).map(|(f, _)| f);
         }
-        let layout_file = files.get(fi)?;
-        let path = if self.single {
-            self.base.clone()
-        } else {
-            self.base.join(layout_file.path.iter().collect::<PathBuf>())
-        };
-        let len = std::fs::metadata(&path).ok()?.len();
+        let path = self.paths.get(fi)?;
+        let len = std::fs::metadata(path).ok()?.len();
         if len < need {
             return None;
         }
@@ -7994,6 +8095,16 @@ mod tests {
         assert_eq!(p.total_bytes, 12);
         assert_eq!(p.total_pieces, 3);
         assert_eq!(p.verified_bytes, 8);
+        // 逐文件进度：a 全部检查且通过；b 检查了 6 字节（含缺失片），只通过 2 字节
+        assert_eq!(p.files.len(), 2);
+        assert_eq!(p.files[0].length, 6);
+        assert_eq!(p.files[0].checked_bytes, 6);
+        assert_eq!(p.files[0].verified_bytes, 6);
+        assert!(p.files[0].exists);
+        assert_eq!(p.files[1].length, 6);
+        assert_eq!(p.files[1].checked_bytes, 6);
+        assert_eq!(p.files[1].verified_bytes, 2);
+        assert!(p.files[1].exists);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -8059,6 +8170,10 @@ mod tests {
         assert_eq!(p.checked_pieces, PIECES as u32);
         assert_eq!(p.verified_pieces, (PIECES - 1) as u32);
         assert_eq!(p.total_bytes, (PIECE * PIECES) as u64);
+        assert_eq!(p.files.len(), 1);
+        assert!(p.files[0].exists);
+        assert_eq!(p.files[0].checked_bytes, (PIECE * PIECES) as u64);
+        assert_eq!(p.files[0].verified_bytes, (PIECE * (PIECES - 1)) as u64);
 
         std::fs::remove_dir_all(&root).ok();
     }

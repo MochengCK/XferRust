@@ -260,8 +260,9 @@ pub struct Task {
     pub bt_verified_bitfield: Mutex<Vec<u8>>,
     /// 是否正在做已有数据 SHA-1 校验（此时还未联网下载）。
     pub bt_verifying: AtomicBool,
-    /// 已有数据校验的进度：已处理字节 / 应处理字节（1Hz 同步）。
+    /// 已有数据校验的进度：已处理 / 已验证 / 应处理字节（1Hz 同步）。
     pub bt_verify_checked: AtomicU64,
+    pub bt_verify_verified: AtomicU64,
     pub bt_verify_total: AtomicU64,
     /// HTTP 任务实时分片位图（下载启动时挂接，写线程按落盘区间增量
     /// 维护；BT 任务不使用——分片信息来自 bt_meta）。暂停后保留最后
@@ -362,6 +363,7 @@ impl Task {
             bt_verified_bitfield: Mutex::new(Vec::new()),
             bt_verifying: AtomicBool::new(false),
             bt_verify_checked: AtomicU64::new(0),
+            bt_verify_verified: AtomicU64::new(0),
             bt_verify_total: AtomicU64::new(0),
             http_pieces: RwLock::new(None),
             http_split_stats: RwLock::new(None),
@@ -431,6 +433,7 @@ impl Task {
             bt_verified_bitfield: Mutex::new(Vec::new()),
             bt_verifying: AtomicBool::new(false),
             bt_verify_checked: AtomicU64::new(0),
+            bt_verify_verified: AtomicU64::new(0),
             bt_verify_total: AtomicU64::new(0),
             http_pieces: RwLock::new(None),
             http_split_stats: RwLock::new(None),
@@ -500,6 +503,7 @@ impl Task {
             bt_verified_bitfield: Mutex::new(Vec::new()),
             bt_verifying: AtomicBool::new(false),
             bt_verify_checked: AtomicU64::new(0),
+            bt_verify_verified: AtomicU64::new(0),
             bt_verify_total: AtomicU64::new(0),
             http_pieces: RwLock::new(None),
             http_split_stats: RwLock::new(None),
@@ -1195,6 +1199,7 @@ pub fn status_json_native(task: &Task) -> Value {
     let hash = info_hash_hex(task);
     let verifying = task.bt_verifying.load(Ordering::Relaxed);
     let verify_checked = task.bt_verify_checked.load(Ordering::Relaxed);
+    let verify_verified = task.bt_verify_verified.load(Ordering::Relaxed);
     let verify_total = task.bt_verify_total.load(Ordering::Relaxed);
     json!({
         "gid": s.gid,
@@ -1207,6 +1212,7 @@ pub fn status_json_native(task: &Task) -> Value {
         "verifying": verifying,
         "verifyProgress": {
             "checkedLength": verify_checked,
+            "verifiedLength": verify_verified,
             "totalLength": verify_total,
         },
         "filename": s.filename,

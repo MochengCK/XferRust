@@ -4566,6 +4566,8 @@ fn sync_verify_state(engine: &TorrentEngine, task: &Task) {
     let p = engine.verify_progress();
     task.bt_verify_checked
         .store(p.checked_bytes, Ordering::Relaxed);
+    task.bt_verify_verified
+        .store(p.verified_bytes, Ordering::Relaxed);
     task.bt_verify_total
         .store(p.total_bytes, Ordering::Relaxed);
 }
@@ -4576,8 +4578,10 @@ fn preview_verifying_json(
     p: xfer_bt::VerifyProgressSnapshot,
 ) -> Value {
     let total = meta.info.files.iter().map(|f| f.length).sum::<u64>();
+    // 进度按"已验证字节"算：与最终可继承的已验证大小/后续下载进度同一口径，
+    // 避免坏片/缺失片把进度推到 100% 后再回落到实际进度
     let ratio = if p.total_bytes > 0 {
-        p.checked_bytes as f64 / p.total_bytes as f64
+        p.verified_bytes as f64 / p.total_bytes as f64
     } else {
         0.0
     };
@@ -4592,6 +4596,14 @@ fn preview_verifying_json(
         "checkedPieces": p.checked_pieces,
         "totalPieces": p.total_pieces,
         "progress": ratio,
+        // 逐文件进度：不存在/空文件 exists=false，前端不显示百分比
+        "files": p.files.iter().enumerate().map(|(i, f)| json!({
+            "index": i + 1,
+            "length": f.length,
+            "exists": f.exists,
+            "checkedLength": f.checked_bytes,
+            "verifiedLength": f.verified_bytes,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -4607,6 +4619,9 @@ fn preview_done_json(meta: &TorrentMeta, preview: Option<&ExistingDataPreview>) 
                 "index": i + 1,
                 "path": meta.info.file_rel_path(f),
                 "length": f.length,
+                "exists": preview
+                    .and_then(|p| p.file_exists.get(i).copied())
+                    .unwrap_or(false),
                 "verifiedLength": preview
                     .and_then(|p| p.file_verified.get(i).copied())
                     .unwrap_or(0),
