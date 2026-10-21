@@ -4,6 +4,7 @@
 //! M6：日志轮转（按日滚动 + 大小上限）、崩溃恢复（panic hook + 会话保存）。
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,6 +22,12 @@ async fn main() {
     {
         println!("{ENGINE_NAME} version {ENGINE_VERSION}");
         return;
+    }
+
+    // `xferrust mcp`：stdio ↔ HTTP 转发，供只支持 stdio 的 MCP 客户端调用
+    // 已在运行的本机引擎（不新起引擎、不碰任务）。
+    if raw.first().map(String::as_str) == Some("mcp") {
+        std::process::exit(mcp_stdio(&raw[1..]).await);
     }
 
     let parsed = xfer_engine::parse_args(raw);
@@ -99,6 +106,26 @@ async fn run(cfg: EngineConfig) -> std::io::Result<()> {
     let bind: std::net::SocketAddr = ([127, 0, 0, 1], cfg.rpc_listen_port).into();
     let shutdown = manager.shutdown_token();
     let engine_shutdown = shutdown.clone();
+
+    // MCP：面向本机 AI Agent 的接口，单独端口；未配置时不监听。
+    // 鉴权直接复用 rpc-secret（MCP 服务器在进程内调 Router，同样会带 token）。
+    let mcp_task = match cfg.mcp_listen_port {
+        Some(port) => {
+            let server = Arc::new(xfer_mcp::McpServer::new(
+                router.clone(),
+                cfg.rpc_secret.clone(),
+            ));
+            let bind: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+            let token = shutdown.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = xfer_mcp::serve(bind, server, token).await {
+                    tracing::error!(error = %e, "MCP 服务退出");
+                }
+            }))
+        }
+        None => None,
+    };
+
     let serve = xfer_rpc::serve(bind, router, shutdown);
     let result = tokio::select! {
         r = serve => r,
@@ -108,10 +135,230 @@ async fn run(cfg: EngineConfig) -> std::io::Result<()> {
             Ok(())
         }
     };
+    if let Some(task) = mcp_task {
+        task.abort();
+    }
     if let Some(lan) = lan {
         lan.stop().await;
     }
     result
+}
+
+/// `xferrust mcp`：以 stdio 提供 MCP 服务，供只支持 stdio 的客户端
+/// （Claude Desktop、Cursor 等）直接拉起。
+///
+/// 两种工作方式，对客户端完全透明：
+/// 1. 本机已有引擎在提供 MCP（应用正在运行）→ **转发**给它，任务与界面共享；
+/// 2. 没有 → 在本进程里**直接起一个引擎**（独立会话与下载目录），
+///    因此不需要打开应用也能用，装上应用即可被 AI 调用。
+///
+/// stdout 只允许出现响应帧（MCP 约定），诊断信息一律走 stderr。
+async fn mcp_stdio(args: &[String]) -> i32 {
+    let mut port: u16 = 16801;
+    let mut token: Option<String> = None;
+    let mut dir: Option<PathBuf> = None;
+    let mut session: Option<PathBuf> = None;
+    for arg in args {
+        let Some(kv) = arg.strip_prefix("--") else {
+            continue;
+        };
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        match k {
+            "mcp-listen-port" | "port" => {
+                if let Ok(p) = v.parse() {
+                    port = p;
+                }
+            }
+            "mcp-token" | "rpc-secret" | "token" => {
+                if !v.is_empty() {
+                    token = Some(v.to_string());
+                }
+            }
+            "dir" => {
+                if !v.is_empty() {
+                    dir = Some(PathBuf::from(v));
+                }
+            }
+            "save-session" | "session" => {
+                if !v.is_empty() {
+                    session = Some(PathBuf::from(v));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 探测本机是否已有 MCP 端点（应用里的引擎）
+    if let Some(client) = probe_client() {
+        let health = format!("http://127.0.0.1:{port}/health");
+        let alive = client
+            .get(&health)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if alive {
+            eprintln!("[xferrust mcp] 已连接到运行中的引擎（端口 {port}）");
+            return relay_stdio(client, format!("http://127.0.0.1:{port}/mcp"), token).await;
+        }
+    }
+
+    embedded_stdio(dir, session).await
+}
+
+/// 短超时的 HTTP 客户端：探测本机端点用，别让客户端等太久。
+fn probe_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(800))
+        .build()
+        .ok()
+}
+
+/// 转发模式：逐行把 stdio 上的请求 POST 给本机 MCP 端点。
+async fn relay_stdio(
+    client: reqwest::Client,
+    url: String,
+    token: Option<String>,
+) -> i32 {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None) => return 0,
+            Err(e) => {
+                eprintln!("stdin 读取失败: {e}");
+                return 1;
+            }
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // 出错时也要回一帧错误，否则客户端会一直等这个 id
+        let id = serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v.get("id").cloned())
+            .unwrap_or(serde_json::Value::Null);
+
+        let mut req = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .body(line.to_string());
+        if let Some(t) = &token {
+            req = req.bearer_auth(t);
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if text.is_empty() {
+                    if !status.is_success() {
+                        eprintln!("MCP 请求失败: HTTP {status}");
+                        reply_error(&id, &format!("MCP HTTP {status}"));
+                    }
+                    continue;
+                }
+                println!("{text}");
+                let _ = std::io::stdout().flush();
+            }
+            Err(e) => {
+                eprintln!("MCP 请求失败: {e}");
+                reply_error(&id, &format!("MCP 请求失败: {e}"));
+            }
+        }
+    }
+}
+
+/// 独立模式：本进程内直接起引擎并处理 stdio，不依赖应用是否在运行。
+///
+/// 会话与下载目录与应用分开：应用有自己的会话文件，两个进程写同一份会损坏状态。
+async fn embedded_stdio(dir: Option<PathBuf>, session: Option<PathBuf>) -> i32 {
+    use tokio::io::AsyncBufReadExt;
+
+    let download_dir = dir.unwrap_or_else(default_download_dir);
+    if let Err(e) = std::fs::create_dir_all(&download_dir) {
+        eprintln!("下载目录不可用 {}: {e}", download_dir.display());
+        return 1;
+    }
+    let session_path = session.unwrap_or_else(default_mcp_session_path);
+    if let Some(parent) = session_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let manager = xfer_engine::TaskManager::start_with_session(
+        Some(download_dir.clone()),
+        None,
+        session_path.clone(),
+    );
+    // 回环地址不走代理：Agent 常见的"下载本机/内网地址"场景不该被系统代理拦下。
+    // 其余流量仍按环境变量/系统代理走（与命令行行为一致）。
+    manager.set_initial_options(&[(
+        "no-proxy".to_string(),
+        "localhost,127.0.0.1,::1".to_string(),
+    )]);
+    let router = std::sync::Arc::new(xfer_rpc::Router::new(
+        None,
+        manager.clone(),
+        manager.events(),
+    ));
+    let server = xfer_mcp::McpServer::new(router, None);
+    eprintln!(
+        "[xferrust mcp] 独立模式：下载目录 {}，会话 {}",
+        download_dir.display(),
+        session_path.display()
+    );
+
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("stdin 读取失败: {e}");
+                let _ = manager.save_session();
+                return 1;
+            }
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(resp) = server.handle(line) {
+            println!("{}", serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into()));
+            let _ = std::io::stdout().flush();
+        }
+    }
+    let _ = manager.save_session();
+    0
+}
+
+/// 独立模式的默认会话文件：`~/.xfer/mcp/session.json`（与应用会话分开）。
+fn default_mcp_session_path() -> PathBuf {
+    match xfer_types::home_dir() {
+        Some(home) => home.join(".xfer").join("mcp").join("session.json"),
+        None => PathBuf::from(".xfer-mcp-session.json"),
+    }
+}
+
+/// 独立模式的默认下载目录：`~/Downloads`。
+fn default_download_dir() -> PathBuf {
+    match xfer_types::home_dir() {
+        Some(home) => home.join("Downloads"),
+        None => PathBuf::from("."),
+    }
+}
+
+fn reply_error(id: &serde_json::Value, message: &str) {
+    let frame = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32603, "message": message },
+    });
+    println!("{frame}");
+    let _ = std::io::stdout().flush();
 }
 
 /// 局域网本地状态目录：显式 `--data-dir` 优先；否则跟随会话文件目录

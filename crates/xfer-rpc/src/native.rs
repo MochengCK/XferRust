@@ -21,7 +21,7 @@ pub const NATIVE_PREFIXES: [&str; 4] = ["task.", "engine.", "events.", "lan."];
 ///
 /// 应用端"引擎信息"卡片与 TUI 都读它做能力展示——新增传输/协议能力
 /// （如 HLS）时必须同步到这里，否则引擎明明支持、界面上却看不到。
-pub const ENGINE_FEATURES: [&str; 16] = [
+pub const ENGINE_FEATURES: [&str; 17] = [
     "http",
     "resume",
     "checksum",
@@ -42,6 +42,8 @@ pub const ENGINE_FEATURES: [&str; 16] = [
     "lan",
     // 互传设置（lan.config / lan.setConfig：总开关 / 设备名 / 接收目录）
     "lan-config",
+    // MCP 服务（--mcp-listen-port：AI Agent 可通过 /mcp 调用引擎）
+    "mcp",
 ];
 
 /// 原生协议分发器。

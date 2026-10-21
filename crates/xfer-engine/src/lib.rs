@@ -20,6 +20,11 @@ pub use task::{status_json_native, Status};
 pub struct EngineConfig {
     pub rpc_listen_port: u16,
     pub rpc_secret: Option<String>,
+    /// MCP（Model Context Protocol）服务监听端口；None = 不启用。
+    ///
+    /// 与 JSON-RPC 分开端口：MCP 面向本机 AI Agent（只监听回环地址），
+    /// 鉴权复用 `rpc_secret`，无需另配一套凭据。
+    pub mcp_listen_port: Option<u16>,
     pub download_dir: PathBuf,
     pub max_concurrent: usize,
     pub log_file: Option<PathBuf>,
@@ -40,6 +45,7 @@ impl Default for EngineConfig {
         Self {
             rpc_listen_port: 6800,
             rpc_secret: None,
+            mcp_listen_port: None,
             download_dir: PathBuf::from("."),
             max_concurrent: 5,
             log_file: None,
@@ -91,6 +97,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> ParsedArgs {
                 if !value.is_empty() {
                     cfg.rpc_secret = Some(value.to_string());
                 }
+            }
+            // MCP 服务：0 或空值表示关闭（应用侧用同一个键控制开关）。
+            "mcp-listen-port" => {
+                cfg.mcp_listen_port = value.parse::<u16>().ok().filter(|p| *p > 0);
             }
             "dir" => cfg.download_dir = PathBuf::from(value),
             "max-concurrent-downloads" => {
@@ -210,6 +220,17 @@ mod tests {
         assert!(p.ignored.is_empty());
         assert!(p.config.initial_options.contains(&("bt-port-mapping".to_string(), "true".to_string())));
         assert!(p.config.initial_options.contains(&("bt-protocol".to_string(), "tcp".to_string())));
+    }
+
+    #[test]
+    fn parses_mcp_listen_port() {
+        let p = parse_args(["--mcp-listen-port=16801".to_string()]);
+        assert_eq!(p.config.mcp_listen_port, Some(16801));
+        // 0 与非法值都表示关闭，且不再作为外部默认参数存储
+        assert_eq!(parse_args(["--mcp-listen-port=0".to_string()]).config.mcp_listen_port, None);
+        assert_eq!(parse_args(["--mcp-listen-port=x".to_string()]).config.mcp_listen_port, None);
+        assert_eq!(parse_args([]).config.mcp_listen_port, None);
+        assert!(p.config.initial_options.is_empty());
     }
 
     #[test]
