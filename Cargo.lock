@@ -2647,7 +2647,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xfer-bencode"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "hex",
  "proptest",
@@ -2658,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-bt"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "futures-util",
@@ -2684,7 +2684,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-crypto"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -2695,7 +2695,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-dht"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "getrandom 0.3.4",
  "hex",
@@ -2712,7 +2712,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-discovery"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "getrandom 0.3.4",
@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-engine"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "base64",
@@ -2757,11 +2757,11 @@ dependencies = [
 
 [[package]]
 name = "xfer-geo"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "xfer-http"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes",
  "axum",
@@ -2785,7 +2785,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-lan"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-mcp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "base64",
@@ -2817,7 +2817,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-rpc"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "base64",
@@ -2842,7 +2842,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-storage"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "hex",
  "libc",
@@ -2856,7 +2856,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-transport"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "getrandom 0.3.4",
  "tokio",
@@ -2865,7 +2865,7 @@ dependencies = [
 
 [[package]]
 name = "xfer-types"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "encoding_rs",
  "getrandom 0.3.4",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "xferrust"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64",
  "crossterm",

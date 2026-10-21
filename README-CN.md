@@ -410,10 +410,11 @@ xferrust --rpc-listen-port=6800 --rpc-secret=mytoken
 // 请求
 {"jsonrpc": "2.0", "id": 1, "method": "engine.getVersion", "params": {"token": "mytoken"}}
 // 成功响应
-{"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.4.0",
+{"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.5.0",
  "features": ["http", "resume", "checksum", "bt", "hls", "flv", "events",
               "bitfield", "wanted-bitfield", "ban-peer", "change-uri",
-              "get-servers", "verify-files", "playhead", "lan", "lan-config"]}}
+              "get-servers", "verify-files", "playhead", "lan", "lan-config",
+              "mcp"]}}
 // 错误响应
 {"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": "Unauthorized"}}
 ```
