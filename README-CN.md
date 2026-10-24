@@ -5,7 +5,7 @@
 # XferRust
 
 一个用 Rust 编写的高性能、低资源占用的独立下载引擎，支持 **HTTP(S)**、
-**HLS（M3U8）**、**HTTP-FLV** 与 **BitTorrent（BT）** 下载。自带全屏终端界面，也可作为
+**HLS（M3U8）**、**HTTP-FLV**、**SFTP** 与 **BitTorrent（BT）** 下载。自带全屏终端界面，也可作为
 后台服务运行，供网页端、桌面应用等客户端通过 JSON-RPC 远程控制。
 
 ## 它能做什么
@@ -28,6 +28,14 @@
   可播的内容，`liveRecordedMs` 给出真实录制时长；断线自动重连续录，暂停
   保留已录内容。带 `Content-Length` 的 FLV 是点播文件，仍走普通下载；
   `flv=false` 关闭嗅探，`flv=true` 可强制录制不报类型也不带扩展名的地址。
+- **SFTP**：`sftp://user:pass@host:port/path` 单文件下载。同一条 SSH 连接
+  多通道并行读、1 MiB 片位图断点续传（`sftp-connections`，默认跟随 `split`，
+  上限 8）。认证支持 URL 内嵌密码 / `sftp-password`，以及 OpenSSH 私钥
+  （`sftp-private-key` + 可选 `sftp-private-key-passphrase`）。主机密钥默认
+  TOFU：读取 `~/.ssh/known_hosts`，首次连接记录到引擎自己的
+  `sftp_known_hosts`，之后指纹变化直接拒绝；`sftp-strict-host-key=true`
+  要求预先录入，`sftp-known-hosts` 可指定信任库，`sftp-timeout` 控制连接 /
+  请求超时（秒）。目前只支持单文件，目录会明确报错。
 - **BitTorrent**：种子与磁力链接，多 peer 并行 + rarest-first 选片；底层是
   完整网络栈：DHT（BEP 5）、IPv6 DHT（BEP 32）、peer 交换（BEP 11）、
   本地节点发现、uTP 与 MSE/PE 加密。
@@ -411,10 +419,10 @@ xferrust --rpc-listen-port=6800 --rpc-secret=mytoken
 {"jsonrpc": "2.0", "id": 1, "method": "engine.getVersion", "params": {"token": "mytoken"}}
 // 成功响应
 {"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.5.0",
- "features": ["http", "resume", "checksum", "bt", "hls", "flv", "events",
-              "bitfield", "wanted-bitfield", "ban-peer", "change-uri",
-              "get-servers", "verify-files", "playhead", "lan", "lan-config",
-              "mcp"]}}
+ "features": ["http", "resume", "checksum", "bt", "hls", "flv", "sftp",
+              "events", "bitfield", "wanted-bitfield", "ban-peer",
+              "change-uri", "get-servers", "verify-files", "playhead", "lan",
+              "lan-config", "mcp"]}}
 // 错误响应
 {"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": "Unauthorized"}}
 ```
@@ -513,6 +521,7 @@ xferrust --rpc-listen-port=6800 --rpc-secret=mytoken
 | HTTP | `split`、`max-connection-per-server`、`min-split-size`、`max-overall-download-limit`、`max-overall-upload-limit`、`user-agent`、`all-proxy`、`no-proxy` |
 | BitTorrent | `bt-max-peers`、`bt-adaptive`、`bt-encryption`、`bt-protocol`、`bt-seed-mode`、`bt-seed-ratio`、`bt-seed-time`、`bt-trackers`、`bt-ip-ban-list`、`auto-update-trackers`、`bt-listen-port`、`bt-enable-lpd`、`bt-port-mapping`、`bt-save-metadata`、`bt-load-saved-metadata` |
 | 节点发现 | `enable-dht`、`enable-dht6`、`enable-peer-exchange`、`dht-listen-port` |
+| SFTP | `sftp-user`、`sftp-password`、`sftp-private-key`、`sftp-key`、`sftp-private-key-passphrase`、`sftp-known-hosts`、`sftp-strict-host-key`、`sftp-connections`、`sftp-timeout` |
 | 存储 | `disk-cache` |
 
 说明：

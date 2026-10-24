@@ -176,7 +176,11 @@ fn main() {
             0
         }
         None => cmd_tui(&[]),
-        Some(other) if other.starts_with("http://") || other.starts_with("https://") => {
+        Some(other)
+            if other.starts_with("http://")
+                || other.starts_with("https://")
+                || other.starts_with("sftp://") =>
+        {
             cmd_download(&args[..])
         }
         Some(other) => {

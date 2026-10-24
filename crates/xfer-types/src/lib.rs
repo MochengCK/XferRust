@@ -2,6 +2,7 @@
 //!
 //! 依赖方向的根：所有 crate 都可以依赖本 crate，本 crate 不依赖任何兄弟 crate。
 
+pub mod rate;
 pub mod text;
 
 /// 引擎版本。与 XferRust 的 Cargo.toml version 保持同步，

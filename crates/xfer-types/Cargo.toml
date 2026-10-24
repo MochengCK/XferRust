@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tokio = { workspace = true }
 hex = { workspace = true }
 getrandom = { workspace = true }
 encoding_rs = { workspace = true }

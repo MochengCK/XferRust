@@ -6,7 +6,6 @@
 mod adaptive;
 mod flv;
 mod playlist;
-mod rate;
 mod split;
 #[cfg(test)]
 mod testutil;
@@ -23,7 +22,8 @@ pub use playlist::{
     PlaylistDone, PlaylistOptions, PlaylistPlan, PlaylistStats, Segment as PlaylistSegment,
     SegmentKey as PlaylistKey, DEFAULT_SEGMENT_RETRIES,
 };
-pub use rate::RateLimiter;
+pub(crate) use xfer_types::rate;
+pub use xfer_types::rate::RateLimiter;
 pub use split::{
     ctrl_path, download_split, ConnSnapshot, PieceSnapshot, PieceTrack, SplitDone, SplitOptions,
     SplitStats,

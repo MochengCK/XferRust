@@ -15,6 +15,7 @@ hex = { workspace = true }
 reqwest = { workspace = true }
 xfer-types = { path = "../xfer-types" }
 xfer-http = { path = "../xfer-http" }
+xfer-sftp = { path = "../xfer-sftp" }
 xfer-storage = { path = "../xfer-storage" }
 xfer-bt = { path = "../xfer-bt" }
 xfer-bencode = { path = "../xfer-bencode" }
@@ -35,3 +36,4 @@ xfer-types = { path = "../xfer-types" }
 xfer-bencode = { path = "../xfer-bencode" }
 xfer-bt = { path = "../xfer-bt" }
 xfer-http = { path = "../xfer-http" }
+xfer-sftp = { path = "../xfer-sftp" }

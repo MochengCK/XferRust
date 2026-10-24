@@ -119,7 +119,7 @@ impl McpServer {
                 "version": ENGINE_VERSION,
             },
             "instructions": "XferRust download engine. Use the tools to add and manage \
-HTTP(S), BitTorrent, magnet and HLS downloads on the local machine, and to send \
+HTTP(S), BitTorrent, magnet, HLS and SFTP downloads on the local machine, and to send \
 files to other devices over the LAN (Lerxu互传).",
         })
     }
@@ -352,7 +352,7 @@ pub fn tools() -> Value {
     json!([
         {
             "name": "add_url",
-            "description": "Add an HTTP(S) or HLS (M3U8) download task. 按 URL 新建下载任务。",
+            "description": "Add an HTTP(S), HLS (M3U8) or SFTP download task. 按 URL 新建下载任务。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

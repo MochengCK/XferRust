@@ -6,13 +6,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Instant, SystemTime};
 
+use crate::manager::parse_size_bytes;
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 use xfer_bencode::{Info, TorrentMeta};
 use xfer_bt::PeerInfo;
 use xfer_storage::{files_done_bytes, HashAlgo};
 use xfer_types::Gid;
-use crate::manager::parse_size_bytes;
 
 /// 任务状态（协议字段值）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +61,8 @@ pub enum TaskKind {
     Bt,
     /// HLS（M3U8）播放列表：先取清单，再并发拉分片并顺序拼接。
     Playlist,
+    /// SFTP：SSH 上的单文件下载，多通道分片 + 位图断点续传。
+    Sftp,
 }
 
 impl TaskKind {
@@ -69,6 +71,7 @@ impl TaskKind {
             TaskKind::Http => "http",
             TaskKind::Bt => "bt",
             TaskKind::Playlist => "playlist",
+            TaskKind::Sftp => "sftp",
         }
     }
 }
@@ -131,8 +134,15 @@ pub fn detect_kind(uris: &[String], options: &HashMap<String, String>) -> TaskKi
     if uris.iter().any(|u| u.trim().starts_with("magnet:")) {
         return TaskKind::Bt;
     }
+    if uris.iter().any(|u| xfer_sftp::is_sftp_url(u)) {
+        return TaskKind::Sftp;
+    }
     if let Some(on) = hls_option_value(options) {
-        return if on { TaskKind::Playlist } else { TaskKind::Http };
+        return if on {
+            TaskKind::Playlist
+        } else {
+            TaskKind::Http
+        };
     }
     if uris.iter().any(|u| is_playlist_url(u)) {
         TaskKind::Playlist
@@ -146,7 +156,8 @@ pub fn detect_kind(uris: &[String], options: &HashMap<String, String>) -> TaskKi
 pub enum UriState {
     Used,
     Waiting,
-}impl UriState {
+}
+impl UriState {
     pub fn as_str(self) -> &'static str {
         match self {
             UriState::Used => "used",
@@ -178,6 +189,9 @@ pub enum TaskFailure {
     /// BT 下载失败（tracker/连接/存储等）。
     #[error("{0}")]
     Bt(String),
+    /// SFTP 下载失败（连接/认证/主机密钥/远端读取等）。
+    #[error(transparent)]
+    Sftp(#[from] xfer_sftp::SftpError),
     /// 用户取消（pause/remove 触发，与 HTTP 取消语义一致）。
     #[error("已取消")]
     Cancelled,
@@ -190,6 +204,7 @@ impl TaskFailure {
             TaskFailure::Http(e) => e.error_code(),
             TaskFailure::Checksum(_) => 9,
             TaskFailure::Bt(_) => 1,
+            TaskFailure::Sftp(e) => e.error_code(),
             TaskFailure::Cancelled => 0,
         }
     }
@@ -197,7 +212,9 @@ impl TaskFailure {
     pub fn is_cancelled(&self) -> bool {
         matches!(
             self,
-            TaskFailure::Http(xfer_http::HttpError::Cancelled) | TaskFailure::Cancelled
+            TaskFailure::Http(xfer_http::HttpError::Cancelled)
+                | TaskFailure::Sftp(xfer_sftp::SftpError::Cancelled)
+                | TaskFailure::Cancelled
         )
     }
 }
@@ -621,7 +638,8 @@ impl Task {
     }
 
     /// 任务级 HTTP 限速器（惰性创建，rate 由 Manager 同步维护）。
-    pub fn http_task_limiter(&self) -> Arc<xfer_http::RateLimiter> {        self.http_limiter
+    pub fn http_task_limiter(&self) -> Arc<xfer_http::RateLimiter> {
+        self.http_limiter
             .get_or_init(|| xfer_http::RateLimiter::new(0))
             .clone()
     }
@@ -902,7 +920,8 @@ fn wanted_bitfield(info: &Info, sel: Option<&[usize]>) -> Vec<u8> {
 
 /// 计算 BT 任务的 info_hash 十六进制表示（None = 非 BT 任务）。
 /// .torrent 任务 bt_info_hash 不落盘，回退取 bt_meta 解析时计算的哈希。
-fn info_hash_hex(task: &Task) -> Option<String> {    if let Some(h) = &*task.bt_info_hash.lock().unwrap() {
+fn info_hash_hex(task: &Task) -> Option<String> {
+    if let Some(h) = &*task.bt_info_hash.lock().unwrap() {
         return Some(h.iter().map(|b| format!("{b:02x}")).collect());
     }
     task.bt_meta
@@ -920,7 +939,13 @@ fn bittorrent_json(task: &Task, hash: Option<&str>) -> Value {
     let Some(hash) = hash else {
         return Value::Null;
     };
-    match task.bt_meta.lock().unwrap().as_ref().map(|m| m.info.name.clone()) {
+    match task
+        .bt_meta
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|m| m.info.name.clone())
+    {
         Some(name) => json!({
             "info": {
                 "name": name,
@@ -941,10 +966,7 @@ fn average_speed_of(task: &Task) -> u64 {
     if ms < 1000 {
         return 0;
     }
-    task.avg_bytes
-        .load(Ordering::Relaxed)
-        .saturating_mul(1000)
-        / ms
+    task.avg_bytes.load(Ordering::Relaxed).saturating_mul(1000) / ms
 }
 
 /// 任务状态 → 前端兼容协议 JSON（数值以字符串承载）。
@@ -1057,7 +1079,10 @@ pub fn status_json(task: &Task) -> Value {
         json!(average_speed_of(task).to_string()),
     );
     m.insert("bitfield".into(), json!(bitfield_hex(&status_bitfield)));
-    m.insert("partialBitfield".into(), json!(bitfield_hex(&partial_bitfield)));
+    m.insert(
+        "partialBitfield".into(),
+        json!(bitfield_hex(&partial_bitfield)),
+    );
     // 需下载片位图（未选择文件覆盖的片为 0；全选时为空串）
     m.insert(
         "wantedBitfield".into(),
@@ -1289,6 +1314,47 @@ mod tests {
     }
 
     #[test]
+    fn detect_kind_recognizes_sftp_before_http_and_hls() {
+        let opts = HashMap::new();
+        assert_eq!(
+            detect_kind(&["sftp://user@host/a.bin".into()], &opts),
+            TaskKind::Sftp
+        );
+        assert_eq!(
+            detect_kind(&["SFTP://user@host/a.bin".into()], &opts),
+            TaskKind::Sftp
+        );
+        // sftp 优先级高于清单后缀/显式 hls：同一批 URI 里有 sftp 就按 sftp 任务
+        let mut hls = HashMap::new();
+        hls.insert("hls".to_string(), "true".to_string());
+        assert_eq!(
+            detect_kind(&["sftp://h/a.m3u8".into()], &hls),
+            TaskKind::Sftp
+        );
+        assert_eq!(
+            detect_kind(&["https://h/a.m3u8".into()], &opts),
+            TaskKind::Playlist
+        );
+        assert_eq!(
+            detect_kind(&["https://h/sftp://x".into()], &opts),
+            TaskKind::Http
+        );
+    }
+
+    #[test]
+    fn sftp_error_codes_and_retryability() {
+        use xfer_sftp::SftpError;
+        assert_eq!(SftpError::Timeout.error_code(), 2);
+        assert_eq!(SftpError::NotFound("x".into()).error_code(), 3);
+        assert_eq!(SftpError::Connect("x".into()).error_code(), 5);
+        assert_eq!(SftpError::Auth("x".into()).error_code(), 1);
+        assert_eq!(SftpError::Cancelled.error_code(), 0);
+        assert!(SftpError::Connect("x".into()).is_retryable());
+        assert!(!SftpError::Auth("x".into()).is_retryable());
+        assert!(TaskFailure::Sftp(SftpError::Cancelled).is_cancelled());
+    }
+
+    #[test]
     fn files_done_bytes_attributes_per_piece_segment() {
         // 文件 15 / 10 / 5，片长 10：片 1 跨 0-1，片 2 跨 1-2
         let info = info_of(&[15, 10, 5]);
@@ -1300,7 +1366,10 @@ mod tests {
         );
         // 只完成片 0（0x80）：未选文件的字节不得因「整体有进度」被估算出来
         let bf0 = bits_from("80");
-        assert_eq!(bt_files_done_bytes(&info, &bf0, None, false), vec![10, 0, 0]);
+        assert_eq!(
+            bt_files_done_bytes(&info, &bf0, None, false),
+            vec![10, 0, 0]
+        );
         // 只完成片 1（0x40，跨文件 0/1）：两侧各计自己那 5 字节
         let bf1 = bits_from("40");
         assert_eq!(bt_files_done_bytes(&info, &bf1, None, false), vec![5, 5, 0]);
@@ -1342,7 +1411,10 @@ mod tests {
         // 只勾选文件 0（片 0 全在其中、片 1 跨文件 0/1）→ 0b110xxxxx
         assert_eq!(bitfield_hex(&wanted_bitfield(&info, Some(&[0]))), "c0");
         // 勾选全部文件 = 全 1 位图（与 bitfield 全满一致）
-        assert_eq!(bitfield_hex(&wanted_bitfield(&info, Some(&[0, 1, 2]))), "e0");
+        assert_eq!(
+            bitfield_hex(&wanted_bitfield(&info, Some(&[0, 1, 2]))),
+            "e0"
+        );
     }
 
     #[test]

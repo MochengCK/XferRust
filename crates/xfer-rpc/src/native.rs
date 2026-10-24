@@ -21,7 +21,7 @@ pub const NATIVE_PREFIXES: [&str; 4] = ["task.", "engine.", "events.", "lan."];
 ///
 /// 应用端"引擎信息"卡片与 TUI 都读它做能力展示——新增传输/协议能力
 /// （如 HLS）时必须同步到这里，否则引擎明明支持、界面上却看不到。
-pub const ENGINE_FEATURES: [&str; 17] = [
+pub const ENGINE_FEATURES: [&str; 18] = [
     "http",
     "resume",
     "checksum",
@@ -38,6 +38,8 @@ pub const ENGINE_FEATURES: [&str; 17] = [
     "verify-files",
     // 边下边播：task.setPlayhead（播放头附近的片优先下载）
     "playhead",
+    // SFTP 单文件下载（sftp://，多通道分片+位图续传）
+    "sftp",
     // 局域网文件传输（lan.peers / lan.tasks / lan.send …）
     "lan",
     // 互传设置（lan.config / lan.setConfig：总开关 / 设备名 / 接收目录）

@@ -5,8 +5,8 @@
 # XferRust
 
 A high-performance, lightweight standalone download engine written in Rust,
-supporting **HTTP(S)**, **HLS (M3U8)**, **HTTP-FLV** and **BitTorrent (BT)**
-downloads. It
+supporting **HTTP(S)**, **HLS (M3U8)**, **HTTP-FLV**, **SFTP** and
+**BitTorrent (BT)** downloads. It
 ships with a full-screen terminal UI and can also run as a background daemon
 controlled over JSON-RPC by web apps, desktop applications and other clients.
 
@@ -37,6 +37,18 @@ controlled over JSON-RPC by web apps, desktop applications and other clients.
   everything recorded so far. A FLV served **with** a `Content-Length` is a
   plain file and downloads normally; `flv=false` disables sniffing, `flv=true`
   forces recording for endpoints that advertise neither type nor extension.
+- **SFTP**: single-file downloads from `sftp://user:pass@host:port/path`.
+  Multiple SFTP channels over one SSH connection read 1 MiB pieces in
+  parallel, with a bitmap control file for resume (`sftp-connections`,
+  defaulting to `split`, capped at 8). Authentication supports a password in
+  the URL or in `sftp-password`, plus OpenSSH private keys
+  (`sftp-private-key` with an optional `sftp-private-key-passphrase`). Host
+  keys are TOFU by default: `~/.ssh/known_hosts` is trusted, first-seen keys
+  are recorded in the engine's own `sftp_known_hosts`, and a changed
+  fingerprint is rejected. `sftp-strict-host-key=true` requires keys to be
+  pre-recorded, `sftp-known-hosts` selects the trust store, and
+  `sftp-timeout` sets connect/request timeouts in seconds. Directories are
+  not supported and fail with a clear error.
 - **BitTorrent** torrents and magnet links with multi-peer parallel
   downloading and rarest-first piece selection, on top of a complete network
   stack: DHT (BEP 5), IPv6 DHT (BEP 32), peer exchange (BEP 11), local peer
@@ -469,10 +481,10 @@ array response; only entries carrying an `id` are answered).
 {"jsonrpc": "2.0", "id": 1, "method": "engine.getVersion", "params": {"token": "mytoken"}}
 // Success response
 {"jsonrpc": "2.0", "id": 1, "result": {"name": "XferRust", "version": "0.5.0",
- "features": ["http", "resume", "checksum", "bt", "hls", "flv", "events",
-              "bitfield", "wanted-bitfield", "ban-peer", "change-uri",
-              "get-servers", "verify-files", "playhead", "lan", "lan-config",
-              "mcp"]}}
+ "features": ["http", "resume", "checksum", "bt", "hls", "flv", "sftp",
+              "events", "bitfield", "wanted-bitfield", "ban-peer",
+              "change-uri", "get-servers", "verify-files", "playhead", "lan",
+              "lan-config", "mcp"]}}
 // Error response
 {"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": "Unauthorized"}}
 ```
@@ -581,6 +593,7 @@ it simply has no effect until the engine implements it):
 | HTTP | `split`, `max-connection-per-server`, `min-split-size`, `max-overall-download-limit`, `max-overall-upload-limit`, `user-agent`, `all-proxy`, `no-proxy` |
 | BitTorrent | `bt-max-peers`, `bt-adaptive`, `bt-encryption`, `bt-protocol`, `bt-seed-mode`, `bt-seed-ratio`, `bt-seed-time`, `bt-trackers`, `bt-ip-ban-list`, `auto-update-trackers`, `bt-listen-port`, `bt-enable-lpd`, `bt-port-mapping`, `bt-save-metadata`, `bt-load-saved-metadata` |
 | Discovery | `enable-dht`, `enable-dht6`, `enable-peer-exchange`, `dht-listen-port` |
+| SFTP | `sftp-user`, `sftp-password`, `sftp-private-key`, `sftp-key`, `sftp-private-key-passphrase`, `sftp-known-hosts`, `sftp-strict-host-key`, `sftp-connections`, `sftp-timeout` |
 | Storage | `disk-cache` |
 
 Notes:

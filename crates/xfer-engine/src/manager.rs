@@ -24,9 +24,7 @@ use crate::task::{
     detect_kind, filter_keys, snapshot, status_json, status_json_native, Intent, Status, Task,
     TaskFailure, TaskKind,
 };
-use xfer_storage::{
-    existing_len, file_digest_hex, verify_file_hash, FileSink, HashAlgo,
-};
+use xfer_storage::{existing_len, file_digest_hex, verify_file_hash, FileSink, HashAlgo};
 
 /// 事件负载：(事件名, gid)，RPC 层拼装线上通知帧。
 pub type EngineEvent = (String, String);
@@ -159,18 +157,16 @@ fn release_tracker_claim(inner: &mut Inner, sub_id: &str, url: &str) -> bool {
         srcs.remove(sub_id);
     }
     // 仍有其他来源（含手动）认领 → 保留
-    let srcs_empty = inner
-        .tracker_sources
-        .get(url)
-        .is_none_or(|s| s.is_empty());
+    let srcs_empty = inner.tracker_sources.get(url).is_none_or(|s| s.is_empty());
     if !srcs_empty {
         return false;
     }
     // 无认领：若其他启用订阅源上次仍提供 → 保留（暂处无来源态，
     // 由提供方下次刷新重新认领）
-    let other_provides = inner.tracker_subscriptions.iter().any(|s| {
-        s.id != sub_id && s.enabled && s.last_trackers.iter().any(|t| t == url)
-    });
+    let other_provides = inner
+        .tracker_subscriptions
+        .iter()
+        .any(|s| s.id != sub_id && s.enabled && s.last_trackers.iter().any(|t| t == url));
     if other_provides {
         return false;
     }
@@ -472,11 +468,8 @@ impl TaskManager {
             // guard 在 unwind 时同样会清），否则任务会永久等在门口
             let _ready = ClientBuildGuard(me.client_busy.clone());
             let (ua, proxy, no_proxy) = sig;
-            let client = xfer_http::build_client_with(
-                ua.as_deref(),
-                proxy.as_deref(),
-                no_proxy.as_deref(),
-            );
+            let client =
+                xfer_http::build_client_with(ua.as_deref(), proxy.as_deref(), no_proxy.as_deref());
             *me.client.write().unwrap() = client;
             tracing::info!(
                 proxy = proxy.as_deref().unwrap_or("(直连)"),
@@ -640,7 +633,10 @@ impl TaskManager {
                 .unwrap_or(0);
             let mut restored: HashMap<IpAddr, BtBanEntry> = HashMap::new();
             for entry in bans {
-                let Some(ip) = entry.get("ip").and_then(Value::as_str).and_then(|s| s.parse().ok())
+                let Some(ip) = entry
+                    .get("ip")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse().ok())
                 else {
                     continue;
                 };
@@ -656,13 +652,7 @@ impl TaskManager {
                     .get("manual")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                restored.insert(
-                    ip,
-                    BtBanEntry {
-                        expires,
-                        manual,
-                    },
-                );
+                restored.insert(ip, BtBanEntry { expires, manual });
             }
             if !restored.is_empty() {
                 mgr.inner.lock().unwrap().bt_bans = restored;
@@ -854,10 +844,19 @@ impl TaskManager {
                 // 恢复累计活跃时长（暂停任务重启后已用时不丢）
                 sh.active_ms = t["elapsedMs"].as_u64().unwrap_or(0);
                 sh.active_since = None;
-                sh.path = t["path"].as_str().map(PathBuf::from);
-                sh.filename = t["path"]
+                // 空字符串 = 会话保存时还没解析出路径（新增后立刻退出）；
+                // 必须当 None，否则恢复后会把 "" 当目标路径直接写入失败。
+                sh.path = t["path"]
                     .as_str()
-                    .map(|p| p.rsplit(['/', '\\']).next().unwrap_or("").to_string());
+                    .filter(|p| !p.is_empty())
+                    .map(PathBuf::from);
+                sh.filename = sh.path.as_ref().map(|p| {
+                    p.to_string_lossy()
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                });
                 sh.error_code = t["errorCode"].as_i64().unwrap_or(0);
                 sh.error_message = t["errorMessage"].as_str().unwrap_or("").to_string();
                 // 恢复完成/错误时间戳（仅终态任务有意义；重新入队时保持 0）
@@ -1042,11 +1041,7 @@ impl TaskManager {
             text.hash(&mut h);
             h.finish()
         };
-        if self
-            .session_hash
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == hash
-        {
+        if self.session_hash.load(std::sync::atomic::Ordering::Relaxed) == hash {
             tracing::trace!(path = %path.display(), "会话内容未变化，跳过写入");
             return;
         }
@@ -1174,6 +1169,18 @@ impl TaskManager {
                     panic_downcast(panic)
                 )))),
             }
+        } else if matches!(kind, TaskKind::Sftp) {
+            match std::panic::AssertUnwindSafe(drive_sftp(&self, &task, &cancel))
+                .catch_unwind()
+                .await
+            {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err(e),
+                Err(panic) => Err(TaskFailure::Sftp(xfer_sftp::SftpError::Protocol(format!(
+                    "任务 panic: {}",
+                    panic_downcast(panic)
+                )))),
+            }
         } else {
             match std::panic::AssertUnwindSafe(drive_download(&self, &task, &cancel))
                 .catch_unwind()
@@ -1294,7 +1301,10 @@ impl TaskManager {
             }
         }
         self.kick();
-        if terminal {
+        // 暂停也要立刻落盘：原先只在终态保存，暂停进度要等 30s 周期或
+        // 客户端主动 saveSession；这期间进程退出会把"已下 8MiB"回退成
+        // 会话里的旧值（重启后 UI 归零，虽然控制文件还能续传）。
+        if terminal || task.status() == Status::Paused {
             self.save_session_now();
         }
     }
@@ -1336,7 +1346,15 @@ impl TaskManager {
         let kind = detect_kind(&uris, &task_opts);
 
         let gid = Gid::generate();
-        let task = Arc::new(Task::new(gid.clone(), kind, uris, dir, out, checksum, task_opts));
+        let task = Arc::new(Task::new(
+            gid.clone(),
+            kind,
+            uris,
+            dir,
+            out,
+            checksum,
+            task_opts,
+        ));
         {
             let mut inner = self.inner.lock().unwrap();
             inner.tasks.insert(gid.clone(), task);
@@ -1411,8 +1429,7 @@ impl TaskManager {
                     .as_ref()
                     .map(|m| m.info.files.len())
                     .unwrap_or(0);
-                let mut sel: Vec<usize> =
-                    indices.into_iter().filter(|i| *i < count).collect();
+                let mut sel: Vec<usize> = indices.into_iter().filter(|i| *i < count).collect();
                 if sel.is_empty() {
                     tracing::warn!(%raw, "select-file 全部越界，按全选处理");
                 } else {
@@ -1563,7 +1580,11 @@ impl TaskManager {
                 sh.error_message.clear();
             }
             task.finished_at.store(0, Ordering::Relaxed);
-            self.inner.lock().unwrap().stopped_order.retain(|g| g != gid);
+            self.inner
+                .lock()
+                .unwrap()
+                .stopped_order
+                .retain(|g| g != gid);
         }
         // 磁力解析流程：等待文件选择的任务必须先勾选文件
         // （元数据在重启后丢失时例外——恢复下载会重新解析并再次暂停）
@@ -1846,6 +1867,66 @@ impl TaskManager {
         )
     }
 
+    /// SFTP 任务选项：任务选项 > 全局选项 > 默认值。
+    fn sftp_options(&self, task: &Task) -> xfer_sftp::SftpOptions {
+        let g = self.inner.lock().unwrap().global_options.clone();
+        let t = task.options.lock().unwrap().clone();
+        let get = |k: &str| {
+            t.get(k)
+                .or_else(|| g.get(k))
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+        };
+        let flag = |k: &str, d: bool| {
+            get(k)
+                .map(|v| {
+                    !matches!(
+                        v.to_ascii_lowercase().as_str(),
+                        "false" | "0" | "no" | "off"
+                    )
+                })
+                .unwrap_or(d)
+        };
+        let num = |k: &str, d: usize| {
+            get(k)
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(d)
+        };
+        let connections =
+            num("sftp-connections", num("split", DEFAULT_SPLIT_CONNECTIONS)).clamp(1, 8);
+        let timeout_secs = num("sftp-timeout", 30).clamp(5, 300) as u64;
+        let known_hosts = get("sftp-known-hosts")
+            .map(normalize_dir)
+            .unwrap_or_else(|| self.sftp_known_hosts_path());
+        xfer_sftp::SftpOptions {
+            user: get("sftp-user").map(String::from),
+            password: get("sftp-password").map(String::from),
+            private_key: get("sftp-private-key")
+                .or_else(|| get("sftp-key"))
+                .map(normalize_dir),
+            private_key_passphrase: get("sftp-private-key-passphrase").map(String::from),
+            known_hosts,
+            strict_host_key: flag("sftp-strict-host-key", false),
+            connections,
+            timeout_secs,
+        }
+    }
+
+    /// 引擎自己的 SFTP 信任库：默认与 session.json 同目录（应用 userData），
+    /// 无会话文件时退回 `~/.xfer/sftp_known_hosts`。
+    fn sftp_known_hosts_path(&self) -> PathBuf {
+        let session = self.inner.lock().unwrap().session.clone();
+        session
+            .and_then(|p| p.parent().map(|d| d.join("sftp_known_hosts")))
+            .unwrap_or_else(|| {
+                xfer_types::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".xfer")
+                    .join("sftp_known_hosts")
+            })
+    }
+
     // ------------------------------------------------------------------
     // 目标路径解析（含 claims 冲突检查）
     // ------------------------------------------------------------------
@@ -1938,12 +2019,14 @@ impl TaskManager {
         //   "没人设过"的 split 默认值吃掉，实际只跑 16 路（实测并发 32 在
         //   CDN 限制单连接吞吐时明显更快）。
         let concurrency = explicit("hls-concurrency")
-            .or_else(|| match (explicit("split"), explicit("max-connection-per-server")) {
-                (Some(s), Some(m)) => Some(s.min(m)),
-                (Some(s), None) => Some(s),
-                (None, Some(m)) => Some(m),
-                (None, None) => None,
-            })
+            .or_else(
+                || match (explicit("split"), explicit("max-connection-per-server")) {
+                    (Some(s), Some(m)) => Some(s.min(m)),
+                    (Some(s), None) => Some(s),
+                    (None, Some(m)) => Some(m),
+                    (None, None) => None,
+                },
+            )
             .unwrap_or(DEFAULT_HLS_CONNECTIONS)
             .clamp(1, MAX_HLS_CONNECTIONS);
         let retries = get("hls-segment-retries")
@@ -2095,10 +2178,10 @@ impl TaskManager {
             task.live_recorded_ms.store(live_ms, Ordering::Relaxed);
 
             let stats = xfer_http::PlaylistStats::new(resume_bytes);
-            let sampler =
-                spawn_playlist_sampler(task, &stats, false, None, false, min_split, true);
-            let r = xfer_http::record_playlist(client, &path, &plan, uri, &opts, cancel, stats.clone())
-                .await;
+            let sampler = spawn_playlist_sampler(task, &stats, false, None, false, min_split, true);
+            let r =
+                xfer_http::record_playlist(client, &path, &plan, uri, &opts, cancel, stats.clone())
+                    .await;
             sampler.abort();
             // 无论成败都把"已录制时长"定格到任务上（卡片一直要显示它）
             task.live_recorded_ms
@@ -2198,7 +2281,8 @@ impl TaskManager {
             min_split,
             false,
         );
-        let r = xfer_http::download_playlist(client, &path, &plan, &opts, cancel, stats.clone()).await;
+        let r =
+            xfer_http::download_playlist(client, &path, &plan, &opts, cancel, stats.clone()).await;
         sampler.abort();
         match r {
             Ok(done) => {
@@ -2308,8 +2392,7 @@ impl TaskManager {
         let opts = self.flv_options(task, headers);
         let stats = xfer_http::FlvStats::new(resume_bytes);
         let sampler = spawn_flv_sampler(task, &stats);
-        let r =
-            xfer_http::record_flv(client, &path, uri, &opts, cancel, stats.clone()).await;
+        let r = xfer_http::record_flv(client, &path, uri, &opts, cancel, stats.clone()).await;
         sampler.abort();
         // 无论成败都把"已录制时长"定格到任务上（卡片一直要显示它）
         task.live_recorded_ms
@@ -2357,7 +2440,8 @@ impl TaskManager {
     /// 计算 BT 下载参数：任务选项 > 全局选项 > 默认值。
     ///
     /// 返回 `(预分配连接数, 是否启用智能调度)`。BT 连接数独立于 HTTP 的 split。
-    fn bt_options(&self, task: &Task) -> (usize, bool) {        let g = self.inner.lock().unwrap().global_options.clone();
+    fn bt_options(&self, task: &Task) -> (usize, bool) {
+        let g = self.inner.lock().unwrap().global_options.clone();
         let t = task.options.lock().unwrap().clone();
         let get = |k: &str| t.get(k).or_else(|| g.get(k));
 
@@ -2551,6 +2635,32 @@ impl TaskManager {
         })
     }
 
+    /// SFTP 任务的目标路径：显式 out 优先，否则用远端文件名。
+    ///
+    /// 同名文件只有在存在有效 SFTP 控制文件（且远端路径/大小一致）时才
+    /// 就地续传；否则重命名新文件，避免覆盖别人完整的同名文件。
+    fn resolve_sftp_path(&self, task: &Arc<Task>, probe: &xfer_sftp::SftpProbe) -> PathBuf {
+        if let Some(p) = task
+            .shared
+            .lock()
+            .unwrap()
+            .path
+            .clone()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            return p;
+        }
+        let base_name = task
+            .out
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| probe.filename.clone());
+        let continue_enabled = self.continue_enabled();
+        self.claim_path(task, base_name, |_existing, candidate| {
+            continue_enabled && xfer_sftp::can_resume(candidate, probe.size, &probe.remote_path)
+        })
+    }
+
     /// FLV 直播录制任务的目标路径：默认文件名由用户给出的地址推导
     /// （[`xfer_http::flv_default_filename`]：末段，扩展名归一为 `.flv`）。
     ///
@@ -2567,9 +2677,7 @@ impl TaskManager {
         };
         let continue_enabled = self.continue_enabled();
         self.claim_path(task, base_name, |existing, candidate| {
-            continue_enabled
-                && existing > 0
-                && xfer_storage::ctrl_path(candidate).exists()
+            continue_enabled && existing > 0 && xfer_storage::ctrl_path(candidate).exists()
         })
     }
 
@@ -2828,7 +2936,8 @@ impl TaskManager {
         if let Some(list) = tracker_replace {
             let (added, removed): (Vec<String>, Vec<String>) = {
                 let mut inner = self.inner.lock().unwrap();
-                let old: std::collections::HashSet<&String> = inner.global_trackers.iter().collect();
+                let old: std::collections::HashSet<&String> =
+                    inner.global_trackers.iter().collect();
                 let new: std::collections::HashSet<&String> = list.iter().collect();
                 let removed: Vec<String> = inner
                     .global_trackers
@@ -2952,14 +3061,7 @@ impl TaskManager {
     /// （运行时立即生效）。任务级限速在 [`Self::apply_task_rate_limits`]
     /// 中与全局值合成，全局变更后逐任务重新同步。
     fn apply_rate_limits(&self) {
-        let tasks: Vec<Arc<Task>> = self
-            .inner
-            .lock()
-            .unwrap()
-            .tasks
-            .values()
-            .cloned()
-            .collect();
+        let tasks: Vec<Arc<Task>> = self.inner.lock().unwrap().tasks.values().cloned().collect();
         for t in tasks {
             self.apply_task_rate_limits(&t);
         }
@@ -2987,7 +3089,8 @@ impl TaskManager {
             (
                 g.get("bt-encryption")
                     .and_then(|v| xfer_bt::EncryptionMode::parse(v)),
-                g.get("bt-protocol").and_then(|v| xfer_bt::BtProtocol::parse(v)),
+                g.get("bt-protocol")
+                    .and_then(|v| xfer_bt::BtProtocol::parse(v)),
             )
         };
         if encryption.is_none() && protocol.is_none() {
@@ -3040,7 +3143,10 @@ impl TaskManager {
             .get("bt-seed-mode")
             .map(|v| v != "false" && v != "0")
             .unwrap_or(false);
-        m.insert("bt-seed-mode".into(), Value::String(bt_seed_mode.to_string()));
+        m.insert(
+            "bt-seed-mode".into(),
+            Value::String(bt_seed_mode.to_string()),
+        );
         // BT 做种分享率上限（0 = 不限/持续做种到手动停止）
         let bt_seed_ratio = inner
             .global_options
@@ -3267,10 +3373,9 @@ impl TaskManager {
             })
             .await;
             let state = match check {
-                Ok(preview) => PreviewJobState::Done(preview_done_json(
-                    &result_meta,
-                    Some(&preview),
-                )),
+                Ok(preview) => {
+                    PreviewJobState::Done(preview_done_json(&result_meta, Some(&preview)))
+                }
                 Err(e) => PreviewJobState::Failed(format!("已有数据校验失败: {e}")),
             };
             if let Some(job) = jobs.lock().unwrap().get_mut(&key) {
@@ -3284,14 +3389,7 @@ impl TaskManager {
 
     /// 按 info_hash 从仍在任务列表里的 BT 任务复用元数据（磁力预览兜底）。
     fn find_bt_meta_by_hash(&self, hash: &[u8; 20]) -> Option<TorrentMeta> {
-        let tasks: Vec<Arc<Task>> = self
-            .inner
-            .lock()
-            .unwrap()
-            .tasks
-            .values()
-            .cloned()
-            .collect();
+        let tasks: Vec<Arc<Task>> = self.inner.lock().unwrap().tasks.values().cloned().collect();
         for task in tasks {
             let meta = task.bt_meta.lock().unwrap().clone();
             if let Some(meta) = meta {
@@ -3484,7 +3582,13 @@ impl TaskManager {
     /// 索引为 `files[].index - 1`（0 起算的文件序号）。
     pub fn select_files(&self, gid: &Gid, indices: &[usize]) -> Result<(), String> {
         let task = self.task_of(gid)?;
-        let count = match task.bt_meta.lock().unwrap().as_ref().map(|m| m.info.files.len()) {
+        let count = match task
+            .bt_meta
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|m| m.info.files.len())
+        {
             Some(c) => c,
             None if task.bt_info_hash.lock().unwrap().is_some() => {
                 return Err("文件列表未就绪（磁力元数据解析中）".to_string());
@@ -3492,11 +3596,7 @@ impl TaskManager {
             // 非 BT 任务（HTTP/HTTPS）：单文件布局
             None => 1,
         };
-        let mut sel: Vec<usize> = indices
-            .iter()
-            .copied()
-            .filter(|i| *i < count)
-            .collect();
+        let mut sel: Vec<usize> = indices.iter().copied().filter(|i| *i < count).collect();
         sel.sort_unstable();
         sel.dedup();
         if sel.is_empty() {
@@ -3663,11 +3763,7 @@ impl TaskManager {
         let now = Instant::now();
         let mut inner = self.inner.lock().unwrap();
         inner.bt_bans.retain(|_, e| e.is_active(now));
-        inner
-            .bt_bans
-            .iter()
-            .map(|(k, v)| (*k, v.expires))
-            .collect()
+        inner.bt_bans.iter().map(|(k, v)| (*k, v.expires)).collect()
     }
 
     /// 封禁名单的完整快照（含来源），供 getPeers 的 banned 分组展示。
@@ -3748,13 +3844,11 @@ impl TaskManager {
         add_uris: Vec<String>,
     ) -> Result<Value, String> {
         let task = self.task_of(gid)?;
-        if task.bt_meta.lock().unwrap().is_some()
-            || task.bt_info_hash.lock().unwrap().is_some()
-        {
+        if task.bt_meta.lock().unwrap().is_some() || task.bt_info_hash.lock().unwrap().is_some() {
             return Err(format!("Cannot change URI for BT GID#{}", gid.0));
         }
         if file_index != 1 {
-            return Err(format!("fileIndex {} 不存在（HTTP 任务单文件）", file_index));
+            return Err(format!("fileIndex {} 不存在（单文件任务）", file_index));
         }
         match task.status() {
             Status::Waiting | Status::Paused => {}
@@ -3806,9 +3900,7 @@ impl TaskManager {
     /// BT 任务无服务器概念返回空数组。
     pub fn get_servers(&self, gid: &Gid) -> Result<Value, String> {
         let task = self.task_of(gid)?;
-        if task.bt_meta.lock().unwrap().is_some()
-            || task.bt_info_hash.lock().unwrap().is_some()
-        {
+        if task.bt_meta.lock().unwrap().is_some() || task.bt_info_hash.lock().unwrap().is_some() {
             return Ok(Value::Array(vec![]));
         }
         let status = task.status();
@@ -3859,7 +3951,8 @@ impl TaskManager {
     }
 
     /// 查询 BT 任务的 tracker 列表。
-    pub fn get_trackers(&self, gid: &Gid) -> Result<Value, String> {        let task = self.task_of(gid)?;
+    pub fn get_trackers(&self, gid: &Gid) -> Result<Value, String> {
+        let task = self.task_of(gid)?;
         if task.bt_meta.lock().unwrap().is_none() && task.bt_info_hash.lock().unwrap().is_none() {
             return Err("非 BT 任务，无 tracker 信息".into());
         }
@@ -3904,32 +3997,30 @@ impl TaskManager {
                 .map(|e| e.tracker_stats())
                 .unwrap_or_default();
             urls.iter()
-                .map(|t| {
-                    match stats.iter().find(|s| s.url == *t) {
-                        Some(s) => json!({
-                            "url": s.url,
-                            "protocol": s.protocol,
-                            "status": s.status,
-                            "seeders": s.seeders,
-                            "leechers": s.leechers,
-                            "peers": s.seeders + s.leechers,
-                            "downloadCount": 0,
-                            "lastAnnounceTime": s.last_announce_ms,
-                            "nextAnnounceTime": s.next_announce_ms,
-                            "error": s.error,
-                        }),
-                        None => json!({
-                            "url": t,
-                            "protocol": xfer_bt::TrackerStat::protocol_of(t),
-                            "status": "waiting",
-                            "seeders": 0,
-                            "leechers": 0,
-                            "peers": 0,
-                            "downloadCount": 0,
-                            "lastAnnounceTime": 0,
-                            "nextAnnounceTime": 0,
-                        }),
-                    }
+                .map(|t| match stats.iter().find(|s| s.url == *t) {
+                    Some(s) => json!({
+                        "url": s.url,
+                        "protocol": s.protocol,
+                        "status": s.status,
+                        "seeders": s.seeders,
+                        "leechers": s.leechers,
+                        "peers": s.seeders + s.leechers,
+                        "downloadCount": 0,
+                        "lastAnnounceTime": s.last_announce_ms,
+                        "nextAnnounceTime": s.next_announce_ms,
+                        "error": s.error,
+                    }),
+                    None => json!({
+                        "url": t,
+                        "protocol": xfer_bt::TrackerStat::protocol_of(t),
+                        "status": "waiting",
+                        "seeders": 0,
+                        "leechers": 0,
+                        "peers": 0,
+                        "downloadCount": 0,
+                        "lastAnnounceTime": 0,
+                        "nextAnnounceTime": 0,
+                    }),
                 })
                 .collect()
         };
@@ -4119,7 +4210,11 @@ impl TaskManager {
                 unclaim_trackers_locked(&mut inner, id)
             };
             if !dropped.is_empty() {
-                tracing::info!(id, removed = dropped.len(), "禁用订阅源，移除其贡献的 tracker");
+                tracing::info!(
+                    id,
+                    removed = dropped.len(),
+                    "禁用订阅源，移除其贡献的 tracker"
+                );
                 self.apply_tracker_delta(&[], &dropped);
             }
         }
@@ -4246,7 +4341,8 @@ impl TaskManager {
                 }
                 drop(inner);
                 tracing::info!(
-                    id, url,
+                    id,
+                    url,
                     total = list.len(),
                     added = added.len(),
                     removed = removed.len(),
@@ -4601,15 +4697,11 @@ fn sync_verify_state(engine: &TorrentEngine, task: &Task) {
         .store(p.checked_bytes, Ordering::Relaxed);
     task.bt_verify_verified
         .store(p.verified_bytes, Ordering::Relaxed);
-    task.bt_verify_total
-        .store(p.total_bytes, Ordering::Relaxed);
+    task.bt_verify_total.store(p.total_bytes, Ordering::Relaxed);
 }
 
 /// 已有数据预览的进行中结果（含实时进度，前端轮询展示百分比）。
-fn preview_verifying_json(
-    meta: &TorrentMeta,
-    p: xfer_bt::VerifyProgressSnapshot,
-) -> Value {
+fn preview_verifying_json(meta: &TorrentMeta, p: xfer_bt::VerifyProgressSnapshot) -> Value {
     let total = meta.info.files.iter().map(|f| f.length).sum::<u64>();
     // 进度按"已验证字节"算：与最终可继承的已验证大小/后续下载进度同一口径，
     // 避免坏片/缺失片把进度推到 100% 后再回落到实际进度
@@ -5043,10 +5135,13 @@ async fn drive_bt_download(
                 }
                 // 无锁同步：speed_ticker / snapshot / stat_raw 优先读原子值
                 task.completed_atomic.store(p.done, Ordering::Relaxed);
-                task.connections_atomic.store(conn_count as u64, Ordering::Relaxed);
-                task.uploaded_atomic.store(engine.uploaded(), Ordering::Relaxed);
+                task.connections_atomic
+                    .store(conn_count as u64, Ordering::Relaxed);
+                task.uploaded_atomic
+                    .store(engine.uploaded(), Ordering::Relaxed);
                 // 接收字节（字节级实时）：speed_ticker 的速度窗口采样源
-                task.received_atomic.store(engine.received_total(), Ordering::Relaxed);
+                task.received_atomic
+                    .store(engine.received_total(), Ordering::Relaxed);
                 *task.bt_peers.lock().unwrap() = peers;
                 // 分片位图同步（分片展示用）：暂停后任务字段保留最后状态
                 if let Some(bf) = engine.bitfield() {
@@ -5115,7 +5210,8 @@ async fn drive_bt_download(
         sh.completed = p.done;
     }
     task.completed_atomic.store(p.done, Ordering::Relaxed);
-    task.uploaded_atomic.store(engine.uploaded(), Ordering::Relaxed);
+    task.uploaded_atomic
+        .store(engine.uploaded(), Ordering::Relaxed);
     *task.bt_peers.lock().unwrap() = engine.peers_info();
     // 停机后同步最终位图（完成/暂停时的快照，避免 1Hz ticker 末次采样缺失）
     if let Some(bf) = engine.bitfield() {
@@ -5291,6 +5387,7 @@ fn reset_task_path(mgr: &TaskManager, task: &Task) {
     };
     if let Some(p) = old_path {
         let _ = std::fs::remove_file(xfer_storage::ctrl_path(&p));
+        let _ = std::fs::remove_file(xfer_sftp::ctrl_path(&p));
         mgr.inner.lock().unwrap().claims.remove(&p);
     }
 }
@@ -5506,6 +5603,125 @@ async fn try_uri(
     finish_http_task(task, sink.path.as_path()).await
 }
 
+/// SFTP 瞬态失败的同 URI 重试次数（断线/超时/短读）。
+const SFTP_TRANSIENT_ATTEMPTS: u32 = 3;
+
+/// SFTP 任务驱动：依次尝试 URI 列表（镜像故障转移）。
+///
+/// 连接类失败先在同 URI 上重试：每次都会重新握手，但控制文件让重试只补
+/// 缺失的片，不会把已下好的字节重来。
+async fn drive_sftp(
+    mgr: &TaskManager,
+    task: &Arc<Task>,
+    cancel: &CancellationToken,
+) -> Result<(), TaskFailure> {
+    let uris_snapshot = task.uris.lock().unwrap().clone();
+    let mut last_err: Option<TaskFailure> = None;
+    for (idx, uri) in uris_snapshot.iter().enumerate() {
+        let mut attempt = 1u32;
+        loop {
+            match try_sftp(mgr, task, uri, idx, cancel).await {
+                Ok(()) => return Ok(()),
+                Err(f) if f.is_cancelled() => return Err(f),
+                Err(f) => {
+                    let retryable = match &f {
+                        TaskFailure::Sftp(e) => e.is_retryable(),
+                        _ => false,
+                    };
+                    if retryable && attempt < SFTP_TRANSIENT_ATTEMPTS {
+                        attempt += 1;
+                        let backoff = if attempt == 2 {
+                            Duration::from_secs(1)
+                        } else {
+                            Duration::from_secs(3)
+                        };
+                        tracing::warn!(
+                            gid = %task.gid, uri = idx, attempt, error = %f,
+                            "SFTP 瞬态失败，断点续传重试"
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff) => {}
+                            _ = cancel.cancelled() => return Err(f),
+                        }
+                        continue;
+                    }
+                    tracing::warn!(gid = %task.gid, uri = idx, error = %f, "SFTP URI 失败，切换下一个");
+                    last_err = Some(f);
+                    break;
+                }
+            }
+        }
+    }
+    Err(
+        last_err.unwrap_or(TaskFailure::Sftp(xfer_sftp::SftpError::Protocol(
+            "无可用下载地址".into(),
+        ))),
+    )
+}
+
+async fn try_sftp(
+    mgr: &TaskManager,
+    task: &Arc<Task>,
+    uri: &str,
+    uri_idx: usize,
+    cancel: &CancellationToken,
+) -> Result<(), TaskFailure> {
+    mgr.apply_task_rate_limits(task);
+    let url = xfer_sftp::SftpUrl::parse(uri)?;
+    let opts = mgr.sftp_options(task);
+    let client = xfer_sftp::SftpClient::connect(&url, &opts).await?;
+    let probe = match client.probe(&url, &opts, &url.path).await {
+        Ok(p) => p,
+        Err(e) => {
+            client.disconnect().await;
+            return Err(e.into());
+        }
+    };
+
+    task.mark_uri_used(uri_idx);
+    {
+        let mut sh = task.shared.lock().unwrap();
+        sh.total_len = Some(probe.size);
+        sh.file_len = probe.size;
+        sh.filename = Some(probe.filename.clone());
+    }
+    let path = mgr.resolve_sftp_path(task, &probe);
+    let resumed = xfer_sftp::resume_bytes(&path, probe.size, &probe.remote_path);
+    task.received_atomic.store(0, Ordering::Relaxed);
+    let stats = Arc::new(xfer_sftp::SftpStats::new(resumed));
+    let sampler = spawn_sftp_sampler(task, &stats);
+    let result = xfer_sftp::download(
+        &client,
+        &path,
+        &probe.remote_path,
+        probe.size,
+        &opts,
+        task.http_task_limiter(),
+        cancel,
+        stats.clone(),
+    )
+    .await;
+    sampler.abort();
+    client.disconnect().await;
+
+    {
+        let mut sh = task.shared.lock().unwrap();
+        sh.completed = stats.completed();
+        sh.connections = 0;
+        task.completed_atomic
+            .store(stats.completed(), Ordering::Relaxed);
+        task.connections_atomic.store(0, Ordering::Relaxed);
+    }
+    match result {
+        Ok(done) => {
+            task.shared.lock().unwrap().completed = done.total;
+            task.completed_atomic.store(done.total, Ordering::Relaxed);
+            finish_http_task(task, &path).await
+        }
+        Err(e) => Err(TaskFailure::Sftp(e)),
+    }
+}
+
 /// HLS（M3U8）任务驱动：依次尝试 URI 列表（镜像故障转移）。
 ///
 /// 目标扩展名像清单、内容却是普通资源时回退到普通 HTTP 驱动——
@@ -5577,16 +5793,19 @@ async fn drive_playlist(
             }
         }
     }
-    Err(last_err.unwrap_or(TaskFailure::Http(xfer_http::HttpError::Protocol(
-        "无可用下载地址".into(),
-    ))))
+    Err(
+        last_err.unwrap_or(TaskFailure::Http(xfer_http::HttpError::Protocol(
+            "无可用下载地址".into(),
+        ))),
+    )
 }
 
 /// HTTP 任务完成收尾：校验和（如配置）。
 ///
 /// 哈希校验走阻塞线程池：大文件整读可能耗时数秒，同步执行会卡住
 /// tokio 工作线程（§7.18⑤：async 上下文禁止同步磁盘 IO）。
-async fn finish_http_task(task: &Arc<Task>, path: &Path) -> Result<(), TaskFailure> {    if let Some((algo, expect)) = task.checksum.clone() {
+async fn finish_http_task(task: &Arc<Task>, path: &Path) -> Result<(), TaskFailure> {
+    if let Some((algo, expect)) = task.checksum.clone() {
         let p = path.to_path_buf();
         tokio::task::spawn_blocking(move || verify_file_hash(&p, algo, &expect))
             .await
@@ -5715,6 +5934,31 @@ fn spawn_split_sampler(
     })
 }
 
+/// SFTP 进度采样：与 [`spawn_split_sampler`] 同构。
+///
+/// `completed` 含续传继承的片，`received` 只统计本次运行收到的字节，
+/// 速度窗口据此在续传时不会先出现"已完成量当速度"的尖峰。
+fn spawn_sftp_sampler(
+    task: &Arc<Task>,
+    stats: &Arc<xfer_sftp::SftpStats>,
+) -> tokio::task::JoinHandle<()> {
+    let task = task.clone();
+    let stats = stats.clone();
+    tokio::spawn(async move {
+        let mut iv = tokio::time::interval(Duration::from_millis(200));
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            iv.tick().await;
+            task.completed_atomic
+                .store(stats.completed(), Ordering::Relaxed);
+            task.received_atomic
+                .store(stats.received(), Ordering::Relaxed);
+            task.connections_atomic
+                .store(stats.connections(), Ordering::Relaxed);
+        }
+    })
+}
+
 /// HLS 播放列表进度采样：与 [`spawn_split_sampler`] 同构（无锁原子）。
 ///
 /// 总长的取值优先级（**精确值永远优先，估算可被修正下调**）：
@@ -5818,7 +6062,11 @@ fn spawn_playlist_sampler(
             if pieces.is_none() {
                 // 优先用精确总长建图（格子数与最终产物严格对应）；没有精确值
                 // 才用估算，并记下"这是估算建的"，等精确值来了重建
-                let hint = if exact > 0 { exact } else { stats.estimated_total.load(Ordering::Relaxed) };
+                let hint = if exact > 0 {
+                    exact
+                } else {
+                    stats.estimated_total.load(Ordering::Relaxed)
+                };
                 if hint > 0 {
                     let p = xfer_http::PieceTrack::new(hint.max(done).max(1), piece_len);
                     *task.http_pieces.write().unwrap() = Some(p.clone());
@@ -5963,6 +6211,10 @@ fn delete_task_ctrl(task: &Task) {
         if ctrl.exists() {
             let _ = std::fs::remove_file(&ctrl);
         }
+        let sftp_ctrl = xfer_sftp::ctrl_path(&p);
+        if sftp_ctrl.exists() {
+            let _ = std::fs::remove_file(&sftp_ctrl);
+        }
         // 播放列表的段目录（`<产物>.hlseg/`：乱序落盘的中间段 / 直播录制的
         // 按序号段文件）。任务都被移除了，这些段永远不会再被拼接 —— 留着
         // 只是垃圾（以前只在"下载成功收尾"时清理）。
@@ -6069,6 +6321,87 @@ mod tests {
         assert_eq!(normalize_dir("rel/dir"), expected);
     }
 
+    #[test]
+    fn sftp_options_merge_task_global_and_defaults() {
+        let dir = std::env::temp_dir().join(format!("xfer-sftp-opts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = TaskManager::new(dir.clone(), 1);
+        mgr.change_global_option(&serde_json::json!({
+            "split": "12",
+            "sftp-timeout": "45",
+            "sftp-user": "global",
+            "sftp-strict-host-key": "true"
+        }))
+        .unwrap();
+        let gid = mgr
+            .add_uri(
+                vec!["sftp://urluser@example.com/f.bin".into()],
+                &serde_json::json!({
+                    "dir": dir,
+                    "sftp-user": "task",
+                    "sftp-private-key": "/tmp/id_ed25519",
+                    "sftp-connections": "3"
+                }),
+                None,
+            )
+            .unwrap();
+        let task = mgr.task_of(&gid).unwrap();
+        let o = mgr.sftp_options(&task);
+        assert_eq!(o.user.as_deref(), Some("task"));
+        assert_eq!(o.private_key, Some(PathBuf::from("/tmp/id_ed25519")));
+        assert_eq!(o.connections, 3, "sftp-connections 应覆盖 split");
+        assert_eq!(o.timeout_secs, 45);
+        assert!(o.strict_host_key);
+        assert_eq!(o.known_hosts, mgr.sftp_known_hosts_path());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn restore_empty_path_is_none_not_current_dir() {
+        let dir = std::env::temp_dir().join(format!("xfer-sftp-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = dir.join("session.json");
+        let dl = dir.join("dl");
+        std::fs::create_dir_all(&dl).unwrap();
+        std::fs::write(
+            &session,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "tasks": [{
+                    "gid": "0123456789abcdef",
+                    "uris": ["sftp://u@example.com/f.bin"],
+                    "dir": dl.to_string_lossy(),
+                    "out": "f.bin",
+                    "options": {},
+                    "status": "paused",
+                    "completedLength": 4,
+                    "totalLength": 10,
+                    // 旧会话/新增后立刻退出：路径还没解析，保存成空串
+                    "path": ""
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mgr = TaskManager::start_with_session(None, None, session);
+        let task = mgr.task_of(&Gid::from("0123456789abcdef")).unwrap();
+        assert_eq!(task.kind, TaskKind::Sftp);
+        assert_eq!(task.status(), Status::Paused);
+        {
+            let sh = task.shared.lock().unwrap();
+            assert!(
+                sh.path.is_none(),
+                "空路径必须恢复成 None，不能是 Some(\"\")"
+            );
+            assert_eq!(sh.total_len, Some(10));
+            assert_eq!(sh.completed, 4);
+            assert_eq!(sh.filename, None);
+        }
+        drop(mgr);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// MCP 独立会话 → 应用会话：按 gid 去重、重复启动幂等、删掉的不会复活。
     #[test]
     fn imports_mcp_tasks_once_and_never_resurrects() {
@@ -6130,11 +6463,20 @@ mod tests {
     #[test]
     fn playlist_out_drops_manifest_extension() {
         // .m3u8 / .m3u 是清单文本 → 换成实际容器
-        assert_eq!(normalize_playlist_out("我的影片.m3u8", false), "我的影片.ts");
-        assert_eq!(normalize_playlist_out("我的影片.M3U8", false), "我的影片.ts");
+        assert_eq!(
+            normalize_playlist_out("我的影片.m3u8", false),
+            "我的影片.ts"
+        );
+        assert_eq!(
+            normalize_playlist_out("我的影片.M3U8", false),
+            "我的影片.ts"
+        );
         assert_eq!(normalize_playlist_out("playlist.m3u", false), "playlist.ts");
         // fMP4 清单 → .mp4（分片拼出来的是 fMP4，不是 TS 流）
-        assert_eq!(normalize_playlist_out("我的影片.m3u8", true), "我的影片.mp4");
+        assert_eq!(
+            normalize_playlist_out("我的影片.m3u8", true),
+            "我的影片.mp4"
+        );
         assert_eq!(normalize_playlist_out("我的影片.m3u", true), "我的影片.mp4");
         // 带目录的 out（aria2 允许）只动文件名部分
         assert_eq!(
@@ -6151,7 +6493,10 @@ mod tests {
         // 无扩展名 → 追加容器扩展名
         assert_eq!(normalize_playlist_out("我的影片", false), "我的影片.ts");
         assert_eq!(normalize_playlist_out("我的影片", true), "我的影片.mp4");
-        assert_eq!(normalize_playlist_out("videos/我的影片", false), "videos/我的影片.ts");
+        assert_eq!(
+            normalize_playlist_out("videos/我的影片", false),
+            "videos/我的影片.ts"
+        );
         assert_eq!(normalize_playlist_out("我的影片.", true), "我的影片.mp4");
         // 点开头的隐藏名不算"无扩展名"，保持原样
         assert_eq!(normalize_playlist_out(".hidden", false), ".hidden");
@@ -6215,8 +6560,14 @@ mod tests {
         .expect("网络发现开关应被接受");
         let (dht, dht6, pex, lpd, pmap) = mgr.bt_network_flags();
         assert!(!dht && dht6 && !pex && lpd && !pmap);
-        assert_eq!(mgr.get_global_option()["enable-dht"], serde_json::json!("false"));
-        assert_eq!(mgr.get_global_option()["enable-dht6"], serde_json::json!("true"));
+        assert_eq!(
+            mgr.get_global_option()["enable-dht"],
+            serde_json::json!("false")
+        );
+        assert_eq!(
+            mgr.get_global_option()["enable-dht6"],
+            serde_json::json!("true")
+        );
         assert_eq!(
             mgr.get_global_option()["enable-peer-exchange"],
             serde_json::json!("false")
@@ -6364,10 +6715,7 @@ mod tests {
         // 幂等：同一组值再触发一次不应重建。应用端启动后会连续推送多次全局
         // 配置（system / user 各一次，且都带 user-agent），不去重就是每次
         // 白等一次客户端构建，叠加起来正是 RPC 超时的来源。
-        assert!(
-            !mgr.rebuild_http_client(),
-            "值未变化时不应重复重建客户端"
-        );
+        assert!(!mgr.rebuild_http_client(), "值未变化时不应重复重建客户端");
         // 值真变了才重建；且 set_initial_options 内部已按新值触发过一次，
         // 紧随其后再调应被签名去重挡下
         mgr.set_initial_options(&[("user-agent".to_string(), "UnitUA/10".to_string())]);
@@ -6402,10 +6750,7 @@ mod tests {
         });
 
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(
-            !done.load(Ordering::SeqCst),
-            "重建未完成时不应放行任务"
-        );
+        assert!(!done.load(Ordering::SeqCst), "重建未完成时不应放行任务");
 
         // 构建完成 → 放行
         mgr.client_busy.send_replace(false);
@@ -6504,8 +6849,16 @@ mod tests {
         }))
         .unwrap();
         let g = mgr.get_global_option();
-        assert_eq!(g["hls-concurrency"], serde_json::json!("32"), "非法并发不应覆盖旧值");
-        assert_eq!(g["hls-write-mode"], serde_json::json!("ordered"), "非法落盘方式不应覆盖旧值");
+        assert_eq!(
+            g["hls-concurrency"],
+            serde_json::json!("32"),
+            "非法并发不应覆盖旧值"
+        );
+        assert_eq!(
+            g["hls-write-mode"],
+            serde_json::json!("ordered"),
+            "非法落盘方式不应覆盖旧值"
+        );
         assert_eq!(
             g["hls-live-stall-timeout"],
             serde_json::json!("600"),
@@ -6520,8 +6873,16 @@ mod tests {
         }))
         .unwrap();
         let g = mgr.get_global_option();
-        assert_eq!(g["hls-concurrency"], serde_json::json!(""), "空串必须被接受（恢复自动）");
-        assert_eq!(g["hls-write-mode"], serde_json::json!(""), "空串必须被接受（恢复乱序）");
+        assert_eq!(
+            g["hls-concurrency"],
+            serde_json::json!(""),
+            "空串必须被接受（恢复自动）"
+        );
+        assert_eq!(
+            g["hls-write-mode"],
+            serde_json::json!(""),
+            "空串必须被接受（恢复乱序）"
+        );
         assert_eq!(
             g["hls-live-stall-timeout"],
             serde_json::json!(""),
@@ -6639,10 +7000,8 @@ mod tests {
         let task = mgr.task_of(&gid).unwrap();
 
         // 全局 1M；单任务未设置 → 跟随全局
-        mgr.change_global_option(
-            &serde_json::json!({"max-overall-download-limit": "1M"}),
-        )
-        .unwrap();
+        mgr.change_global_option(&serde_json::json!({"max-overall-download-limit": "1M"}))
+            .unwrap();
         assert_eq!(
             task.http_task_limiter().rate(),
             1024 * 1024,
@@ -6786,9 +7145,9 @@ mod tests {
         // 同一份头也必须进入分片选项（探测 / 分片 / 单连接三条路径同源）
         let opts = mgr.split_options(&task);
         assert!(
-            opts.headers
-                .iter()
-                .any(|(k, v)| k.eq_ignore_ascii_case("referer") && v == "https://site.example/watch"),
+            opts.headers.iter().any(
+                |(k, v)| k.eq_ignore_ascii_case("referer") && v == "https://site.example/watch"
+            ),
             "分片下载路径未带上逐任务头"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -6827,9 +7186,7 @@ mod tests {
         use base64::Engine;
         let tb64 = base64::engine::general_purpose::STANDARD.encode(encode(&top));
         let dir = root.to_string_lossy().to_string();
-        let call = || {
-            serde_json::json!({"torrent": tb64.clone(), "dir": dir.clone()})
-        };
+        let call = || serde_json::json!({"torrent": tb64.clone(), "dir": dir.clone()});
         let mgr = TaskManager::new(root.clone(), 1);
 
         // 磁盘上没有数据：不需要后台校验，首包就是 done。
