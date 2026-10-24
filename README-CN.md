@@ -35,7 +35,8 @@
   TOFU：读取 `~/.ssh/known_hosts`，首次连接记录到引擎自己的
   `sftp_known_hosts`，之后指纹变化直接拒绝；`sftp-strict-host-key=true`
   要求预先录入，`sftp-known-hosts` 可指定信任库，`sftp-timeout` 控制连接 /
-  请求超时（秒）。目前只支持单文件，目录会明确报错。
+  请求超时（秒）。断线、超时这类连接失败会在同一地址上重试，多地址之间自动
+  故障转移，已下载的片不会重来。目前只支持单文件，目录会明确报错。
 - **BitTorrent**：种子与磁力链接，多 peer 并行 + rarest-first 选片；底层是
   完整网络栈：DHT（BEP 5）、IPv6 DHT（BEP 32）、peer 交换（BEP 11）、
   本地节点发现、uTP 与 MSE/PE 加密。
@@ -60,7 +61,8 @@
   与任务级（`max-download-limit` / `max-upload-limit`）两级。
 - **对端管理**：对端按四个分组上报——已连接 / 正在连接 / 已断开 / 已封禁；
   封禁、解封支持永久或指定时长，并有 IP 黑名单；UPnP 与 NAT-PMP 端口映射
-  打通入向连接。
+  打通入向连接（UPnP 同时兼容只提供 `WANPPPConnection` 的 PPPoE 路由器，
+  并按实际监听端口做 TCP + UDP 双映射）。
 - **Tracker**：任务级 tracker 列表、全局列表，以及每日自动刷新的订阅源。
   刷新是"同步"而非"只增"，远端返回空列表会被当作异常处理，不会误清你的 tracker。
 - **冷启动加速**：tracker / DHT / IPv6 announce 并行，候选节点边到边连；
@@ -253,6 +255,7 @@ xfer tui [-d dir] [-j max-concurrent]
 ```bash
 xfer download <url> [-d dir] [-o filename] [--checksum algo=digest]
 xfer https://example.com/file.zip   # 裸 http(s):// URL 等价于 download
+xfer sftp://user@host/home/user/a.bin  # 裸 sftp:// URL 同样等价于 download
 ```
 
 | 选项 | 说明 |
@@ -271,8 +274,8 @@ xfer download https://example.com/iso --checksum sha-256=ab34…
 行为：全屏 TUI 实时显示进度；`q` / `ESC` / `Ctrl-C` 取消（退出码 130）；成功退出码 0
 并打印文件路径；失败退出码 1 并给出错误码与信息。
 
-> 裸参数只有在以 `http://` 或 `https://` 开头时才按下载处理。种子文件与磁力链接
-> 请走下面的子命令（`add`，或主界面的输入框）。
+> 裸参数只有在以 `http://`、`https://` 或 `sftp://` 开头时才按下载处理。种子文件与
+> 磁力链接请走下面的子命令（`add`，或主界面的输入框）。
 
 ### 3. 守护进程
 

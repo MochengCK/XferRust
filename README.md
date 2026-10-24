@@ -47,8 +47,10 @@ controlled over JSON-RPC by web apps, desktop applications and other clients.
   are recorded in the engine's own `sftp_known_hosts`, and a changed
   fingerprint is rejected. `sftp-strict-host-key=true` requires keys to be
   pre-recorded, `sftp-known-hosts` selects the trust store, and
-  `sftp-timeout` sets connect/request timeouts in seconds. Directories are
-  not supported and fail with a clear error.
+  `sftp-timeout` sets connect/request timeouts in seconds. Connection-level
+  failures (drops, timeouts) are retried on the same address and fail over
+  between multiple addresses without re-downloading completed pieces.
+  Directories are not supported and fail with a clear error.
 - **BitTorrent** torrents and magnet links with multi-peer parallel
   downloading and rarest-first piece selection, on top of a complete network
   stack: DHT (BEP 5), IPv6 DHT (BEP 32), peer exchange (BEP 11), local peer
@@ -82,7 +84,8 @@ controlled over JSON-RPC by web apps, desktop applications and other clients.
 - **Peer management**: peers are reported in four groups — connected /
   attempting / disconnected / banned. Ban or unban addresses permanently or for
   a duration, backed by an IP ban list; UPnP and NAT-PMP port mapping for
-  inbound connectivity.
+  inbound connectivity (UPnP also works with PPPoE routers that only expose
+  `WANPPPConnection`, and maps both TCP and UDP on the actual listen port).
 - **Trackers**: per-task tracker lists, a global list, and tracker
   subscriptions refreshed daily. Refreshes are synchronised rather than
   add-only, and an empty remote list is treated as an anomaly instead of
@@ -306,6 +309,7 @@ the list; `Tab` switches focus between the two tables, arrow keys and
 ```bash
 xfer download <url> [-d dir] [-o filename] [--checksum algo=digest]
 xfer https://example.com/file.zip   # a bare http(s):// URL is equivalent to download
+xfer sftp://user@host/home/user/a.bin  # a bare sftp:// URL works the same way
 ```
 
 | Option | Description |
@@ -325,9 +329,9 @@ Behavior: a full-screen TUI shows live progress; `q` / `ESC` / `Ctrl-C`
 cancels (exit code 130); on success exit code 0 and the file path is printed;
 on failure exit code 1 with the error code and message.
 
-> A bare argument is only treated as a download when it starts with `http://`
-> or `https://`. Torrent files and magnet links go through the subcommands
-> below (`add`, or the TUI input box).
+> A bare argument is only treated as a download when it starts with `http://`,
+> `https://` or `sftp://`. Torrent files and magnet links go through the
+> subcommands below (`add`, or the TUI input box).
 
 ### 3. Daemon
 
