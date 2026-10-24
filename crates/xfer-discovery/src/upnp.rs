@@ -94,11 +94,34 @@ impl UpnpClient {
         lifetime: u32,
     ) -> Vec<Result<NatPortMapping, String>> {
         let mut results = Vec::new();
-        let gateway = self.gateway;
+        // 网关只解析一次：`resolve_gateway` 会盲探几个常见网关地址
+        // （每个 600ms 超时），此前 TCP/UDP 各探一遍。解析不出来就说明
+        // 本网没有 NAT-PMP 网关，直接跳过它走 UPnP（SSDP 不依赖网关地址）。
+        let gateway = match self.gateway {
+            Some(gw) => Some(gw),
+            None => match resolve_gateway(None).await {
+                Ok(gw) => Some(gw),
+                Err(e) => {
+                    tracing::debug!(error = %e, "未发现 NAT-PMP 网关，跳过 NAT-PMP");
+                    None
+                }
+            },
+        };
+        // SSDP 发现也只做一次，TCP/UDP 两个协议复用（此前每个协议各扫一遍，
+        // 白白多花一次 3 秒超时）。
+        let mut igd: Option<Igd> = None;
 
         for proto in [PortMappingProtocol::Tcp, PortMappingProtocol::Udp] {
-            // 先尝试 NAT-PMP
-            match nat_pmp_map_port(gateway, internal_port, external_port, proto, lifetime).await {
+            // 先尝试 NAT-PMP（轻量、一次往返；不少路由器/机场基站只支持它）
+            let nat_result = match gateway {
+                Some(gw) => {
+                    nat_pmp_map_port(Some(gw), internal_port, external_port, proto, lifetime)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                None => Err("无 NAT-PMP 网关".to_string()),
+            };
+            match nat_result {
                 Ok(mapping) => {
                     tracing::info!(
                         proto = ?proto,
@@ -109,8 +132,18 @@ impl UpnpClient {
                 }
                 Err(e) => {
                     tracing::debug!(proto = ?proto, error = %e, "NAT-PMP 映射失败，尝试 UPnP");
+                    // 只有 NAT-PMP 真的失败后才做 SSDP：它要 3 秒超时，
+                    // 不能挡在 NAT-PMP 前面。
+                    if igd.is_none() {
+                        match upnp_ssdp_discover().await {
+                            Ok(found) => igd = Some(found),
+                            Err(err) => {
+                                tracing::debug!(error = %err, "SSDP 未发现 IGD");
+                            }
+                        }
+                    }
                     // NAT-PMP 失败，回退到 UPnP 确保该协议仍可被映射
-                    match upnp_map_port(gateway, internal_port, external_port, proto, lifetime)
+                    match upnp_map_port(igd.as_ref(), internal_port, external_port, proto, lifetime)
                         .await
                     {
                         Ok(mapping) => {
@@ -122,7 +155,7 @@ impl UpnpClient {
                             results.push(Ok(mapping));
                         }
                         Err(e2) => {
-                            tracing::debug!(proto = ?proto, error = %e2, "UPnP 映射也失败");
+                            tracing::warn!(proto = ?proto, error = %e2, "UPnP 映射也失败");
                             results.push(Err(format!("NAT-PMP: {e}; UPnP: {e2}")));
                         }
                     }
@@ -144,7 +177,7 @@ impl UpnpClient {
         if let Err(e) = nat_pmp_unmap_port(gateway, external_port, protocol).await {
             tracing::debug!(error = %e, "NAT-PMP 删除映射失败，尝试 UPnP");
             // 再试 UPnP
-            upnp_unmap_port(gateway, external_port, protocol).await?;
+            upnp_unmap_port(None, external_port, protocol).await?;
         }
         Ok(())
     }
@@ -203,7 +236,7 @@ async fn nat_pmp_map_port_to_addr(
         .map_err(|e| format!("NAT-PMP 发送失败: {e}"))?;
 
     let mut buf = vec![0u8; 12];
-    let n = timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+    let n = timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
         .await
         .map_err(|_| "NAT-PMP 外部地址响应超时".to_string())?
         .map_err(|e| format!("NAT-PMP 接收失败: {e}"))?
@@ -243,7 +276,7 @@ async fn nat_pmp_map_port_to_addr(
         .map_err(|e| format!("NAT-PMP 发送失败: {e}"))?;
 
     let mut buf = vec![0u8; 16];
-    let n = timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+    let n = timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
         .await
         .map_err(|_| "NAT-PMP 响应超时".to_string())?
         .map_err(|e| format!("NAT-PMP 接收失败: {e}"))?
@@ -274,7 +307,7 @@ async fn nat_pmp_get_external_addr(gateway: SocketAddr) -> Result<IpAddr, String
         .map_err(|e| format!("NAT-PMP 发送失败: {e}"))?;
 
     let mut buf = vec![0u8; 12];
-    let n = timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+    let n = timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
         .await
         .map_err(|_| "NAT-PMP 外部地址响应超时".to_string())?
         .map_err(|e| format!("NAT-PMP 接收失败: {e}"))?
@@ -376,7 +409,7 @@ async fn nat_pmp_unmap_port(
         .map_err(|e| format!("NAT-PMP 发送失败: {e}"))?;
 
     let mut buf = vec![0u8; 16];
-    let n = timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+    let n = timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
         .await
         .map_err(|_| "NAT-PMP 响应超时".to_string())?
         .map_err(|e| format!("NAT-PMP 接收失败: {e}"))?
@@ -400,8 +433,23 @@ async fn nat_pmp_unmap_port(
 const SSDP_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const SSDP_PORT: u16 = 1900;
 
-/// UPnP SSDP 发现。
-async fn upnp_ssdp_discover() -> Result<String, String> {
+/// 支持的 IGD 服务类型（按优先级）：
+/// - `WANIPConnection`：路由器桥接/二级路由，内网口直接持有公网地址；
+/// - `WANPPPConnection`：路由器自己拨号（PPPoE）——国内家用路由器绝大多数
+///   属于这一类，只认 IPConnection 会直接报「设备描述中未找到服务」。
+const IGD_SERVICE_TYPES: [&str; 2] = [
+    "urn:schemas-upnp-org:service:WANIPConnection:1",
+    "urn:schemas-upnp-org:service:WANPPPConnection:1",
+];
+
+/// SSDP 发现的 IGD：设备描述地址 + 响应来源地址（= 路由器内网地址）。
+struct Igd {
+    location: String,
+    ip: IpAddr,
+}
+
+/// UPnP SSDP 发现（返回设备描述 URL 与响应来源地址）。
+async fn upnp_ssdp_discover() -> Result<Igd, String> {
     let socket = UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(|e| format!("SSDP socket 绑定失败: {e}"))?;
@@ -420,65 +468,120 @@ async fn upnp_ssdp_discover() -> Result<String, String> {
         .map_err(|e| format!("SSDP 发送失败: {e}"))?;
 
     let mut buf = vec![0u8; 4096];
-    let n = timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
-        .await
-        .map_err(|_| "SSDP 响应超时".to_string())?
-        .map_err(|e| format!("SSDP 接收失败: {e}"))?
-        .0;
-
-    let text = std::str::from_utf8(&buf[..n]).map_err(|_| "SSDP 响应非 UTF-8".to_string())?;
-
-    // 提取 Location 头
-    for line in text.lines() {
-        let line = line.trim();
-        if line.to_lowercase().starts_with("location:") {
-            let url = line[9..].trim().to_string();
-            return Ok(url);
+    // 多播会收到多个设备的响应（路由器 + 电视 + NAS），只取第一个带
+    // Location 的；IGD 通常最先回，拿不到再退化为 UPnP 不可用。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("SSDP 响应超时".into());
+        }
+        let (n, from) = match timeout(remaining, socket.recv_from(&mut buf)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(format!("SSDP 接收失败: {e}")),
+            Err(_) => return Err("SSDP 响应超时".into()),
+        };
+        let text = match std::str::from_utf8(&buf[..n]) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let location = text.lines().find_map(|line| {
+            let line = line.trim();
+            if line.len() > 9 && line[..9].eq_ignore_ascii_case("location:") {
+                Some(line[9..].trim().to_string())
+            } else {
+                None
+            }
+        });
+        if let Some(location) = location {
+            return Ok(Igd {
+                location,
+                ip: from.ip(),
+            });
         }
     }
-    Err("SSDP 响应中未找到 Location".into())
 }
 
-/// UPnP SOAP AddPortMapping。
-async fn upnp_map_port(
-    _gateway: Option<IpAddr>,
-    internal_port: u16,
-    external_port: u16,
-    protocol: PortMappingProtocol,
-    lifetime: u32,
-) -> Result<NatPortMapping, String> {
-    // 1. SSDP 发现
-    let location = upnp_ssdp_discover().await?;
-
-    // 2. 获取设备描述 → 提取控制 URL
-    let client = reqwest::Client::builder()
+/// 构建 SOAP 用的 HTTP 客户端。
+///
+/// 同一操作里**只建一次**：客户端初始化要加载根证书（本机实测约 0.8s），
+/// 每个请求各建一次会让映射/撤销白花一两秒。
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
-        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
+        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))
+}
 
-    let desc = client
-        .get(&location)
+/// 读取设备描述 XML。
+async fn fetch_description(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    client
+        .get(url)
         .send()
         .await
         .map_err(|e| format!("UPnP 设备描述请求失败: {e}"))?
         .text()
         .await
-        .map_err(|e| format!("UPnP 设备描述读取失败: {e}"))?;
+        .map_err(|e| format!("UPnP 设备描述读取失败: {e}"))
+}
 
-    // 简化：从 XML 中提取 WANIPConnection 控制 URL
-    let control_url = extract_control_url(&desc, &location)?;
+/// 本机到 `peer` 会使用的源地址（= 内网地址）。
+///
+/// `NewInternalClient` 必须填这个真实地址：填 `0.0.0.0` 时标准实现一律回
+/// **402 Invalid NewInternalClient**（2026-10-24 在 TP-Link 上实测），映射
+/// 永远建不起来——引擎此前的实现正是填 0.0.0.0，所以 UPnP 从未生效过。
+async fn local_ip_towards(peer: IpAddr) -> Result<IpAddr, String> {
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| format!("内网地址探测 socket 绑定失败: {e}"))?;
+    // UDP connect 不发包，只让内核按路由表选定出口网卡与源地址
+    socket
+        .connect(SocketAddr::new(peer, SSDP_PORT))
+        .await
+        .map_err(|e| format!("内网地址探测失败: {e}"))?;
+    let local = socket
+        .local_addr()
+        .map_err(|e| format!("内网地址读取失败: {e}"))?;
+    match local.ip() {
+        IpAddr::V4(v4) if !v4.is_unspecified() => Ok(IpAddr::V4(v4)),
+        other => Err(format!("无法确定本机内网地址: {other}")),
+    }
+}
 
-    // 3. SOAP AddPortMapping
+/// UPnP SOAP AddPortMapping。
+async fn upnp_map_port(
+    igd: Option<&Igd>,
+    internal_port: u16,
+    external_port: u16,
+    protocol: PortMappingProtocol,
+    lifetime: u32,
+) -> Result<NatPortMapping, String> {
+    // 复用调用方已经做过的 SSDP 发现（`map_port` 对 TCP/UDP 只发现一次），
+    // 单独调用时再自己发现。
+    let discovered;
+    let igd: &Igd = match igd {
+        Some(found) => found,
+        None => {
+            discovered = upnp_ssdp_discover().await?;
+            &discovered
+        }
+    };
+
+    let client = http_client()?;
+    let desc = fetch_description(&client, &igd.location).await?;
+    let (control_url, service_type) = extract_control_url(&desc, &igd.location)?;
+    let internal_client = local_ip_towards(igd.ip).await?;
+
     let soap_body = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
-    <u:AddPortMapping xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
+    <u:AddPortMapping xmlns:u="{service_type}">
       <NewRemoteHost></NewRemoteHost>
       <NewExternalPort>{external_port}</NewExternalPort>
       <NewProtocol>{protocol}</NewProtocol>
       <NewInternalPort>{internal_port}</NewInternalPort>
-      <NewInternalClient>0.0.0.0</NewInternalClient>
+      <NewInternalClient>{internal_client}</NewInternalClient>
       <NewEnabled>1</NewEnabled>
       <NewPortMappingDescription>{ENGINE_NAME}</NewPortMappingDescription>
       <NewLeaseDuration>{lifetime}</NewLeaseDuration>
@@ -490,21 +593,24 @@ async fn upnp_map_port(
     let resp = client
         .post(&control_url)
         .header("Content-Type", "text/xml; charset=utf-8")
-        .header(
-            "SOAPAction",
-            r#""urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping""#,
-        )
+        .header("SOAPAction", format!("\"{service_type}#AddPortMapping\""))
         .body(soap_body)
         .send()
         .await
         .map_err(|e| format!("UPnP SOAP 请求失败: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("UPnP SOAP 错误: {}", resp.status()));
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "UPnP SOAP 错误: {} {}",
+            body_error_code(&body).unwrap_or_else(|| "unknown".into()),
+            body_error_text(&body).unwrap_or_default()
+        ));
     }
 
-    // 简化：不解析外部 IP（UPnP 需额外 GetExternalIPAddress 调用）
     Ok(NatPortMapping {
+        // 简化：不额外发 GetExternalIPAddress（多一次往返），外部地址对
+        // 映射本身没有影响，日志里以端口为准。
         external_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         external_port,
         internal_port,
@@ -514,35 +620,42 @@ async fn upnp_map_port(
     })
 }
 
+/// 从 SOAP Fault 里取 UPnP 错误码（用于把人话写进日志）。
+fn body_error_code(body: &str) -> Option<String> {
+    let start = body.find("<errorCode>")? + "<errorCode>".len();
+    let end = body[start..].find("</errorCode>")? + start;
+    Some(body[start..end].trim().to_string())
+}
+
+fn body_error_text(body: &str) -> Option<String> {
+    let start = body.find("<errorDescription>")? + "<errorDescription>".len();
+    let end = body[start..].find("</errorDescription>")? + start;
+    Some(body[start..end].trim().to_string())
+}
+
 /// UPnP 删除映射。
 async fn upnp_unmap_port(
-    _gateway: Option<IpAddr>,
+    igd: Option<&Igd>,
     external_port: u16,
     protocol: PortMappingProtocol,
 ) -> Result<(), String> {
-    let location = upnp_ssdp_discover().await?;
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
-
-    let desc = client
-        .get(&location)
-        .send()
-        .await
-        .map_err(|e| format!("UPnP 设备描述请求失败: {e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("UPnP 设备描述读取失败: {e}"))?;
-
-    let control_url = extract_control_url(&desc, &location)?;
+    let discovered;
+    let igd: &Igd = match igd {
+        Some(found) => found,
+        None => {
+            discovered = upnp_ssdp_discover().await?;
+            &discovered
+        }
+    };
+    let client = http_client()?;
+    let desc = fetch_description(&client, &igd.location).await?;
+    let (control_url, service_type) = extract_control_url(&desc, &igd.location)?;
 
     let soap_body = format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body>
-    <u:DeletePortMapping xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">
+    <u:DeletePortMapping xmlns:u="{service_type}">
       <NewRemoteHost></NewRemoteHost>
       <NewExternalPort>{external_port}</NewExternalPort>
       <NewProtocol>{protocol}</NewProtocol>
@@ -556,7 +669,7 @@ async fn upnp_unmap_port(
         .header("Content-Type", "text/xml; charset=utf-8")
         .header(
             "SOAPAction",
-            r#""urn:schemas-upnp-org:service:WANIPConnection:1#DeletePortMapping""#,
+            format!("\"{service_type}#DeletePortMapping\""),
         )
         .body(soap_body)
         .send()
@@ -564,43 +677,74 @@ async fn upnp_unmap_port(
         .map_err(|e| format!("UPnP SOAP 请求失败: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("UPnP SOAP 错误: {}", resp.status()));
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "UPnP SOAP 错误: {} {}",
+            body_error_code(&body).unwrap_or_else(|| "unknown".into()),
+            body_error_text(&body).unwrap_or_default()
+        ));
     }
     Ok(())
 }
 
-/// 从 UPnP 设备描述 XML 中提取控制 URL。
-fn extract_control_url(desc: &str, base_url: &str) -> Result<String, String> {
-    // 简化 XML 解析：查找 WANIPConnection 的 controlURL
-    // 在实际实现中应使用 XML 解析器，这里用字符串搜索
-    let service_type = "urn:schemas-upnp-org:service:WANIPConnection:1";
-
-    // 找到 serviceType 标签位置
-    let st_pos = desc
-        .find(service_type)
-        .ok_or_else(|| "设备描述中未找到 WANIPConnection 服务".to_string())?;
-
-    // 从 st_pos 向后找 controlURL 标签
-    let after = &desc[st_pos..];
-    let ctrl_start = after
-        .find("<controlURL>")
-        .ok_or_else(|| "未找到 controlURL 标签".to_string())?;
-    let ctrl_end = after[ctrl_start..]
-        .find("</controlURL>")
-        .ok_or_else(|| "controlURL 标签未闭合".to_string())?;
-
-    let path = &after[ctrl_start + 12..ctrl_start + ctrl_end];
-    let path = path.trim();
-
-    // 路径 + base URL 组合
-    let base_url = base_url
-        .rsplit_once('/')
-        .map(|(prefix, _)| prefix.to_string())
-        .unwrap_or_else(|| base_url.to_string());
-
-    Ok(format!("{base_url}{path}"))
+/// 从 UPnP 设备描述 XML 中提取控制 URL 与服务类型。
+///
+/// 注意 `<controlURL>` 必须落在**同一个 `<service>` 块内**：设备描述里
+/// 往往有十几个服务，先出现的可能是别的服务的 controlURL。
+fn extract_control_url(desc: &str, base_url: &str) -> Result<(String, &'static str), String> {
+    for service_type in IGD_SERVICE_TYPES {
+        let Some(st_pos) = desc.find(service_type) else {
+            continue;
+        };
+        let after = &desc[st_pos..];
+        let block_end = after.find("</service>").unwrap_or(after.len());
+        let Some(ctrl_start) = after.find("<controlURL>") else {
+            continue;
+        };
+        if ctrl_start > block_end {
+            continue;
+        }
+        let value_start = ctrl_start + "<controlURL>".len();
+        let Some(ctrl_end) = after[value_start..].find("</controlURL>") else {
+            continue;
+        };
+        let path = after[value_start..value_start + ctrl_end].trim();
+        if path.is_empty() {
+            continue;
+        }
+        return Ok((join_url(base_url, path), service_type));
+    }
+    Err("设备描述中未找到 WANIPConnection/WANPPPConnection 服务".into())
 }
 
+/// 把（可能是相对的）controlURL 拼到设备描述的 origin 上。
+fn join_url(base_url: &str, path: &str) -> String {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return path.to_string();
+    }
+    let base = base_url.split('#').next().unwrap_or(base_url);
+    let (origin, base_path) = match base.find("://") {
+        Some(scheme_end) => {
+            let after_scheme_start = scheme_end + 3;
+            match base[after_scheme_start..].find('/') {
+                Some(i) => {
+                    let split = after_scheme_start + i;
+                    (&base[..split], &base[split..])
+                }
+                None => (base, ""),
+            }
+        }
+        None => (base, ""),
+    };
+    if path.starts_with('/') {
+        return format!("{origin}{path}");
+    }
+    let dir = match base_path.rfind('/') {
+        Some(i) => &base_path[..=i],
+        None => "/",
+    };
+    format!("{origin}{dir}{path}")
+}
 // ----------------------------------------------------------------------
 // 网关发现
 // ----------------------------------------------------------------------
@@ -620,8 +764,16 @@ async fn resolve_gateway(gateway: Option<IpAddr>) -> Result<IpAddr, String> {
         Ipv4Addr::new(10, 0, 0, 1),
         Ipv4Addr::new(10, 1, 1, 1),
     ];
-    for ip in candidates {
-        if probe_nat_pmp_gateway(IpAddr::V4(ip)).await {
+    // 并行探测：串行时 4 个候选地址最坏要等 4×600ms，而这段时间对
+    // 「路由器不支持 NAT-PMP」的场景是纯粹的浪费 —— 映射与撤销都要付一次。
+    let (a, b, c, d) = tokio::join!(
+        probe_nat_pmp_gateway(IpAddr::V4(candidates[0])),
+        probe_nat_pmp_gateway(IpAddr::V4(candidates[1])),
+        probe_nat_pmp_gateway(IpAddr::V4(candidates[2])),
+        probe_nat_pmp_gateway(IpAddr::V4(candidates[3])),
+    );
+    for (ip, ok) in candidates.into_iter().zip([a, b, c, d]) {
+        if ok {
             return Ok(IpAddr::V4(ip));
         }
     }
@@ -639,8 +791,10 @@ async fn probe_nat_pmp_gateway(gateway: IpAddr) -> bool {
     if socket.send_to(&[0u8, 0u8], addr).await.is_err() {
         return false;
     }
+    // 局域网内一次 UDP 往返，正常 < 20ms；用 600ms 上限而不是 2s，
+    // 否则 4 个候选地址就要盲等 8 秒，把 UPnP 回退一起拖慢。
     let mut buf = vec![0u8; 12];
-    timeout(Duration::from_secs(2), socket.recv_from(&mut buf))
+    timeout(Duration::from_millis(600), socket.recv_from(&mut buf))
         .await
         .is_ok()
 }
@@ -738,14 +892,85 @@ mod tests {
   </device>
 </root>"#;
 
-        let url = extract_control_url(desc, "http://192.168.1.1:1900/rootDesc.xml").unwrap();
+        let (url, service) =
+            extract_control_url(desc, "http://192.168.1.1:1900/rootDesc.xml").unwrap();
         assert_eq!(url, "http://192.168.1.1:1900/upnp/control/WANIPConn1");
+        assert_eq!(service, "urn:schemas-upnp-org:service:WANIPConnection:1");
+    }
+
+    /// PPPoE 路由器只暴露 WANPPPConnection：此前代码只认 WANIPConnection，
+    /// 这类路由器（国内家用路由器绝大多数）会直接报「未找到服务」。
+    #[test]
+    fn extract_control_url_ppp_service() {
+        let desc = r#"<?xml version="1.0"?>
+<root>
+  <device>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:WANPPPConnection:1</serviceType>
+        <controlURL>ipc</controlURL>
+      </service>
+    </serviceList>
+  </device>
+</root>"#;
+
+        let (url, service) = extract_control_url(desc, "http://192.168.31.1:1900/igd.xml").unwrap();
+        // 相对路径（不带前导 /）要按设备描述所在目录拼
+        assert_eq!(url, "http://192.168.31.1:1900/ipc");
+        assert_eq!(service, "urn:schemas-upnp-org:service:WANPPPConnection:1");
+    }
+
+    /// 别处服务的 controlURL 不能被误当成 IGD 的。
+    #[test]
+    fn extract_control_url_ignores_other_service() {
+        let desc = r#"<?xml version="1.0"?>
+<root>
+  <device>
+    <serviceList>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:Layer3Forwarding:1</serviceType>
+        <controlURL>/l3f</controlURL>
+      </service>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+        <controlURL>/ipc</controlURL>
+      </service>
+    </serviceList>
+  </device>
+</root>"#;
+
+        let (url, _) = extract_control_url(desc, "http://192.168.0.1:1900/igd.xml").unwrap();
+        assert_eq!(url, "http://192.168.0.1:1900/ipc");
     }
 
     #[test]
     fn extract_control_url_missing_service() {
         let desc = r#"<?xml version="1.0"?><root></root>"#;
         assert!(extract_control_url(desc, "http://192.168.1.1:1900/desc.xml").is_err());
+    }
+
+    #[test]
+    fn join_url_absolute_and_relative() {
+        // 绝对 URL 原样返回
+        assert_eq!(
+            join_url("http://192.168.1.1:1900/igd.xml", "http://10.0.0.1/ctl"),
+            "http://10.0.0.1/ctl"
+        );
+        // 根路径
+        assert_eq!(
+            join_url("http://192.168.1.1:1900/igd.xml", "/ctl"),
+            "http://192.168.1.1:1900/ctl"
+        );
+        // 相对路径（目录保留）
+        assert_eq!(
+            join_url("http://192.168.1.1:1900/upnp/igd.xml", "ctl"),
+            "http://192.168.1.1:1900/upnp/ctl"
+        );
+        // 描述地址没有路径
+        assert_eq!(
+            join_url("http://192.168.1.1:1900", "ctl"),
+            "http://192.168.1.1:1900/ctl"
+        );
     }
 
     /// 模拟 NAT-PMP 服务器测试。
@@ -802,5 +1027,35 @@ mod tests {
         assert_eq!(mapping.external_ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
 
         server_task.await.unwrap();
+    }
+
+    /// 真机验证（需要路由器开启 UPnP；默认跳过）：
+    ///
+    /// ```text
+    /// cargo test -p xfer-discovery --lib real_upnp_map -- --ignored --nocapture
+    /// ```
+    ///
+    /// 建立 TCP+UDP 映射后立即撤销，用来确认「内网地址填写 / IGD 服务类型 /
+    /// SOAP 动作」在真实路由器上确实能成功（2026-10-24 用 TP-Link 验证：
+    /// 旧实现填 0.0.0.0 被回 402，新实现映射成功）。
+    #[tokio::test]
+    #[ignore]
+    async fn real_upnp_map_and_unmap() {
+        const PORT: u16 = 45678;
+        let client = UpnpClient::new();
+        let results = client.map_port(PORT, PORT, 120).await;
+        for r in &results {
+            eprintln!("map result: {r:?}");
+        }
+        assert!(
+            results.iter().any(|r| r.is_ok()),
+            "NAT-PMP 与 UPnP 都失败（路由器未开 UPnP？）"
+        );
+        for proto in [PortMappingProtocol::Tcp, PortMappingProtocol::Udp] {
+            match client.unmap_port(PORT, proto).await {
+                Ok(()) => eprintln!("unmap {proto} ok"),
+                Err(e) => eprintln!("unmap {proto} fail: {e}"),
+            }
+        }
     }
 }
