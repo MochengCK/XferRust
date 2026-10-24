@@ -31,6 +31,15 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(60);
 /// 连接建立上限。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 连接尝试次数（首次 + 两次重试）。
+///
+/// 对端地址来自 UDP 发现报文（8s 过期）：DHCP 续租换址、手机 Wi-Fi 休眠后
+/// ARP 失效、设备刚从一张网卡切到另一张，都会让旧地址报 "No route to host"。
+/// 下一轮广播（2s 一轮）往往就能带回新地址，所以连接失败先重试，不要一次
+/// 失败就把任务打成错误。
+const CONNECT_ATTEMPTS: u32 = 3;
+/// 连接重试间隔：略小于一轮发现广播，留出对方回 hello 的时间。
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(1200);
 /// 握手行字节上限（协议报文是单行小 JSON）。
 const HANDSHAKE_MAX: usize = 8 * 1024;
 
@@ -296,18 +305,88 @@ pub(crate) async fn sender_loop(svc: Arc<LanService>) {
     }
 }
 
+/// 连接对端，失败时按发现周期重试。
+///
+/// 每次尝试都重新读 `peer_target`：发现循环每 2s 广播一次，对端换网/续租后
+/// 地址表会在几百毫秒内更新，拿旧地址死磕只会得到 `No route to host`。
+async fn connect_peer(
+    svc: &Arc<LanService>,
+    peer_id: &str,
+    peer_name: &str,
+    first_target: SocketAddr,
+) -> Result<(TcpStream, SocketAddr), String> {
+    let mut last_error = format!("连接 {peer_name} 失败");
+    for attempt in 1..=CONNECT_ATTEMPTS {
+        // 首次沿用调用方已经取好的地址（与打开文件前的判断一致），
+        // 重试时重新读地址表：对端换网后新地址由下一轮广播带回来。
+        let target = if attempt == 1 {
+            first_target
+        } else {
+            match svc.peer_target(peer_id) {
+                Some(target) => target,
+                None => {
+                    // 地址表里没有（超过 8s 没收到对端报文）：等一轮广播再看
+                    last_error = format!("设备 {peer_name} 已离线");
+                    tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                    continue;
+                }
+            }
+        };
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect(target)).await {
+            Ok(Ok(stream)) => {
+                let _ = stream.set_nodelay(true);
+                return Ok((stream, target));
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(peer = %target, attempt, error = %e, "连接对端失败");
+                last_error = connect_error_text(peer_name, &e);
+            }
+            Err(_) => {
+                tracing::warn!(peer = %target, attempt, "连接对端超时");
+                last_error = format!("连接 {peer_name} 超时");
+            }
+        }
+        if attempt < CONNECT_ATTEMPTS {
+            tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+        }
+    }
+    Err(last_error)
+}
+
+/// 把连接错误翻译成用户能看懂的一句话。
+///
+/// 原来的做法是把 `io::Error` 直接拼进任务错误，界面上显示的
+/// `No route to host (os error 65)` 对普通用户没有意义，也分不清
+/// 「设备离线」和「网络不同」。原始错误仍然写进 tracing 日志，方便排查。
+fn connect_error_text(peer_name: &str, err: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    match err.kind() {
+        ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => {
+            format!("连接 {peer_name} 失败：对方设备不在线，或两台设备不在同一网络")
+        }
+        ErrorKind::ConnectionRefused => {
+            format!("连接 {peer_name} 失败：对方已停止接收，可能刚关闭了应用")
+        }
+        ErrorKind::TimedOut => format!("连接 {peer_name} 超时"),
+        _ => format!("连接 {peer_name} 失败：{err}"),
+    }
+}
+
 async fn send_one(svc: &Arc<LanService>, task: &LanTask) -> Result<(), String> {
     let peer_id = task
         .peer_id
         .as_deref()
         .ok_or_else(|| "任务缺少对方设备 id".to_string())?;
-    let target = svc
-        .peer_target(peer_id)
-        .ok_or_else(|| format!("设备 {} 已离线", task.peer_name))?;
     let source = task
         .source_path
         .as_deref()
         .ok_or_else(|| "任务缺少源文件路径".to_string())?;
+
+    // 先按最近一轮发现拿到的地址确认对端在线；打开文件之后地址可能被
+    // 新一轮广播刷新，connect_peer 会在重试时重新读取。
+    let first_target = svc
+        .peer_target(peer_id)
+        .ok_or_else(|| format!("设备 {} 已离线", task.peer_name))?;
 
     let mut file = File::open(source)
         .await
@@ -322,11 +401,7 @@ async fn send_one(svc: &Arc<LanService>, task: &LanTask) -> Result<(), String> {
     let size = meta.len() as i64;
     svc.update_size(&task.id, size);
 
-    let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(target))
-        .await
-        .map_err(|_| format!("连接 {} 超时", task.peer_name))?
-        .map_err(|e| format!("连接 {} 失败：{e}", task.peer_name))?;
-    let _ = stream.set_nodelay(true);
+    let (mut stream, target) = connect_peer(svc, peer_id, &task.peer_name, first_target).await?;
 
     // ---- 明文 offer ----
     let own_key = crypto::new_secret_key();
@@ -621,5 +696,24 @@ mod tests {
             "a (1).txt"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 不可达/拒绝/超时要给用户能看懂的话，不能把 `os error 65` 这种
+    /// 系统错误直接甩到任务卡片上。
+    #[test]
+    fn connect_errors_are_explained_in_plain_words() {
+        let unreachable = std::io::Error::new(
+            std::io::ErrorKind::HostUnreachable,
+            "No route to host (os error 65)",
+        );
+        let text = connect_error_text("Lerxu", &unreachable);
+        assert!(text.contains("不在同一网络"), "{text}");
+        assert!(!text.contains("os error"), "{text}");
+
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        assert!(connect_error_text("Lerxu", &refused).contains("停止接收"));
+
+        let timed_out = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert!(connect_error_text("Lerxu", &timed_out).contains("超时"));
     }
 }

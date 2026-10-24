@@ -6,6 +6,7 @@
 - Port mapping now supports both `WANIPConnection` and `WANPPPConnection` (PPPoE routers)
 - Pausing a task saves the session immediately, so progress no longer rolls back after a restart
 - Fixed a write failure after restarting when a task had just been added and the session stored an empty path
+- LAN sends now explain an unreachable device in plain words and retry before giving up
 
 ## New Features
 
@@ -35,6 +36,11 @@
 
 - Pausing a task now saves the session immediately: quitting after a pause no longer rolls the downloaded size back to an older value on restart.
 - Fixed a write failure on restart when a task had just been added and the session stored an empty path as the target.
+
+### LAN transfer
+
+- When a send cannot reach the other device, the task now says the device is offline or on a different network instead of showing a bare `No route to host`.
+- Before declaring the device offline it retries at the discovery interval, so a device that just changed networks or woke from sleep is not failed on the first attempt.
 
 ## Behavior Changes
 
