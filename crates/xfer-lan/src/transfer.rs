@@ -358,11 +358,25 @@ async fn connect_peer(
 /// 原来的做法是把 `io::Error` 直接拼进任务错误，界面上显示的
 /// `No route to host (os error 65)` 对普通用户没有意义，也分不清
 /// 「设备离线」和「网络不同」。原始错误仍然写进 tracing 日志，方便排查。
+///
+/// macOS 15 起「本地网络」是需要单独授权的隐私项：**没授权时内核会立刻
+/// 回 EHOSTUNREACH**（SYN 根本没出网卡），和「真的不在一个网段」表现
+/// 一模一样。所以 macOS 上的文案必须把这条最可能的原因排在前面 ——
+/// 只写「不在同一网络」会把用户赶去查路由器，而问题其实在系统设置里。
 fn connect_error_text(peer_name: &str, err: &std::io::Error) -> String {
     use std::io::ErrorKind;
     match err.kind() {
         ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => {
-            format!("连接 {peer_name} 失败：对方设备不在线，或两台设备不在同一网络")
+            #[cfg(target_os = "macos")]
+            {
+                // 任务卡片一行放得下；完整路径（系统设置 › 隐私与安全性 ›
+                // 本地网络）由界面的互传面板提示给出，不塞进这里。
+                format!("连接 {peer_name} 失败：本机的「本地网络」权限未开启，或两台设备不在同一网络")
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                format!("连接 {peer_name} 失败：对方设备不在线，或两台设备不在同一网络")
+            }
         }
         ErrorKind::ConnectionRefused => {
             format!("连接 {peer_name} 失败：对方已停止接收，可能刚关闭了应用")
