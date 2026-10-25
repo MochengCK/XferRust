@@ -211,6 +211,57 @@ impl PlaylistPlan {
     }
 }
 
+/// 按时间窗口裁剪分片计划：只保留与 `[start, end)` 有交集的分片。
+///
+/// 时间轴 = `#EXTINF` 的累计和（从媒体起点算）。粒度是**整个分片**——引擎不带
+/// ffmpeg，不能在转封装时按帧裁切，所以实际产物会比请求的窗口多出首尾各最多
+/// 一个分片的长度（典型 2~6 秒）。
+///
+/// 窗口内一个分片都没有时**退回整条清单**：宁可多下也不要产出空任务（时长
+/// 估算来自清单，站点把 EXTINF 写虚时窗口可能整段落空）。
+fn apply_clip_window(plan: &mut PlaylistPlan, start: f64, end: f64) {
+    let all = std::mem::take(&mut plan.segments);
+    if all.is_empty() {
+        return;
+    }
+    let mut cursor = 0.0f64;
+    let mut keep = Vec::with_capacity(all.len());
+    let mut kept_duration = 0.0f64;
+    for seg in &all {
+        let seg_start = cursor;
+        let seg_end = cursor + seg.duration.max(0.0);
+        cursor = seg_end;
+        // 与 [start, end) 有交集：段尾 > start 且段头 < end
+        let hit = seg_end > start + 0.001 && seg_start < end - 0.001;
+        if hit {
+            kept_duration += seg.duration.max(0.0);
+        }
+        keep.push(hit);
+    }
+    if !keep.iter().any(|k| *k) {
+        tracing::warn!(start, end, "片段区间内没有分片，按整条清单下载");
+        plan.segments = all;
+        return;
+    }
+    let kept_count = keep.iter().filter(|k| **k).count();
+    plan.segments = all
+        .into_iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(seg, _)| seg)
+        .collect();
+    plan.duration_secs = kept_duration;
+    // 只下了片段，原来的总长（若已估算）不再成立，交给后面的探测/求和重算
+    plan.total = None;
+    tracing::info!(
+        start,
+        end,
+        kept = kept_count,
+        duration_secs = kept_duration,
+        "片段下载：按时间窗口裁剪分片"
+    );
+}
+
 /// 下载选项（由引擎层从任务/全局选项合成）。
 #[derive(Debug, Clone)]
 pub struct PlaylistOptions {
@@ -252,6 +303,13 @@ pub struct PlaylistOptions {
     /// 没有任何新增足以判定源已停播；`Duration::ZERO` = 不自动收尾（只认
     /// `#EXT-X-ENDLIST` 与手动停止）。
     pub live_stall_timeout: Duration,
+    /// 片段下载：只保留与 `[clip_start, clip_end)` 有交集的分片（秒，相对媒体起点）。
+    ///
+    /// 边界以**分片**为粒度（按 `#EXTINF` 累计算出每段的起止时间）：引擎不依赖
+    /// ffmpeg，没有"转封装时裁切"的能力，所以裁不到帧级。`None` = 不裁剪。
+    /// 只对**非直播**清单生效（直播没有稳定时间轴）。
+    pub clip_start: Option<f64>,
+    pub clip_end: Option<f64>,
 }
 
 impl Default for PlaylistOptions {
@@ -267,7 +325,21 @@ impl Default for PlaylistOptions {
             ordered_write: false,
             // 两分钟无新增分片 → 视为直播结束（见字段说明）
             live_stall_timeout: Duration::from_secs(120),
+            clip_start: None,
+            clip_end: None,
         }
+    }
+}
+
+impl PlaylistOptions {
+    /// 归一化后的裁剪窗口：起止都有效、且 end 在 start 之后才算数。
+    pub fn clip_window(&self) -> Option<(f64, f64)> {
+        let start = self.clip_start.filter(|v| v.is_finite() && *v >= 0.0)?;
+        let end = self.clip_end.filter(|v| v.is_finite() && *v > 0.0)?;
+        if end <= start {
+            return None;
+        }
+        Some((start, end))
     }
 }
 
@@ -1238,6 +1310,12 @@ pub async fn fetch_plan(
             target_duration: media.target_duration,
             parts_only: media.parts_only,
         };
+        // 片段下载：按时间窗口裁分片（直播没有稳定时间轴，不裁）
+        if !plan.live {
+            if let Some((start, end)) = opts.clip_window() {
+                apply_clip_window(&mut plan, start, end);
+            }
+        }
         if plan.segment_count() == 0 {
             return Err(HttpError::Protocol("播放列表中没有可下载的分片".into()));
         }
@@ -6810,5 +6888,28 @@ mod tests {
         // 每轨相对推进量保留：三段共 3s（视频 270000@90k、音频 144000@48k）
         let bytes = std::fs::read(&path).unwrap();
         assert!(!bytes.is_empty(), "产物应包含 init 与分段");
+    }
+}
+
+#[cfg(test)]
+mod clip_window_opts {
+    use super::*;
+
+    #[test]
+    fn clip_window_requires_valid_range() {
+        let mut o = PlaylistOptions::default();
+        assert_eq!(o.clip_window(), None, "默认不裁剪");
+
+        o.clip_start = Some(5.0);
+        assert_eq!(o.clip_window(), None, "只有 start 不算窗口");
+
+        o.clip_end = Some(3.0);
+        assert_eq!(o.clip_window(), None, "end 必须大于 start");
+
+        o.clip_end = Some(9.5);
+        assert_eq!(o.clip_window(), Some((5.0, 9.5)));
+
+        o.clip_start = Some(f64::NAN);
+        assert_eq!(o.clip_window(), None, "非法值直接忽略");
     }
 }

@@ -2058,6 +2058,14 @@ impl TaskManager {
                     v == "ordered" || v == "sequential" || v == "true"
                 })
                 .unwrap_or(false),
+            // 片段下载：起止秒数（任务选项 > 全局选项）。只有 start/end 都有效、
+            // 且 end > start 时才生效（见 PlaylistOptions::clip_window）。
+            clip_start: get("clip-start")
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0),
+            clip_end: get("clip-end")
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0),
             // 直播录制的停滞判定（秒；0 = 不自动收尾）。默认两分钟：
             // 真实直播的分片间隔在 2~10 秒量级，两分钟没有新增足以判定
             // 源已停播；而"不带 ENDLIST 的点播列表"也靠它收尾。
