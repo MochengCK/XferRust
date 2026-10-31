@@ -1567,7 +1567,9 @@ impl TaskManager {
         // （`delete_task_ctrl`），新任务既找不到续传现场、又因为目标文件已存在而
         // 改名成 `xxx.1.ts`，用户看到的就是"一出错，重新下载必定从零开始"。
         let status = task.status();
-        if !matches!(status, Status::Paused | Status::Error) {
+        // `Active` 也放进来：见下面"驱动还在跑"的特判（磁力 select-file 后
+        // 应用紧接着 resume 的竞态）。真正的"不接受"仍是其他终态。
+        if !matches!(status, Status::Paused | Status::Error | Status::Active) {
             return Err("任务未处于暂停或失败状态".into());
         }
         // 失败态重跑：清掉上一次的错误信息，否则界面上"下载中"还挂着旧错误。
@@ -1593,6 +1595,18 @@ impl TaskManager {
             && task.bt_meta.lock().unwrap().is_some()
         {
             return Err("请先选择要下载的文件".into());
+        }
+        // 驱动**还在跑**（典型场景：磁力刚下发 select-file，select_files 里的
+        // cancel 尚未收尾，应用紧接着就调了 resume）：
+        //   · 直接入队 → 同一任务既在 active 又在 queue，会被调度两次；
+        //   · 返回错误 → 前端把"选择文件"整体判成失败，任务永远停在暂停，
+        //     表现就是"选完文件一直没有速度"（qB 是热切换，没有这段窗口）。
+        // 置 Restart：本轮收尾会把任务转成 Waiting 并带上**新的**
+        // selected_files 重新入队（见 run_task 的 Intent::Restart 分支），
+        // 不用等应用重试，也不会重复入队。
+        if status == Status::Active {
+            *task.intent.lock().unwrap() = Intent::Restart;
+            return Ok(());
         }
         // 令牌不可复用：替换为新令牌并重置意图，再入队等待调度
         *task.cancel.write().unwrap() = CancellationToken::new();
