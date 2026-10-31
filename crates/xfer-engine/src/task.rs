@@ -987,11 +987,22 @@ pub fn status_json(task: &Task) -> Value {
         let per_file = bt_files_done_bytes(&meta.info, &bitfield, sel.as_deref(), complete);
         let per_file_verified =
             bt_files_done_bytes(&meta.info, &verified_bitfield, sel.as_deref(), false);
-        verified_total = per_file_verified.iter().sum();
+        // 已验证大小同样排除 BEP 47 对齐填充：它和 completedLength 是同一个
+        // 内容口径，混进 padding 会让"已验证"虚高
+        verified_total = per_file_verified
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !meta.info.files[*i].is_padding)
+            .map(|(_, v)| *v)
+            .sum();
         meta.info
             .files
             .iter()
             .enumerate()
+            // BEP 47 对齐填充文件不进文件列表（qB 也不显示）：它们是种子
+            // 为对齐片边界插入的填充，不是内容。**index 仍用原始 1 起算值**，
+            // 这样界面回传的 select-file 索引与引擎内部布局一一对应。
+            .filter(|(_, f)| !f.is_padding)
             .map(|(i, f)| {
                 json!({
                     "index": (i + 1).to_string(),
@@ -1068,6 +1079,13 @@ pub fn status_json(task: &Task) -> Value {
         json!(s.total_len.unwrap_or(0).to_string()),
     );
     m.insert("completedLength".into(), json!(s.completed.to_string()));
+    // 本轮已接收字节（BT 驱动按字节级上报，含尚未校验落盘、重复下载的部分）。
+    // 首片校验完成前 completedLength 恒为 0，界面用它在"首片窗口"里显示
+    // "已接收 X"而不是死板的 0 KB。HTTP/SFTP 未上报时为 0。
+    m.insert(
+        "receivedLength".into(),
+        json!(task.received_live().to_string()),
+    );
     // 本次启动从磁盘已有文件继承并校验通过的大小（普通新任务为 0）
     m.insert("verifiedLength".into(), json!(verified_total.to_string()));
     m.insert("uploadLength".into(), json!(s.uploaded.to_string()));
@@ -1148,11 +1166,21 @@ pub fn status_json_native(task: &Task) -> Value {
         // 已验证大小：只统计本次启动从磁盘已有文件继承/续传的片
         let per_file_verified =
             bt_files_done_bytes(&meta.info, &verified_bitfield, sel.as_deref(), false);
-        verified_total = per_file_verified.iter().sum();
+        // 已验证大小同样排除 BEP 47 对齐填充：它和 completedLength 是同一个
+        // 内容口径，混进 padding 会让"已验证"虚高
+        verified_total = per_file_verified
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !meta.info.files[*i].is_padding)
+            .map(|(_, v)| *v)
+            .sum();
         meta.info
             .files
             .iter()
             .enumerate()
+            // BEP 47 对齐填充文件不进文件列表（与兼容协议同口径）；
+            // index 保持原始 1 起算值，select-file 索引才能对上
+            .filter(|(_, f)| !f.is_padding)
             .map(|(i, f)| {
                 json!({
                     "index": i + 1,
@@ -1231,6 +1259,9 @@ pub fn status_json_native(task: &Task) -> Value {
         "status": s.status.as_str(),
         "totalLength": s.total_len.unwrap_or(0),
         "completedLength": s.completed,
+        // 本轮已接收字节（BT 字节级上报，含未校验/重复下载的部分）：
+        // 首片落盘前 completedLength 恒为 0，界面据此显示"已接收 X"。
+        "receivedLength": task.received_live(),
         // 本次启动从磁盘已有文件继承并校验通过的大小（普通新任务为 0）
         "verifiedLength": verified_total,
         // 已有数据校验进行中：checked/total 为实时进度（未校验时为 false/0）
@@ -1288,6 +1319,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, len)| FileEntry {
+                is_padding: false,
                 path: vec![format!("f{i}.bin")],
                 length: *len,
             })

@@ -1180,11 +1180,17 @@ impl TorrentEngine {
             .iter()
             .map(|f| (f.path.clone(), f.length))
             .collect();
+        // BEP 47 对齐填充标记：片布局必须保留它们（参与偏移与 SHA-1），
+        // 但内容大小 / 进度 / 文件列表都要排除（与 qB 同口径）
+        let padding_flags: Vec<bool> = meta.info.files.iter().map(|f| f.is_padding).collect();
         // 单文件/多文件由种子结构位决定（`files.len()==1` 无法区分
         // 「单文件种子」与「只有 1 个文件的多文件种子」）
         let layout =
             PieceLayout::new(meta.info.piece_length, files).with_multi_file(meta.info.multi_file);
-        let total_bytes = layout.total_length();
+        let layout = layout.with_padding_flags(&padding_flags);
+        // 分母口径 = 所选文件的**内容**长度（不含 padding），与
+        // `done_bytes_of` 的分子同源
+        let total_bytes = layout.selected_length(config.selected_files.as_deref());
         // 已有数据判定必须在建库/预分配**之前**：预分配会把新文件补到最终
         // 长度，之后再 stat 会把空文件误判成"已有数据"并白跑一遍校验。
         let existing_before = has_existing_data(&config.dir, &meta.info.name, &layout);
@@ -1393,11 +1399,14 @@ impl TorrentEngine {
             .iter()
             .map(|f| (f.path.clone(), f.length))
             .collect();
+        // BEP 47 对齐填充标记（与 TorrentEngine::new 同口径）
+        let padding_flags: Vec<bool> = meta.info.files.iter().map(|f| f.is_padding).collect();
         // 单文件/多文件由种子结构位决定（`files.len()==1` 无法区分
         // 「单文件种子」与「只有 1 个文件的多文件种子」）
         let layout =
             PieceLayout::new(meta.info.piece_length, files).with_multi_file(meta.info.multi_file);
-        let total_bytes = layout.total_length();
+        let layout = layout.with_padding_flags(&padding_flags);
+        let total_bytes = layout.selected_length(self.selected_files.lock().unwrap().as_deref());
         // 按文件选择建库（与 TorrentEngine::new 同语义）：
         // 磁力等待勾选期间 selected_files=Some(空) → 不创建任何数据文件，
         // 目录与文件等用户勾选完成、下次启动带真实选择时才创建
@@ -6159,12 +6168,17 @@ impl TorrentEngine {
 /// 位图/磁盘实测背离（进度虚报，见 ANALYSIS_BT_SPEED.md 第六节）。
 ///
 /// 口径与 `total_bytes` 严格配对：
-/// - `selected = None`（全量下载）：总量 = 全部文件长度，已完成 = 每个
-///   已完成片的片长之和（非末片恒为 piece_length，末片查布局）；
+/// - `selected = None`（全量下载）：总量 = 全部**内容**文件长度，已完成 =
+///   每个已完成片的片长之和（非末片恒为 piece_length，末片查布局）；
 /// - `selected = Some`（勾选部分文件）：总量 = 所选文件长度之和，已完成
 ///   只累计「已完成片落在所选文件内的段长」——跨选/未选边界的片必须
 ///   按段长归属拆分，否则未选文件一侧的字节会混入分子，出现
 ///   completedLength > totalLength 的 >100% 进度（曾观测到 100.08%）。
+///
+/// **BEP 47 对齐填充（padding）两侧都不计**：它的字节参与片校验、占全局
+/// 偏移，但不是内容。若分子算了、分母没算（或反过来），进度会漂到
+/// 100% 上下，所以这里与 [`PieceLayout::selected_length`] 必须同口径 ——
+/// 后者已经排除了 padding，这里也要排除。
 fn done_bytes_of(
     store: &PieceStore,
     wanted: Option<&PieceMap>,
@@ -6174,9 +6188,10 @@ fn done_bytes_of(
     if count == 0 {
         return 0;
     }
-    if selected.is_none() {
+    let has_padding = store.layout().files.iter().any(|f| f.is_padding);
+    if selected.is_none() && !has_padding {
         // 全量快路径：不查文件布局（避免每片重算 total_length 的
-        // O(片数×文件数) 开销）
+        // O(片数×文件数) 开销）。无 padding 时按片累加与按文件归属等价。
         let piece_length = store.layout().piece_length;
         let last = count - 1;
         let mut n = 0u64;
@@ -6192,15 +6207,17 @@ fn done_bytes_of(
         }
         return n;
     }
-    // 收缩口径：逐片按段长归属统计（O(片数 + 文件数)）
-    let set: HashSet<usize> = selected.unwrap().iter().copied().collect();
-    let per_file = store
-        .layout()
-        .files_done_bytes(|i| wanted.is_none_or(|m| m.is_set(i)) && store.have_piece(i));
+    // 按段长归属统计（O(片数 + 文件数)）：padding 文件与未选文件的字节
+    // 一律不计入分子。
+    let set: Option<HashSet<usize>> = selected.map(|s| s.iter().copied().collect());
+    let layout = store.layout();
+    let per_file = layout.files_done_bytes(|i| wanted.is_none_or(|m| m.is_set(i)) && store.have_piece(i));
     per_file
         .iter()
         .enumerate()
-        .filter(|(i, _)| set.contains(i))
+        .filter(|(i, _)| {
+            !layout.files[*i].is_padding && set.as_ref().is_none_or(|set| set.contains(i))
+        })
         .map(|(_, v)| *v)
         .sum()
 }
@@ -8037,10 +8054,12 @@ mod tests {
                 pieces: vec![hash(b"ab"), hash(b"cd"), hash(b"ef"), hash(b"gh")],
                 files: vec![
                     FileEntry {
+                        is_padding: false,
                         path: vec!["a.bin".into()],
                         length: 4,
                     },
                     FileEntry {
+                        is_padding: false,
                         path: vec!["b.bin".into()],
                         length: 4,
                     },
@@ -8107,10 +8126,12 @@ mod tests {
                 pieces: vec![hash(b"abcd"), hash(b"efgh"), hash(b"ijkl")],
                 files: vec![
                     FileEntry {
+                        is_padding: false,
                         path: vec!["a.bin".into()],
                         length: 6,
                     },
                     FileEntry {
+                        is_padding: false,
                         path: vec!["b.bin".into()],
                         length: 6,
                     },
@@ -8191,6 +8212,7 @@ mod tests {
                 piece_length: PIECE as u64,
                 pieces,
                 files: vec![FileEntry {
+                    is_padding: false,
                     path: vec!["big.bin".into()],
                     length: data.len() as u64,
                 }],

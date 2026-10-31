@@ -56,6 +56,15 @@ pub struct FileEntry {
     /// 相对路径各部分（多文件时 ≥1 段；单文件时仅 name）。
     pub path: Vec<String>,
     pub length: u64,
+    /// BEP 47 对齐填充文件（`attr` 含 `p`，或旧式 `_____padding_file_N` 命名）。
+    ///
+    /// 它的字节**是种子的一部分**（参与片 SHA-1 校验、占全局偏移），
+    /// 但**不是用户要的内容**：qB / libtorrent 都不把它算进"大小"、
+    /// 不在文件列表里显示。此前完全没解析 `attr`，padding 被当成普通文件，
+    /// 于是总大小偏大（实测 5.02GB vs qB 的 4.67GB）、文件列表里混进
+    /// 一堆 `.pad` 条目（用户按 qB 的印象勾选就会勾错，勾中纯 padding
+    /// 的文件则永远下不到真实数据 —— 表现成"选完文件没速度"）。
+    pub is_padding: bool,
 }
 
 /// 解析 .torrent 字节。
@@ -234,6 +243,7 @@ fn parse_info(v: &Value) -> Result<Info, String> {
                 vec![FileEntry {
                     path: vec![name.clone()],
                     length: len as u64,
+                    is_padding: false,
                 }],
                 false,
             )
@@ -277,9 +287,21 @@ fn parse_info(v: &Value) -> Result<Info, String> {
                 if parts.is_empty() {
                     return Err("文件条目 path 为空".into());
                 }
+                // BEP 47：`attr` 里的 `p` 表示对齐填充文件；老式种子（BEP 47
+                // 之前）用 `_____padding_file_N` 这种命名表达同一件事。
+                // 两者都要认，否则大小/文件列表都会把 padding 算成内容。
+                let attr_pad = fd
+                    .get(b"attr".as_slice())
+                    .and_then(Value::as_bytes)
+                    .map(|b| b.contains(&b'p'))
+                    .unwrap_or(false);
+                let name_pad = parts
+                    .iter()
+                    .any(|seg| seg.starts_with("_____padding_file_"));
                 out.push(FileEntry {
                     path: parts,
                     length,
+                    is_padding: attr_pad || name_pad,
                 });
             }
             (out, true)
@@ -296,9 +318,29 @@ fn parse_info(v: &Value) -> Result<Info, String> {
 }
 
 impl Info {
-    /// 文件总长度。
+    /// 文件总长度（**含** BEP 47 对齐填充文件）。
+    ///
+    /// 片数、片偏移、片校验都必须按它算 —— padding 的字节是种子数据的一部分。
+    /// 给用户显示的大小请用 [`Self::content_length`]。
     pub fn total_length(&self) -> u64 {
         self.files.iter().map(|f| f.length).sum()
+    }
+
+    /// 内容总长度（**不含** BEP 47 对齐填充文件）。
+    ///
+    /// qB / libtorrent 的"大小"列就是这个口径：padding 是为了把文件对齐到
+    /// 片边界而插入的填充，不是用户要的内容。
+    pub fn content_length(&self) -> u64 {
+        self.files
+            .iter()
+            .filter(|f| !f.is_padding)
+            .map(|f| f.length)
+            .sum()
+    }
+
+    /// 是否存在对齐填充文件（尺寸/进度口径需要区分时才用）。
+    pub fn has_padding(&self) -> bool {
+        self.files.iter().any(|f| f.is_padding)
     }
 
     /// 某文件相对任务下载目录的路径（`/` 分隔），与磁盘布局一致。
@@ -476,14 +518,17 @@ mod tests {
                 FileEntry {
                     path: vec!["a".into()],
                     length: 15,
+                    is_padding: false,
                 },
                 FileEntry {
                     path: vec!["b".into()],
                     length: 10,
+                    is_padding: false,
                 },
                 FileEntry {
                     path: vec!["c".into()],
                     length: 5,
+                    is_padding: false,
                 },
             ],
             private: false,
@@ -600,5 +645,73 @@ mod tests {
             meta.info.files[0].path,
             vec!["_".to_string(), "sub".to_string(), "f.bin".to_string()]
         );
+    }
+
+    /// 单个文件字典（BEP 3 / BEP 47）。
+    fn file_entry(name: &str, len: i64, attr: Option<&str>) -> crate::Value {
+        let mut m = BTreeMap::new();
+        m.insert(b"length".to_vec(), int(len));
+        m.insert(b"path".to_vec(), list(vec![bytes(name)]));
+        if let Some(a) = attr {
+            m.insert(b"attr".to_vec(), bytes(a));
+        }
+        dict(m)
+    }
+
+    /// BEP 47：`attr` 含 `p` 的对齐填充文件必须被标记，且**不计入内容大小**。
+    ///
+    /// 修这个之前 `attr` 完全没解析：padding 被当成普通文件 → 总大小比
+    /// qB 偏大（实测 5.02GB vs 4.67GB）、文件列表里混进一堆 `.pad` 条目。
+    #[test]
+    fn padding_files_flagged_and_excluded_from_content_length() {
+        let info = dict(BTreeMap::from([
+            (b"name".to_vec(), bytes("d")),
+            (b"piece length".to_vec(), int(10)),
+            // 总长 6+4+6=16 → 2 片
+            (b"pieces".to_vec(), bytes(vec![0u8; 40])),
+            (
+                b"files".to_vec(),
+                list(vec![
+                    file_entry("a.bin", 6, None),
+                    file_entry("pad-1", 4, Some("p")),
+                    file_entry("b.bin", 6, None),
+                ]),
+            ),
+        ]));
+        let top = dict(BTreeMap::from([(b"info".to_vec(), info)]));
+        let meta = parse_torrent(&encode(&top)).unwrap();
+
+        assert_eq!(meta.info.files.len(), 3);
+        assert!(!meta.info.files[0].is_padding);
+        assert!(meta.info.files[1].is_padding, "attr=p 必须标记为 padding");
+        assert!(!meta.info.files[2].is_padding);
+        // 片布局/校验仍按含 padding 的总长
+        assert_eq!(meta.info.total_length(), 16);
+        // 用户看到的大小排除 padding
+        assert_eq!(meta.info.content_length(), 12);
+        assert!(meta.info.has_padding());
+    }
+
+    /// 旧式种子（BEP 47 之前）用 `_____padding_file_N` 命名表达同一件事，
+    /// 没有 `attr` 也要认出来。
+    #[test]
+    fn legacy_padding_file_name_is_detected() {
+        let info = dict(BTreeMap::from([
+            (b"name".to_vec(), bytes("d")),
+            (b"piece length".to_vec(), int(10)),
+            (b"pieces".to_vec(), bytes(vec![0u8; 40])),
+            (
+                b"files".to_vec(),
+                list(vec![
+                    file_entry("a.bin", 6, None),
+                    file_entry("_____padding_file_0_xyz", 4, None),
+                    file_entry("b.bin", 6, None),
+                ]),
+            ),
+        ]));
+        let top = dict(BTreeMap::from([(b"info".to_vec(), info)]));
+        let meta = parse_torrent(&encode(&top)).unwrap();
+        assert!(meta.info.files[1].is_padding, "旧式命名也要识别");
+        assert_eq!(meta.info.content_length(), 12);
     }
 }

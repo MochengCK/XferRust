@@ -198,6 +198,10 @@ pub struct FileLayout {
     pub length: u64,
     /// 全局字节偏移（布局构建时计算）。
     pub offset: u64,
+    /// BEP 47 对齐填充文件：字节仍参与片校验与全局偏移，但
+    /// **不是用户要的内容** —— 不计入内容大小、不在文件列表显示、
+    /// 不参与进度分子/分母（见 [`PieceLayout::content_length`]）。
+    pub is_padding: bool,
 }
 
 impl PieceLayout {
@@ -211,6 +215,7 @@ impl PieceLayout {
                     path,
                     length,
                     offset,
+                    is_padding: false,
                 };
                 offset += f.length;
                 f
@@ -251,6 +256,30 @@ impl PieceLayout {
 
     pub fn total_length(&self) -> u64 {
         self.files.iter().map(|f| f.length).sum()
+    }
+
+    /// 内容长度（**不含** BEP 47 对齐填充文件）。
+    ///
+    /// 上报给界面的"总大小"、进度分母都用它；[`Self::total_length`] 含
+    /// padding，只用于片数/片偏移。
+    pub fn content_length(&self) -> u64 {
+        self.files
+            .iter()
+            .filter(|f| !f.is_padding)
+            .map(|f| f.length)
+            .sum()
+    }
+
+    /// 按种子解析结果给每个文件打"对齐填充"标记（顺序与文件列表一致）。
+    ///
+    /// 长度不匹配时原样返回（宁可少标记，也不要错位标到别的文件上）。
+    pub fn with_padding_flags(mut self, flags: &[bool]) -> Self {
+        if flags.len() == self.files.len() {
+            for (f, p) in self.files.iter_mut().zip(flags.iter()) {
+                f.is_padding = *p;
+            }
+        }
+        self
     }
 
     pub fn piece_count(&self) -> u32 {
@@ -308,15 +337,18 @@ impl PieceLayout {
     }
 
     /// 所选文件的字节总量（None = 全部文件）。
+    ///
+    /// **不含 BEP 47 对齐填充**：这是给"总大小/进度分母"用的口径，
+    /// 与 qB / libtorrent 一致。片布局仍按 [`Self::total_length`]。
     pub fn selected_length(&self, selected: Option<&[usize]>) -> u64 {
         match selected {
-            None => self.total_length(),
+            None => self.content_length(),
             Some(sel) => {
                 let set: std::collections::HashSet<usize> = sel.iter().copied().collect();
                 self.files
                     .iter()
                     .enumerate()
-                    .filter(|(i, _)| set.contains(i))
+                    .filter(|(i, f)| set.contains(i) && !f.is_padding)
                     .map(|(_, f)| f.length)
                     .sum()
             }
