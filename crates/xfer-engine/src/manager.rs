@@ -5167,8 +5167,15 @@ async fn drive_bt_download(
                 {
                     let mut sh = task.shared.lock().unwrap();
                     sh.completed = p.done;
-                    sh.total_len = Some(p.total);
-                    sh.file_len = p.total;
+                    // total 只在引擎给出**非零**值时才覆盖。
+                    // 磁力等待勾选、引擎刚创建还没打开 piece store 的那几拍，
+                    // `progress().total` 是 0；无条件写入会抹掉 `new_torrent`
+                    // 和 `select_files` 已经算好的正确分母，界面就变成
+                    // 「0 字节 / 0%」（多文件种子的等待选择阶段尤其明显）。
+                    if p.total > 0 {
+                        sh.total_len = Some(p.total);
+                        sh.file_len = p.total;
+                    }
                     sh.connections = conn_count;
                 }
                 // 无锁同步：speed_ticker / snapshot / stat_raw 优先读原子值
