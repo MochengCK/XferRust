@@ -3625,6 +3625,22 @@ impl TaskManager {
             return Err("至少选择一个文件".into());
         }
         *task.selected_files.lock().unwrap() = Some(sel.clone());
+        // 分母立即收缩到**所选文件的内容长度**（排除 padding）：
+        // 「选择文件」发生在引擎暂停期间（磁力等待勾选 / 种子文件选文件），
+        // 到引擎重启并接管可能还要几秒；这段时间界面若继续用「全部文件」
+        // 当分母，进度会明显偏低甚至看着不动。引擎启动后会用它自己的
+        // `selected_length` 覆盖同一个值，两处同源、不会来回跳。
+        if let Some(total) = task
+            .bt_meta
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|m| m.info.selected_content_length(Some(&sel)))
+        {
+            let mut sh = task.shared.lock().unwrap();
+            sh.total_len = Some(total);
+            sh.file_len = total;
+        }
         // 选择完成：解除磁力解析流程的等待标记。该标记只在"元数据就绪
         // 但用户尚未勾选"期间应保持置位；若不清除，下次运行的 1Hz
         // ticker 会再次触发"等待文件选择"自动暂停——任务开始后数秒即

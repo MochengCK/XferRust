@@ -430,7 +430,12 @@ impl Task {
         meta: Arc<TorrentMeta>,
         options: HashMap<String, String>,
     ) -> Self {
-        let total = meta.info.total_length();
+        // 分母用**内容**总长（排除 BEP 47 对齐填充）：padding 的字节要参与
+        // 片偏移与 SHA-1，但不是用户要下载的数据。此前用 `total_length()`
+        // （含 padding）作初始分母，引擎还没启动的那段时间（磁力等待选择、
+        // 暂停态）界面就会显示比 qB 大几个百分点的总大小，且百分比永远到
+        // 不了 100%。
+        let total = meta.info.content_length();
         let name = meta.info.name.clone();
         let (dl0, ul0) = limits_from_options(&options);
         Self {

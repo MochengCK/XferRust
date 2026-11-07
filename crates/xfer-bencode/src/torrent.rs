@@ -343,6 +343,32 @@ impl Info {
         self.files.iter().any(|f| f.is_padding)
     }
 
+    /// **所选文件**的内容总长度（不含 padding），用作进度分母。
+    ///
+    /// `None` = 全部文件，等价于 [`Self::content_length`]。这是任务级
+    /// `totalLength` 的唯一正确口径：单文件种子与它恰好相等，所以历史上
+    /// 一直没暴露问题；多文件种子一旦勾选部分文件，若分母仍按「全部文件」
+    /// 或「含 padding 的总长」算，进度会永远到不了 100%（界面表现为
+    /// 「有速度但进度几乎不动」），而分子是严格按所选文件统计的。
+    ///
+    /// 与 [`xfer_storage::PieceLayout::selected_length`] 同口径 ——
+    /// 那一个是按磁盘布局算的，这里按种子元信息算，用于引擎未启动时
+    /// （等待文件选择 / 暂停）也能给出正确的分母。
+    pub fn selected_content_length(&self, selected: Option<&[usize]>) -> u64 {
+        match selected {
+            None => self.content_length(),
+            Some(sel) => {
+                let set: std::collections::HashSet<usize> = sel.iter().copied().collect();
+                self.files
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, f)| set.contains(i) && !f.is_padding)
+                    .map(|(_, f)| f.length)
+                    .sum()
+            }
+        }
+    }
+
     /// 某文件相对任务下载目录的路径（`/` 分隔），与磁盘布局一致。
     ///
     /// - 多文件种子：`<name>/<path 段拼接>`；
@@ -546,6 +572,52 @@ mod tests {
         assert_eq!(info.locate(15), (1, 0));
         assert_eq!(info.locate(25), (2, 0));
         assert_eq!(info.locate(29), (2, 4));
+    }
+
+    /// 进度分母口径：**所选文件的内容长度**（排除 BEP 47 对齐填充）。
+    ///
+    /// 回归点：多文件种子一旦勾选部分文件，分母若仍按「全部文件」或
+    /// 「含 padding 的总长」算，进度就永远到不了 100%（单文件种子两者
+    /// 恰好相等，所以只有多文件会暴露这个错误）。
+    #[test]
+    fn selected_content_length_excludes_padding_and_unselected() {
+        let info = Info {
+            name: "pack".into(),
+            piece_length: 10,
+            pieces: vec![[0u8; 20]; 2],
+            multi_file: true,
+            files: vec![
+                FileEntry {
+                    path: vec!["a.bin".into()],
+                    length: 6,
+                    is_padding: false,
+                },
+                FileEntry {
+                    path: vec!["pad.bin".into()],
+                    length: 4,
+                    is_padding: true,
+                },
+                FileEntry {
+                    path: vec!["sub".into(), "b.bin".into()],
+                    length: 6,
+                    is_padding: false,
+                },
+            ],
+            private: false,
+        };
+        // 片布局必须含 padding（偏移与 SHA-1 都按它算）
+        assert_eq!(info.total_length(), 16);
+        assert_eq!(info.piece_count(), 2);
+        // 显示 / 进度分母只算内容
+        assert_eq!(info.content_length(), 12);
+        assert_eq!(info.selected_content_length(None), 12);
+        // 只选一个文件：分母必须跟着收缩
+        assert_eq!(info.selected_content_length(Some(&[0])), 6);
+        assert_eq!(info.selected_content_length(Some(&[2])), 6);
+        assert_eq!(info.selected_content_length(Some(&[0, 2])), 12);
+        // padding 永远不进分母（只选它 → 0，而不是 4）
+        assert_eq!(info.selected_content_length(Some(&[1])), 0);
+        assert_eq!(info.selected_content_length(Some(&[0, 1])), 6);
     }
 
     #[test]
