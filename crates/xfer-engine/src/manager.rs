@@ -5202,12 +5202,18 @@ async fn drive_bt_download(
                 if task.awaiting_selection.load(Ordering::SeqCst)
                     && task.bt_meta.lock().unwrap().is_some()
                 {
+                    // 「要不要用户选文件」按**内容文件数**判断，排除 BEP 47
+                    // 对齐填充：填充不是可选内容，把它算进来会让「1 个视频 +
+                    // N 个 padding」的单文件种子被误判成多文件——引擎暂停等
+                    // 选择，而前端拿到的文件列表已过滤 padding、判定「不需要
+                    // 选择」，于是界面上既没有选择入口、任务又不动（速度 0、
+                    // 进度 0）。qB 对这类种子是直接开下的。
                     let file_count = task
                         .bt_meta
                         .lock()
                         .unwrap()
                         .as_ref()
-                        .map(|m| m.info.files.len())
+                        .map(|m| m.info.files.iter().filter(|f| !f.is_padding).count())
                         .unwrap_or(0);
                     let mut intent = task.intent.lock().unwrap();
                     if matches!(*intent, Intent::None) {
