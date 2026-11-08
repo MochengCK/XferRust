@@ -184,6 +184,12 @@ const RATE_LIMIT_INTERVAL: Duration = Duration::from_millis(100);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 /// Choking 算法执行间隔（BEP 3：10 秒一轮）。
 const CHOKE_INTERVAL: Duration = Duration::from_secs(10);
+/// 被对端 choke 后仍保留已收块与片归属的时长。
+///
+/// 对端 choking 每 10s 轮换，短时 choke 后往往很快 unchoke；这段时间里
+/// 已收到的块仍然有效，旧实现一收到 Choke 就清空全部缓存，等于把刚下载
+/// 的数据重下一遍。超过该时长仍不 unchoke 才把片归还给其它 peer。
+const CHOKE_GRACE: Duration = Duration::from_secs(60);
 /// 消息洪泛检测间隔。
 const FLOODING_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// 消息洪泛阈值（检查区间内 choke/unchoke 或 keep-alive 次数）。
@@ -196,6 +202,8 @@ const NO_INTEREST_TIMEOUT: Duration = Duration::from_secs(120);
 /// 清空在途表触发重发（aria2 request slot 超时语义）。
 /// 覆盖对端静默丢弃请求的场景（无 RejectRequest 可依赖）。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// 流水线补请求水位分母：在途块降到窗口的 `1/DIVISOR` 才补齐。
+const PIPELINE_REFILL_DIVISOR: usize = 2;
 /// 续传控制文件节流间隔：片完成频繁时最多每秒写一次；暂停/停止强制写入。
 const RESUME_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 /// PEX 发送间隔（BEP 11：约 1 分钟）。
@@ -224,9 +232,31 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_METADATA_SIZE: usize = 4 * 1024 * 1024;
 /// 磁力元数据获取阶段的 announce 补充间隔（秒）。
 const METADATA_ANNOUNCE_INTERVAL: u64 = 5;
+/// 已有活跃 peer 时的最大 announce 间隔（秒）。
+///
+/// tracker 的 `interval` 常见 1800s（30 分钟）；旧实现一旦连上几个 peer
+/// 就半小时不再要新地址，被淘汰/断开的槽位只能靠 PEX（60s）和低频 DHT
+/// 补，peer 池随时间持续劣化。主流客户端在此期间仍会定期补充候选。
+/// 5 分钟远高于绝大多数 tracker 的 `min interval`，不会触发限流。
+const MAX_ACTIVE_ANNOUNCE_INTERVAL: u64 = 300;
 /// 元数据分片流水线深度：一次向同一 peer 在途请求多个分片（BEP 9 允许）。
 /// 避免大 metadata 逐片串行请求（每片一个 RTT），冷启动大幅提速。
 const METADATA_PIPELINE: usize = 8;
+
+/// 是否该批量补齐请求流水线。
+///
+/// 旧实现**每收到一个 16KiB 块**就跑一次完整的 `fill_pipeline`：克隆片队列、
+/// 持全局 store 锁为每片重算 `request_blocks`、从队首扫全部 (片, 块) 找
+/// 下一个待发块，最后单独 `write_all` 一条 17 字节 request。10MB/s 下约
+/// 640 次/秒 —— 批量流水线被退化成「每块一条小包 + 一次全量扫描」，
+/// CPU 耗在重复扫描/分配，网络耗在小包与延迟确认上。
+///
+/// 现在等窗口降到一半再一次性补满：窗口始终维持 50%~100%（平均 75%，
+/// 不会断流），而扫描、分配与写请求次数下降约两个数量级。这是纯判定，
+/// 便于单测钉住「窗口不会空」这一不变式。
+fn refill_due(in_flight: usize, pipeline: usize) -> bool {
+    in_flight <= pipeline / PIPELINE_REFILL_DIVISOR
+}
 
 /// ut_metadata 消息类型（BEP 9 msg_type 字段）。
 const UT_METADATA_REQUEST: i64 = 0;
@@ -891,6 +921,8 @@ struct PeerCtx {
     last_request_at: Option<Instant>,
     /// 连续无进展计数（用于检测卡死的 peer）。
     stale_count: u32,
+    /// 进入「被对端 choke」状态的时间；Some 表示正在宽限期内保留已收块。
+    choked_since: Option<Instant>,
 }
 
 /// 进度快照。
@@ -2039,11 +2071,19 @@ impl TorrentEngine {
                         self.stop_background();
                         return Ok(());
                     }
-                    // 低水位重试：无活跃 peer 时缩短 announce 间隔
+                    // 低水位重试：无活跃 peer 时缩短 announce 间隔。
+                    // 有活跃 peer 时也不能直接采用 tracker 的 interval：
+                    // 常见值 1800s 会让 peer 池半小时不换血（见
+                    // MAX_ACTIVE_ANNOUNCE_INTERVAL）。封顶 5 分钟，
+                    // 并按连接数加一点固定偏移，避免多任务同刻打 tracker。
                     let active = self.peers.read().unwrap().len();
                     let cold = self.cold_start_at.elapsed() < COLD_START_WINDOW;
                     let interval = self.last_interval.load(Ordering::Relaxed).max(15);
-                    let eff = if active == 0 { if cold { 3 } else { 5 } } else { interval };
+                    let eff = if active == 0 {
+                        if cold { 3 } else { 5 }
+                    } else {
+                        interval.min(MAX_ACTIVE_ANNOUNCE_INTERVAL) + (active as u64 % 17)
+                    };
                     if last_announce.elapsed() >= Duration::from_secs(eff) {
                         // announce 全程后台执行：tracker 再慢也不阻塞拨号/选片/调度；
                         // 新 peer 由 add_peers 唤醒主循环立即连接。
@@ -2868,7 +2908,20 @@ impl TorrentEngine {
             *prev = downloaded;
             // 10 秒采样窗口（原 5s 波动太大：BT 突发式传输在 5s 窗口内
             // 可能恰好赶上空闲间隙 → recent_speed=0 → 调度器误判为死节点）
-            c.state.lock().unwrap().recent_speed = delta / 10;
+            let instant = delta / 10;
+            let mut st = c.state.lock().unwrap();
+            // 指数平滑（0.6×历史 + 0.4×本轮）：对端 choking 每 10s 轮换，
+            // 单个窗口可能正好落在空档里，瞬时 0 速率会让调度把正常
+            // 节点当死节点淘汰、并触发目标连接数收缩。首个样本直接采用，
+            // 保证刚起速的 peer 不会被平滑拖慢识别。
+            st.recent_speed = if st.recent_speed == 0 {
+                instant
+            } else {
+                st.recent_speed
+                    .saturating_mul(3)
+                    .saturating_add(instant.saturating_mul(2))
+                    / 5
+            };
         }
     }
 
@@ -4259,25 +4312,39 @@ impl TorrentEngine {
                     // 唤醒本连接 → 永久空转（有节点无速度）。每 10s 兜底一次。
                     // fill_pipeline 幂等（已有分配/在途请求时不会重复发请求）。
                     //
+                    // 长期被 choke：宽限期已过，把片归还给其它 peer。
+                    // 块表是 per-peer 的，片一旦易主这些块也无人能复用。
+                    if let Some(since) = ctx.choked_since {
+                        if since.elapsed() > CHOKE_GRACE {
+                            self.release_all_pieces(&ctx.cell);
+                            ctx.in_flight.clear();
+                            ctx.blocks.clear();
+                            ctx.block_need.clear();
+                            ctx.block_have.clear();
+                            ctx.choked_since = None;
+                        }
+                    }
                     // 停滞缩窗：有在途请求但长时间收不到块 → 递减窗口
                     // （旧实现的减半分支放在收块路径里，永远不会触发）
                     self.shrink_stalled_pipeline(ctx);
-                    // 请求超时重发：有在途请求但长时间收不到任何块（对端静默
-                    // 丢弃请求，无 RejectRequest 可依赖）时，清空在途表，让
-                    // 紧随的 fill_pipeline 补发缺失块（已收块保留在 ctx.blocks）。
+                    // 请求超时：有在途请求但 30s 收不到任何块（对端静默
+                    // 丢弃请求，无 RejectRequest 可依赖）。旧实现只清在途表
+                    // 让**同一个** peer 重发，而片仍被 assigned 独占，其它
+                    // peer 接不了手 —— 于是每 30s 空转一轮，表现为「连了
+                    // 一堆节点但速度是 0」。现在直接结束会话，
+                    // unregister_peer 会归还全部片，候选池里的其它节点顶上。
                     {
                         let timed_out = ctx.last_request_at.is_some()
                             && !ctx.in_flight.is_empty()
                             && ctx.cell.last_block_at.lock().unwrap().elapsed()
                                 > REQUEST_TIMEOUT;
                         if timed_out {
-                            tracing::debug!(
+                            tracing::info!(
                                 peer = %ctx.cell.addr,
                                 count = ctx.in_flight.len(),
-                                "在途请求超时未应答，重发"
+                                "在途请求超时无应答，释放片并换节点"
                             );
-                            ctx.in_flight.clear();
-                            ctx.last_request_at = None;
+                            return Err("请求超时无应答".into());
                         }
                     }
                     if !ctx.cell.state.lock().unwrap().choked {
@@ -4460,13 +4527,21 @@ impl TorrentEngine {
                                         st.choke_unchoke_count.saturating_add(1);
                                 }
                             }
-                            self.release_all_pieces(&ctx.cell);
+                            // 不再丢弃已收到的块：对端 choking 每 10s 轮换，
+                            // 短时 choke 后 unchoke 时这些块仍然有效。旧实现
+                            // 一收到 Choke 就把 4~64 片的所有已收块清空，
+                            // 等于把刚下载的带宽重下一遍，公网里每 10s
+                            // 发生一次（典型的「有速度但进度不动」）。
+                            // 只清在途表：这些请求对端已丢弃，unchoke 后
+                            // fill_pipeline 会按 ctx.blocks 只补发缺失块。
+                            // 片归属暂不释放，超过 CHOKE_GRACE 仍未 unchoke
+                            // 才在 choke_timer 分支里归还给其它 peer。
                             ctx.in_flight.clear();
-                            ctx.blocks.clear();
-                            ctx.block_need.clear();
-                            ctx.block_have.clear();
+                            ctx.last_request_at = None;
+                            ctx.choked_since = Some(Instant::now());
                         }
                         Message::Unchoke => {
+                            ctx.choked_since = None;
                             {
                                 let mut st = ctx.cell.state.lock().unwrap();
                                 let was_choked = st.choked;
@@ -4508,6 +4583,9 @@ impl TorrentEngine {
                             // 非 Fast Extension 且被 choke：忽略请求
                         }
                         Message::Piece { index, begin, block } => {
+                            // 片完成会释放一整片的槽位，必须立即补请求；
+                            // 只收到普通块则按水位批量补（见 refill_due）。
+                            let mut force_refill = false;
                             if !ctx.cell.queued.lock().unwrap().contains(&index) {
                                 continue; // 非本连接下载中的片，丢弃
                             }
@@ -4591,8 +4669,17 @@ impl TorrentEngine {
                                 ctx.in_flight.retain(|&(pi, _)| pi != index);
                                 ctx.block_need.remove(&index);
                                 ctx.block_have.remove(&index);
+                                // 整片槽位空出来了，不等水位立即领新片
+                                force_refill = true;
                             }
-                            self.fill_pipeline(stream, ctx).await?;
+                            // 水位批量补请求：普通收块只在窗口降到一半时
+                            // 一次性补满，不再每块重建快照 + 发一条小包。
+                            // unchoke / Have / 10s 兜底等事件仍直接调用
+                            // fill_pipeline，不受水位限制。
+                            let pipeline = *ctx.cell.pipeline.lock().unwrap();
+                            if force_refill || refill_due(ctx.in_flight.len(), pipeline) {
+                                self.fill_pipeline(stream, ctx).await?;
+                            }
                         }
                         Message::Cancel { index, begin, length } => {
                             // seed 模式：对端取消请求，忽略（已在发送中或已发送）
@@ -6126,14 +6213,22 @@ impl TorrentEngine {
                 .collect()
         };
 
+        // 稀有度一次算齐：旧实现对「每一片」遍历「每一个 peer」调
+        // `is_set`，复杂度 O(片数 × peer 数)（848 片 × 50 peer ≈ 4.2 万次
+        // 零散位查询/次选片）。改为按字节累加置位，复杂度 O(置位片数)，
+        // 下载初期的稀疏位图上快一个数量级。语义完全一致。
+        let mut rarity = vec![0u32; count as usize];
+        for h in &peer_haves {
+            h.accumulate_rarity(&mut rarity);
+        }
+
         // (片号, 稀有度)：稀有度 = 当前连接 peers 中拥有该片的人数（越少越优先）
         let mut candidates: Vec<(u32, u32)> = Vec::new();
         for idx in 0..count {
             if !peer_have.is_set(idx) || store_have.is_set(idx) || !self.piece_wanted(idx) {
                 continue;
             }
-            let rarity = peer_haves.iter().filter(|h| h.is_set(idx)).count() as u32;
-            candidates.push((idx, rarity));
+            candidates.push((idx, rarity[idx as usize]));
         }
         // 排片：**有播放头时窗口内的片优先**（且在窗口内按片号升序 —— 必须
         // 形成连续前缀，稀有度排序会把窗口里的片打散），窗口外仍是 rarest-first。
@@ -6811,6 +6906,7 @@ impl PeerCtx {
             block_have: HashMap::new(),
             last_request_at: None,
             stale_count: 0,
+            choked_since: None,
         }
     }
 }
@@ -8259,5 +8355,36 @@ mod tests {
         assert_eq!(canonical_peer_addr(v6), v6);
         let v4: SocketAddr = "203.0.113.7:6881".parse().unwrap();
         assert_eq!(canonical_peer_addr(v4), v4);
+    }
+
+    #[test]
+    fn refill_due_batches_requests_without_empty_window() {
+        let p = PIPELINE_INITIAL.min(PIPELINE_MAX);
+        // 窗口满 / 只掉了几块 → 不补（这正是旧实现白白重算的地方）
+        assert!(!refill_due(p, p));
+        assert!(!refill_due(200, p));
+        assert!(!refill_due(129, p));
+        // 降到一半 → 一次性补满
+        assert!(refill_due(128, p));
+        assert!(refill_due(1, p));
+        assert!(refill_due(0, p));
+        // 保底窗口同样成立
+        assert!(!refill_due(9, PIPELINE_MIN));
+        assert!(refill_due(8, PIPELINE_MIN));
+
+        // 模拟连续收到 256 个块：窗口始终不低于水位，且只需补 1~2 次。
+        // 旧实现要跑 256 次完整 fill_pipeline + 256 次单条小包写入。
+        let mut in_flight = p;
+        let mut refills = 0;
+        for _ in 0..p {
+            if refill_due(in_flight, p) {
+                in_flight = p; // 一次补满
+                refills += 1;
+            }
+            in_flight -= 1; // 收到一个块
+            assert!(in_flight >= p / 2 - 1, "窗口不得被抽空");
+        }
+        assert!(refills <= 2, "256 个块最多补 2 次请求，实际 {refills}");
+        assert!(refills >= 1, "窗口降到水位时应当补请求");
     }
 }

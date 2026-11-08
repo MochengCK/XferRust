@@ -18,7 +18,13 @@ use std::time::Duration;
 pub struct PeerSchedulerConfig {
     /// 预分配连接数：调度上限（来自 `bt-max-peers`）。
     pub max_peers: usize,
-    /// 保底连接数。
+    /// 保底连接数（0 = 按 `max_peers` 自动推导）。
+    ///
+    /// 不再用固定 2：BT 的吞吐来自「同时有多少个愿意上传的 peer」，
+    /// 一旦目标被砍到 2，即使候选池里还有几十个健康节点也不会再拨号，
+    /// 速度直接被锁死在那一两个 peer 上。真实公网里被 choke 是常态，
+    /// 需要一批连接轮换才有稳定的上传槽位。自动推导取 `max_peers/4`
+    /// 且至少 8、至多一半（给换血留余地），见 `PeerScheduler::new`。
     pub min_peers: usize,
     /// 单次扩张步长。
     pub expand_step: usize,
@@ -40,7 +46,7 @@ impl Default for PeerSchedulerConfig {
     fn default() -> Self {
         Self {
             max_peers: 50,
-            min_peers: 2,
+            min_peers: 0,
             expand_step: 4,
             gain_ratio: 0.10,
             // 真实网络下 peer 从连接到被 unchoke 再到出数据
@@ -103,10 +109,22 @@ pub struct PeerScheduler {
     stagnant: u32,
     /// 是否已评估过（首轮直接拉满目标，快速起速）。
     started: bool,
+    /// 连续「吞吐下滑」轮次。BT 吞吐受对端 choking 轮换（10s 一轮）
+    /// 影响天然剧烈波动，单轮下滑就乘性砍目标会把连接数一路压到下限；
+    /// 必须连续多轮下滑才认定是真的没有边际收益。
+    decline_rounds: u32,
 }
 
 impl PeerScheduler {
     pub fn new(mut cfg: PeerSchedulerConfig) -> Self {
+        // 保底连接数按预分配上限的四分之一自动推导（至少 8、至多一半）：
+        // max_peers=50 → 12，max_peers=200 → 50。上限取一半是为了给
+        // 「淘汰慢 peer 换血」留出余量，否则 try_replace 永远不触发。
+        // 固定 min_peers 会让「大连接数配置 + 吞吐正常抖动」退化到 2 条连接。
+        if cfg.min_peers == 0 {
+            let half = (cfg.max_peers / 2).max(1);
+            cfg.min_peers = (cfg.max_peers / 4).max(8).min(half);
+        }
         // min > max 属配置错误：钳制保底，保证目标永不超预分配上限
         cfg.min_peers = cfg.min_peers.min(cfg.max_peers);
         let target = cfg.max_peers;
@@ -116,6 +134,7 @@ impl PeerScheduler {
             last_throughput: 0,
             stagnant: 0,
             started: false,
+            decline_rounds: 0,
         }
     }
 
@@ -151,18 +170,28 @@ impl PeerScheduler {
             // 每 10s 目标 ×3/4，从 max_peers 一路崩到 min_peers；等 peer 出现
             // 后每轮只 +expand_step 爬回，起速被人为拖慢约 2 分钟。
             self.stagnant += 1;
+            self.decline_rounds = 0;
         } else if gain > self.cfg.gain_ratio {
             // 加连接确实带来了吞吐增长 → 继续扩张（不超过上限）
             self.stagnant = 0;
+            self.decline_rounds = 0;
             self.target = (self.target + self.cfg.expand_step).min(self.cfg.max_peers);
         } else if gain >= 0.0 {
             // 持平：不再抬高目标，仅按现有目标补位
             self.stagnant += 1;
+            self.decline_rounds = 0;
         } else {
-            // 吞吐下滑：乘性缩减目标（AIMD 的 MD 半），下限保底；
-            // 目标不降的话会一直满上限拨号，换血→宽限→再停滞无限震荡
+            // 吞吐下滑：**不再单轮就乘性砍 25%**。对端 choking 每 10s
+            // 轮换、块到达本身是突发的，10s 采样窗口里「下滑 >10%」极常见；
+            // 旧逻辑连续三四轮就把 50 条目标压到 2 条，之后即使候选池里
+            // 全是健康 peer 也不再拨号（这就是「有节点却没速度」的来源）。
+            // 现在要连续 2 轮下滑才温和收缩 10%，且保底是 max_peers/4。
             self.stagnant = self.stagnant.saturating_add(2);
-            self.target = ((self.target * 3) / 4).max(self.cfg.min_peers);
+            self.decline_rounds += 1;
+            if self.decline_rounds >= 2 {
+                self.decline_rounds = 0;
+                self.target = ((self.target * 9) / 10).max(self.cfg.min_peers);
+            }
         }
 
         // 未达目标且有候选 → 继续补连接
@@ -335,24 +364,52 @@ mod tests {
     }
 
     #[test]
-    fn target_shrinks_on_throughput_drop() {
+    fn target_shrinks_gently_on_sustained_drop() {
         let mut s = PeerScheduler::new(cfg(20));
         let peers: Vec<PeerSample> = (0..10).map(|i| sample(100 + i, 100_000, 60)).collect();
         let _ = s.evaluate(&peers, 0);
         assert_eq!(s.target(), 20, "冷启动目标应为上限");
-        // 吞吐骤降 >10% → 乘性缩减（20 × 3/4 = 15）
+        // 单轮下滑（对端 choking 轮换造成的正常抖动）不该砍连接
         let poor: Vec<PeerSample> = (0..10).map(|i| sample(100 + i, 1_000, 60)).collect();
         let _ = s.evaluate(&poor, 0);
-        assert_eq!(s.target(), 15, "吞吐下滑应乘性缩减目标");
-        // 连续下滑（每轮吞吐减半）也不得低于 min_peers（默认 2）
+        assert_eq!(s.target(), 20, "单轮抖动不应缩减目标");
+        // 持续下滑才温和收缩，且保底是 max_peers/4（20 → 8）
         let mut speed = 500u64;
-        for _ in 0..20 {
+        for _ in 0..30 {
             let declining: Vec<PeerSample> =
                 (0..10).map(|i| sample(100 + i, speed, 60)).collect();
             let _ = s.evaluate(&declining, 0);
-            speed /= 2;
+            speed = (speed / 2).max(1);
         }
-        assert_eq!(s.target(), 2, "目标应停在保底连接数");
+        // 吞吐降到地板后稳定下来，缩减自然停止；关键是**绝不**跌破动态保底，
+        // 更不能被压到旧逻辑的 2 条连接（真实场景里那等于没有并发数据源）
+        let target = s.target();
+        assert!(target >= 8, "持续下滑也不得跌破动态保底，实际 {target}");
+        assert!(target > 2, "不能把并发数据源砍到 2 条");
+    }
+
+    #[test]
+    fn min_peers_scales_with_max_peers() {
+        // 大连接数配置下，保底按 1/4 抬高，避免抖动后只剩个位数连接
+        assert_eq!(PeerScheduler::new(cfg(200)).cfg.min_peers, 50);
+        assert_eq!(PeerScheduler::new(cfg(20)).cfg.min_peers, 8);
+        // 小配置下保底仍要留出一半给换血，否则慢节点永远淘汰不掉
+        assert_eq!(PeerScheduler::new(cfg(4)).cfg.min_peers, 2);
+    }
+
+    #[test]
+    fn alternating_throughput_keeps_target_high() {
+        // 真实 BT：10s 一轮 choking，吞吐忽高忽低。旧逻辑每次下滑 ×3/4，
+        // 几轮就崩到下限且爬不回来；新逻辑只在连续下滑时轻缩。
+        let mut s = PeerScheduler::new(cfg(50));
+        let hi: Vec<PeerSample> = (0..10).map(|i| sample(200 + i, 100_000, 60)).collect();
+        let lo: Vec<PeerSample> = (0..10).map(|i| sample(200 + i, 60_000, 60)).collect();
+        let _ = s.evaluate(&hi, 10);
+        for _ in 0..12 {
+            let _ = s.evaluate(&lo, 10);
+            let _ = s.evaluate(&hi, 10);
+        }
+        assert_eq!(s.target(), 50, "交替抖动不应把目标压低");
     }
 
     #[test]

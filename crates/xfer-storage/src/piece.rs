@@ -123,6 +123,27 @@ impl PieceMap {
             .min(self.count)
     }
 
+    /// 把本位置图的置位片累加到稀有度计数（rarest-first 选片用）。
+    ///
+    /// 调用方原本对「每一片」遍历「每一个 peer」调 `is_set`，复杂度
+    /// O(片数 × peer 数) 且全是零散的位查询；这里按字节遍历置位，
+    /// 复杂度 O(置位片数)，在下载初期的稀疏位图上快一个数量级。
+    /// 超出 `count` 的尾部填充位与超出 `out` 长度的片一律忽略。
+    pub fn accumulate_rarity(&self, out: &mut [u32]) {
+        for (byte_idx, &byte) in self.bits.iter().enumerate() {
+            let mut b = byte;
+            while b != 0 {
+                // 位图语义是「字节内高位在前」：leading_zeros=0 对应 0x80
+                let bit = b.leading_zeros() as usize;
+                let i = byte_idx * 8 + bit;
+                if (i as u32) < self.count && i < out.len() {
+                    out[i] += 1;
+                }
+                b &= !(0x80 >> bit);
+            }
+        }
+    }
+
     pub fn all_done(&self) -> bool {
         self.done_count() == self.count
     }
@@ -1510,5 +1531,40 @@ mod tests {
         assert_eq!(parse_size_bytes("abc"), None);
         assert_eq!(parse_size_bytes("12x"), None);
         assert_eq!(parse_size_bytes("M"), None);
+    }
+
+    #[test]
+    fn accumulate_rarity_matches_per_piece_count() {
+        let mut a = PieceMap::new(20);
+        let mut b = PieceMap::new(20);
+        for i in [0u32, 1, 7, 8, 9, 15, 16, 19] {
+            a.set(i);
+        }
+        for i in [1u32, 7, 8, 18, 19] {
+            b.set(i);
+        }
+        let mut out = vec![0u32; 20];
+        a.accumulate_rarity(&mut out);
+        b.accumulate_rarity(&mut out);
+        // 与「每片 × 每 peer」的朴素实现逐片对拍
+        for i in 0..20u32 {
+            let naive = (a.is_set(i) as u32) + (b.is_set(i) as u32);
+            assert_eq!(out[i as usize], naive, "片 {i} 的稀有度不一致");
+        }
+        assert_eq!(out[0], 1);
+        assert_eq!(out[1], 2);
+        assert_eq!(out[18], 1);
+        assert_eq!(out.iter().sum::<u32>(), a.done_count() + b.done_count());
+
+        // count 不是 8 的倍数时，尾部填充位不得计入
+        let mut tail = PieceMap::new(20);
+        tail.set(19);
+        let mut o2 = vec![0u32; 20];
+        tail.accumulate_rarity(&mut o2);
+        assert_eq!(o2.iter().sum::<u32>(), 1);
+        // 输出数组比 count 短时不得越界
+        let mut short = vec![0u32; 3];
+        a.accumulate_rarity(&mut short);
+        assert_eq!(short, vec![1, 1, 0]);
     }
 }
