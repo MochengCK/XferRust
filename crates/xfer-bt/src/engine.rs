@@ -5,7 +5,8 @@
 //!
 //! 设计：单控制器（TorrentEngine）+ 每 peer 一个 tokio 任务。
 //! 一片同一时刻只分配给一个 peer（独占至完成/断开），rarest-first 选择；
-//! 块级请求流水线自适应 16→256；被 choke 时整片释放重新排队。
+//! 块级请求流水线自适应 16→256（按水位批量补齐，不是每块一条小包）；
+//! 被 choke 时保留已收块与片归属一段时间（见 CHOKE_GRACE），超时才归还。
 //! M5 新增：请求流水线自适应、30s 连接超时、冷启动突发连接、
 //! 慢速节点淘汰、限速、seed 模式、MSE 集成、uTP-first 探测。
 //! M7 新增：Fast Extension (BEP 6) 完整集成、Extension Protocol (BEP 10) + PEX (BEP 11)、
@@ -190,6 +191,13 @@ const CHOKE_INTERVAL: Duration = Duration::from_secs(10);
 /// 已收到的块仍然有效，旧实现一收到 Choke 就清空全部缓存，等于把刚下载
 /// 的数据重下一遍。超过该时长仍不 unchoke 才把片归还给其它 peer。
 const CHOKE_GRACE: Duration = Duration::from_secs(60);
+/// 收尾阶段的宽限期（缩短版）。
+///
+/// 当「还缺的片」全部已有归属时，被 choke 的对端继续占着片就等于把其它
+/// peer 唯一的活路堵死 —— 收尾阶段（只剩最后几片）尤其致命：唯一还愿意
+/// 上传的 peer 无片可领，进度会硬停到宽限期结束。此时把宽限期压到一轮
+/// choking 周期，宁可丢一点已收块也不能把尾巴钉死。
+const CHOKE_GRACE_TAIL: Duration = Duration::from_secs(10);
 /// 消息洪泛检测间隔。
 const FLOODING_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// 消息洪泛阈值（检查区间内 choke/unchoke 或 keep-alive 次数）。
@@ -237,11 +245,31 @@ const METADATA_ANNOUNCE_INTERVAL: u64 = 5;
 /// tracker 的 `interval` 常见 1800s（30 分钟）；旧实现一旦连上几个 peer
 /// 就半小时不再要新地址，被淘汰/断开的槽位只能靠 PEX（60s）和低频 DHT
 /// 补，peer 池随时间持续劣化。主流客户端在此期间仍会定期补充候选。
-/// 5 分钟远高于绝大多数 tracker 的 `min interval`，不会触发限流。
+/// 这个封顶只在 tracker 没声明 `min interval`（公开 tracker 的常态）时
+/// 生效；声明了的话以 tracker 的要求为准，见 [`last_min_interval`]。
 const MAX_ACTIVE_ANNOUNCE_INTERVAL: u64 = 300;
 /// 元数据分片流水线深度：一次向同一 peer 在途请求多个分片（BEP 9 允许）。
 /// 避免大 metadata 逐片串行请求（每片一个 RTT），冷启动大幅提速。
 const METADATA_PIPELINE: usize = 8;
+
+/// 请求是否已超时无应答（对端静默丢弃请求，应当放弃该连接换节点）。
+///
+/// 判据只看「有在途请求 + 多久没收到块」，**不看最后一次发包时间**：
+/// 批量补请求之后，每收到一个块都会把发包时间清成 None，而下一次补请求
+/// 要等窗口降到一半 —— 这段时间里它恒为 None，拿它当前置条件等于给对端
+/// 留了一个「挑这个窗口静默」的免死金牌，片会被它占到底。
+fn requests_timed_out(in_flight: usize, idle: Duration) -> bool {
+    in_flight > 0 && idle > REQUEST_TIMEOUT
+}
+
+/// 被 choke 的对端还能保留片归属多久（见 [`CHOKE_GRACE`] / [`CHOKE_GRACE_TAIL`]）。
+fn choke_grace(has_unassigned: bool) -> Duration {
+    if has_unassigned {
+        CHOKE_GRACE
+    } else {
+        CHOKE_GRACE_TAIL
+    }
+}
 
 /// 是否该批量补齐请求流水线。
 ///
@@ -443,7 +471,12 @@ impl MetadataAccum {
 fn scheduler_config(cfg: &TorrentConfig) -> PeerSchedulerConfig {
     PeerSchedulerConfig {
         max_peers: cfg.max_peers.max(1),
-        min_peers: 2,
+        // **必须留 0**：`PeerScheduler::new` 只在 min_peers == 0 时按
+        // max_peers 推导（max_peers/4，至少 8、至多一半）。这里曾经写死
+        // `min_peers: 2`，于是「保底 2 条连接」的旧行为原封不动留在生产
+        // 路径上 —— 单测覆盖的是 `Default`（0，会推导），生产走的是本函数
+        // （2，不推导），两边脱节，改了半天连接数还是被压到 2 条。
+        min_peers: 0,
         ..Default::default()
     }
 }
@@ -917,8 +950,6 @@ struct PeerCtx {
     block_need: HashMap<u32, u32>,
     /// 片 → 已收块数（首次收到的块计数；重发块去重不计）。
     block_have: HashMap<u32, u32>,
-    /// 最近一次发送请求的时间（用于 RTT 估算）。
-    last_request_at: Option<Instant>,
     /// 连续无进展计数（用于检测卡死的 peer）。
     stale_count: u32,
     /// 进入「被对端 choke」状态的时间；Some 表示正在宽限期内保留已收块。
@@ -1097,6 +1128,13 @@ pub struct TorrentEngine {
     finished: AtomicBool,
     /// 最近一次成功 announce 的 interval（秒）。
     last_interval: AtomicU64,
+    /// tracker 明确要求的最小 announce 间隔（秒，0 = 未声明）。
+    ///
+    /// 私有 tracker 会用它限制超频 announce（违反会被警告/封禁）。
+    /// 本引擎在有活跃 peer 时把 interval 封顶到
+    /// [`MAX_ACTIVE_ANNOUNCE_INTERVAL`]，若无条件封顶就会以数倍频率打
+    /// tracker，因此这个下限必须参与钳制。
+    last_min_interval: AtomicU64,
     /// 全局下载限速器。
     rate_limiter: Mutex<RateLimiter>,
     /// 全局上传限速器（响应 peer 请求发送块前消费令牌）。
@@ -1298,6 +1336,7 @@ impl TorrentEngine {
             total_bytes: AtomicU64::new(total_bytes),
             finished: AtomicBool::new(false),
             last_interval: AtomicU64::new(60),
+            last_min_interval: AtomicU64::new(0),
             rate_limiter: Mutex::new(RateLimiter::new(download_limit)),
             upload_limiter: Mutex::new(RateLimiter::new(upload_limit)),
             dl_limit: AtomicU64::new(download_limit),
@@ -1374,6 +1413,7 @@ impl TorrentEngine {
             total_bytes: AtomicU64::new(0),
             finished: AtomicBool::new(false),
             last_interval: AtomicU64::new(60),
+            last_min_interval: AtomicU64::new(0),
             rate_limiter: Mutex::new(RateLimiter::new(download_limit)),
             upload_limiter: Mutex::new(RateLimiter::new(upload_limit)),
             dl_limit: AtomicU64::new(download_limit),
@@ -1620,6 +1660,33 @@ impl TorrentEngine {
             None => true,
             Some(m) => m.is_set(idx),
         }
+    }
+
+    /// 是否还有「需要但没被任何连接领走」的片。
+    ///
+    /// 用于判断是否已进入收尾阶段（见 [`CHOKE_GRACE_TAIL`]）：返回 false
+    /// 表示还缺的片全都已在某个 peer 手上，此刻唯一能推进的方式就是把
+    /// 被 choke 连接占着的片收回来重新分配。
+    ///
+    /// 两把锁**分开**取（先算出缺哪些片，再单独查 assigned），不得嵌套：
+    /// `assign_piece` 里 `wanted` 与 `assigned` 也是分开取的，嵌套即锁环。
+    fn has_unassigned_wanted(&self) -> bool {
+        let (count, have) = {
+            let guard = self.store.lock().unwrap();
+            let Some(store) = guard.as_ref() else {
+                return false;
+            };
+            (store.piece_count(), store.map().clone())
+        };
+        let wanted = self.wanted.lock().unwrap().clone();
+        let missing: Vec<u32> = (0..count)
+            .filter(|&i| !have.is_set(i) && wanted.as_ref().is_none_or(|m| m.is_set(i)))
+            .collect();
+        if missing.is_empty() {
+            return false;
+        }
+        let assigned = self.assigned.lock().unwrap();
+        missing.iter().any(|i| !assigned.contains(i))
     }
 
     /// 所需片是否全部完成（文件选择下的完成判定）。
@@ -2084,6 +2151,10 @@ impl TorrentEngine {
                     } else {
                         interval.min(MAX_ACTIVE_ANNOUNCE_INTERVAL) + (active as u64 % 17)
                     };
+                    // tracker 明确要求的 min interval 优先：私有 tracker 对
+                    // 超频 announce 会警告甚至封禁。公开 tracker 一般不给这个
+                    // 字段（floor = 0），行为与以前一致。
+                    let eff = eff.max(self.last_min_interval.load(Ordering::Relaxed));
                     if last_announce.elapsed() >= Duration::from_secs(eff) {
                         // announce 全程后台执行：tracker 再慢也不阻塞拨号/选片/调度；
                         // 新 peer 由 add_peers 唤醒主循环立即连接。
@@ -2407,6 +2478,11 @@ impl TorrentEngine {
                             self.record_tracker_success(&url, &r);
                             self.last_interval
                                 .store(r.interval.max(1), Ordering::Relaxed);
+                            // tracker 声明的最小间隔（**取各 tracker 的最大值**，
+                            // 保守取向：多 tracker 时只要有一个明确要求低频，
+                            // 就整体降频，宁可少要几轮候选也不冒被封的风险）。
+                            self.last_min_interval
+                                .fetch_max(r.min_interval.unwrap_or(0), Ordering::Relaxed);
                             if r.interval > best_interval {
                                 best_interval = r.interval;
                             }
@@ -4315,7 +4391,16 @@ impl TorrentEngine {
                     // 长期被 choke：宽限期已过，把片归还给其它 peer。
                     // 块表是 per-peer 的，片一旦易主这些块也无人能复用。
                     if let Some(since) = ctx.choked_since {
-                        if since.elapsed() > CHOKE_GRACE {
+                        // 无片可领（收尾阶段）时用缩短的宽限期，见
+                        // CHOKE_GRACE_TAIL：不能让被 choke 的对端把尾巴钉住。
+                        // 只剩这一个连接时缩短没有意义 —— 没有别人能接手，
+                        // 收回片只会白丢已收块，仍然按常规宽限期保留。
+                        let grace = if self.peers.read().unwrap().len() > 1 {
+                            choke_grace(self.has_unassigned_wanted())
+                        } else {
+                            CHOKE_GRACE
+                        };
+                        if since.elapsed() > grace {
                             self.release_all_pieces(&ctx.cell);
                             ctx.in_flight.clear();
                             ctx.blocks.clear();
@@ -4333,11 +4418,15 @@ impl TorrentEngine {
                     // peer 接不了手 —— 于是每 30s 空转一轮，表现为「连了
                     // 一堆节点但速度是 0」。现在直接结束会话，
                     // unregister_peer 会归还全部片，候选池里的其它节点顶上。
+                    //
+                    // 判据只看「有在途 + 多久没收到块」，不看
+                    // `last_request_at`：批量补请求后「每次收到块都会把它
+                    // 清成 None」，而下一次补请求要等窗口降到一半 —— 中间
+                    // 这段里 `last_request_at == None`，对端挑这个时机静默
+                    // 的话超时判定会被永久解除武装（片被它占到底）。
                     {
-                        let timed_out = ctx.last_request_at.is_some()
-                            && !ctx.in_flight.is_empty()
-                            && ctx.cell.last_block_at.lock().unwrap().elapsed()
-                                > REQUEST_TIMEOUT;
+                        let idle = ctx.cell.last_block_at.lock().unwrap().elapsed();
+                        let timed_out = requests_timed_out(ctx.in_flight.len(), idle);
                         if timed_out {
                             tracing::info!(
                                 peer = %ctx.cell.addr,
@@ -4517,7 +4606,7 @@ impl TorrentEngine {
                             }
                         }
                         Message::Choke => {
-                            {
+                            let was_choked = {
                                 let mut st = ctx.cell.state.lock().unwrap();
                                 let was_choked = st.choked;
                                 st.choked = true;
@@ -4526,7 +4615,8 @@ impl TorrentEngine {
                                     st.choke_unchoke_count =
                                         st.choke_unchoke_count.saturating_add(1);
                                 }
-                            }
+                                was_choked
+                            };
                             // 不再丢弃已收到的块：对端 choking 每 10s 轮换，
                             // 短时 choke 后 unchoke 时这些块仍然有效。旧实现
                             // 一收到 Choke 就把 4~64 片的所有已收块清空，
@@ -4534,11 +4624,16 @@ impl TorrentEngine {
                             // 发生一次（典型的「有速度但进度不动」）。
                             // 只清在途表：这些请求对端已丢弃，unchoke 后
                             // fill_pipeline 会按 ctx.blocks 只补发缺失块。
-                            // 片归属暂不释放，超过 CHOKE_GRACE 仍未 unchoke
+                            // 片归属暂不释放，超过宽限期仍未 unchoke
                             // 才在 choke_timer 分支里归还给其它 peer。
                             ctx.in_flight.clear();
-                            ctx.last_request_at = None;
-                            ctx.choked_since = Some(Instant::now());
+                            // 宽限期只在「unchoke → choke」这次状态转变时
+                            // 起算：已在 choke 状态下重复收到 Choke（不规范，
+                            // 但对端确实会发）若每次都重置计时，片归属会被
+                            // 无限延长，其它 peer 永远接不了手。
+                            if !was_choked {
+                                ctx.choked_since = Some(Instant::now());
+                            }
                         }
                         Message::Unchoke => {
                             ctx.choked_since = None;
@@ -4626,7 +4721,6 @@ impl TorrentEngine {
                             // 引擎级接收字节（任务级瞬时速度采样源，见字段注释）
                             self.received_bytes.fetch_add(blen, Ordering::Relaxed);
                             *ctx.cell.last_block_at.lock().unwrap() = Instant::now();
-                            ctx.last_request_at = None;
                             ctx.stale_count = 0;
                             {
                                 let mut st = ctx.cell.state.lock().unwrap();
@@ -6181,7 +6275,6 @@ impl TorrentEngine {
                 .write_all(&request_batch)
                 .await
                 .map_err(|e| format!("request 批量发送失败: {e}"))?;
-            ctx.last_request_at = Some(Instant::now());
             tokio::task::yield_now().await;
         }
         Ok(())
@@ -6904,7 +6997,6 @@ impl PeerCtx {
             blocks: HashMap::new(),
             block_need: HashMap::new(),
             block_have: HashMap::new(),
-            last_request_at: None,
             stale_count: 0,
             choked_since: None,
         }
@@ -8386,5 +8478,81 @@ mod tests {
         }
         assert!(refills <= 2, "256 个块最多补 2 次请求，实际 {refills}");
         assert!(refills >= 1, "窗口降到水位时应当补请求");
+    }
+
+    /// 调度器的保底连接数必须由 `max_peers` 推导，不能在上游写死。
+    ///
+    /// 这条曾是真实事故：`scheduler_config` 里写死 `min_peers: 2`，而
+    /// `PeerScheduler::new` 只在 0 时推导 —— 单测覆盖的是 `Default`（0），
+    /// 生产走的是 `scheduler_config`（2），于是「连接数被压到 2 条」的
+    /// 缺陷在测试全绿的情况下原封不动留在真机上。
+    #[test]
+    fn engine_scheduler_config_derives_min_peers() {
+        let cfg = TorrentConfig {
+            max_peers: 50,
+            ..Default::default()
+        };
+        let sched_cfg = scheduler_config(&cfg);
+        assert_eq!(
+            sched_cfg.min_peers, 0,
+            "上游不得写死保底连接数，否则 PeerScheduler::new 的自动推导永远不生效"
+        );
+
+        // 端到端：吞吐单调下滑（每一轮都负增长，模拟对端持续限速）
+        // 目标只能收敛到动态保底（50/4 = 12），而不是旧行为的 2。
+        let mut s = PeerScheduler::new(sched_cfg);
+        let peers: Vec<PeerSample> = (0..12)
+            .map(|i| PeerSample {
+                addr: format!("203.0.113.{}:6881", i + 1).parse().unwrap(),
+                speed: 1_000_000,
+                connected_for: Duration::from_secs(120),
+            })
+            .collect();
+        let _ = s.evaluate(&peers, 40);
+        let mut speed = 1_000_000u64;
+        for _ in 0..60 {
+            // 每轮 -10%：gain 恒为负 → 连续下滑计数持续累积
+            speed = (speed * 9 / 10).max(1);
+            let samples: Vec<PeerSample> = peers
+                .iter()
+                .map(|p| PeerSample { speed, ..*p })
+                .collect();
+            let _ = s.evaluate(&samples, 40);
+        }
+        assert!(
+            s.target() >= 12,
+            "保底必须是 max_peers/4，实际目标 {}",
+            s.target()
+        );
+    }
+
+    /// 超时判据不得依赖「最后一次发包时间」：批量补请求后它会被清成
+    /// None 且长期不恢复，拿它做前置条件会让静默的对端永久占住片。
+    #[test]
+    fn request_timeout_ignores_last_send_time() {
+        // 有在途 + 长时间没块 → 换节点
+        assert!(requests_timed_out(1, REQUEST_TIMEOUT + Duration::from_secs(1)));
+        assert!(requests_timed_out(256, Duration::from_secs(45)));
+        // 没有在途请求 → 不算超时（被 choke 时在途表已被清空）
+        assert!(!requests_timed_out(0, Duration::from_secs(600)));
+        // 仍在收块 → 不算超时
+        assert!(!requests_timed_out(200, Duration::from_secs(5)));
+        assert!(!requests_timed_out(200, REQUEST_TIMEOUT));
+    }
+
+    /// 收尾阶段（还缺的片全部已有归属）必须用缩短的宽限期，
+    /// 否则被 choke 的对端会把最后几片钉住整整一个 CHOKE_GRACE。
+    #[test]
+    fn choke_grace_shrinks_when_no_piece_left_to_assign() {
+        assert_eq!(choke_grace(true), CHOKE_GRACE);
+        assert_eq!(choke_grace(false), CHOKE_GRACE_TAIL);
+        assert!(
+            CHOKE_GRACE_TAIL < CHOKE_GRACE,
+            "收尾宽限期必须短于常规宽限期"
+        );
+        assert!(
+            CHOKE_GRACE_TAIL >= CHOKE_INTERVAL,
+            "收尾宽限期不该短于一轮 choking，否则每次轮换都白丢已收块"
+        );
     }
 }
