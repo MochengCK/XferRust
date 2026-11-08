@@ -267,6 +267,29 @@ fn requests_timed_out(in_flight: usize, idle: Duration) -> bool {
 }
 
 /// 被 choke 的对端还能保留片归属多久（见 [`CHOKE_GRACE`] / [`CHOKE_GRACE_TAIL`]）。
+/// 实际 announce 间隔（秒）的纯算法。
+///
+/// 输入全部来自调用方快照（连接数 / 是否冷启动 / tracker 回的 interval /
+/// tracker 要求的 min interval），因此可以单测钉死；主循环触发与 tracker
+/// 面板的「下次连接」都走这里，避免两处口径漂移。
+fn announce_interval_secs(
+    active: usize,
+    cold: bool,
+    tracker_interval: u64,
+    min_interval: u64,
+) -> u64 {
+    let interval = tracker_interval.max(15);
+    let eff = if active == 0 {
+        if cold { 3 } else { 5 }
+    } else {
+        // 封顶 5 分钟：常见 interval 是 1800s，半小时不换血会让 peer 池劣化；
+        // 按连接数加固定偏移，避免多任务同刻打 tracker。
+        interval.min(MAX_ACTIVE_ANNOUNCE_INTERVAL) + (active as u64 % 17)
+    };
+    // tracker 明确要求的 min interval 优先（私有 tracker 超频会被警告/封禁）
+    eff.max(min_interval)
+}
+
 fn choke_grace(has_unassigned: bool) -> Duration {
     if has_unassigned {
         CHOKE_GRACE
@@ -1147,6 +1170,11 @@ pub struct TorrentEngine {
     /// [`MAX_ACTIVE_ANNOUNCE_INTERVAL`]，若无条件封顶就会以数倍频率打
     /// tracker，因此这个下限必须参与钳制。
     last_min_interval: AtomicU64,
+    /// 最近一次**真正发起** announce 的时刻（epoch ms，0 = 还没发过）。
+    ///
+    /// tracker 面板的「下次连接」= 这个时刻 + 当前实际间隔：所有 tracker 是
+    /// 一起 announce 的，各 tracker 自己回的 interval 只是它的建议值。
+    last_announce_at_ms: AtomicU64,
     /// 全局下载限速器。
     rate_limiter: Mutex<RateLimiter>,
     /// 全局上传限速器（响应 peer 请求发送块前消费令牌）。
@@ -1349,6 +1377,7 @@ impl TorrentEngine {
             finished: AtomicBool::new(false),
             last_interval: AtomicU64::new(60),
             last_min_interval: AtomicU64::new(0),
+            last_announce_at_ms: AtomicU64::new(0),
             rate_limiter: Mutex::new(RateLimiter::new(download_limit)),
             upload_limiter: Mutex::new(RateLimiter::new(upload_limit)),
             dl_limit: AtomicU64::new(download_limit),
@@ -1426,6 +1455,7 @@ impl TorrentEngine {
             finished: AtomicBool::new(false),
             last_interval: AtomicU64::new(60),
             last_min_interval: AtomicU64::new(0),
+            last_announce_at_ms: AtomicU64::new(0),
             rate_limiter: Mutex::new(RateLimiter::new(download_limit)),
             upload_limiter: Mutex::new(RateLimiter::new(upload_limit)),
             dl_limit: AtomicU64::new(download_limit),
@@ -2155,18 +2185,9 @@ impl TorrentEngine {
                     // 常见值 1800s 会让 peer 池半小时不换血（见
                     // MAX_ACTIVE_ANNOUNCE_INTERVAL）。封顶 5 分钟，
                     // 并按连接数加一点固定偏移，避免多任务同刻打 tracker。
-                    let active = self.peers.read().unwrap().len();
-                    let cold = self.cold_start_at.elapsed() < COLD_START_WINDOW;
-                    let interval = self.last_interval.load(Ordering::Relaxed).max(15);
-                    let eff = if active == 0 {
-                        if cold { 3 } else { 5 }
-                    } else {
-                        interval.min(MAX_ACTIVE_ANNOUNCE_INTERVAL) + (active as u64 % 17)
-                    };
-                    // tracker 明确要求的 min interval 优先：私有 tracker 对
-                    // 超频 announce 会警告甚至封禁。公开 tracker 一般不给这个
-                    // 字段（floor = 0），行为与以前一致。
-                    let eff = eff.max(self.last_min_interval.load(Ordering::Relaxed));
+                    // 具体算法在 effective_announce_interval 里 —— tracker
+                    // 面板的「下次连接」用的是同一份，不能各写一份。
+                    let eff = self.effective_announce_interval();
                     if last_announce.elapsed() >= Duration::from_secs(eff) {
                         // announce 全程后台执行：tracker 再慢也不阻塞拨号/选片/调度；
                         // 新 peer 由 add_peers 唤醒主循环立即连接。
@@ -2280,6 +2301,9 @@ impl TorrentEngine {
         if self.announce_busy.swap(true, Ordering::Relaxed) {
             return false;
         }
+        // 「下次连接」的计时基准：以**真正发起**这一轮的时刻算（而不是
+        // tracker 应答时刻），否则倒计时要等网络回来才开始。
+        self.last_announce_at_ms.store(epoch_ms(), Ordering::Relaxed);
         let engine = self.clone();
         let event = event.map(str::to_string);
         tokio::spawn(async move {
@@ -2649,7 +2673,32 @@ impl TorrentEngine {
 
     /// 各 tracker 最近一次 announce 状态快照（引擎管理器 getTrackers 合并）。
     pub fn tracker_stats(&self) -> Vec<TrackerStat> {
-        self.tracker_stats.lock().unwrap().clone()
+        let mut stats = self.tracker_stats.lock().unwrap().clone();
+        // 「下次连接」按**实际调度**算，而不是各 tracker 自己回的 interval：
+        // 所有 tracker 是一起 announce 的，且我们会把 interval 封顶到
+        // MAX_ACTIVE_ANNOUNCE_INTERVAL（冷启动更是 3~5s）。直接用 1800s
+        // 算出来的倒计时会一直停在半小时、永远走不到 0。
+        let started = self.last_announce_at_ms.load(Ordering::Relaxed);
+        if started > 0 {
+            let next = started + self.effective_announce_interval() * 1000;
+            for s in stats.iter_mut() {
+                s.next_announce_ms = next;
+            }
+        }
+        stats
+    }
+
+    /// 当前实际使用的 announce 间隔（秒）。
+    ///
+    /// 主循环的触发条件与 tracker 面板的「下次连接」必须共用这一份算法：
+    /// 两处各写一份的话，界面倒计时会和真实调度各说各话。
+    fn effective_announce_interval(&self) -> u64 {
+        announce_interval_secs(
+            self.peers.read().unwrap().len(),
+            self.cold_start_at.elapsed() < COLD_START_WINDOW,
+            self.last_interval.load(Ordering::Relaxed),
+            self.last_min_interval.load(Ordering::Relaxed),
+        )
     }
 
     /// 异步派发的 stopped/completed announce（run 结束后尽力通知）。
@@ -8655,5 +8704,24 @@ mod tests {
             CHOKE_GRACE_TAIL >= CHOKE_INTERVAL,
             "收尾宽限期不该短于一轮 choking，否则每次轮换都白丢已收块"
         );
+    }
+
+    /// announce 间隔：冷启动 / 有 peer / tracker 下限三种情形。
+    ///
+    /// tracker 面板的「下次连接」= 最近一次发起 announce 的时刻 + 这个间隔，
+    /// 所以这里钉的就是界面上倒计时的分母。
+    #[test]
+    fn announce_interval_uses_cold_start_and_respects_tracker_floor() {
+        // 无 peer：冷启动 3s，否则 5s（与 tracker 的 interval 无关）
+        assert_eq!(announce_interval_secs(0, true, 1800, 0), 3);
+        assert_eq!(announce_interval_secs(0, false, 1800, 0), 5);
+        // 有 peer：tracker interval 封顶 300s + 按连接数偏移
+        assert_eq!(announce_interval_secs(50, false, 1800, 0), 300 + 50 % 17);
+        assert_eq!(announce_interval_secs(1, false, 120, 0), 120 + 1);
+        // 下限极小的 interval 会被抬到 15s，避免把 tracker 打爆
+        assert_eq!(announce_interval_secs(0, true, 0, 0), 3);
+        assert_eq!(announce_interval_secs(10, false, 1, 0), 15 + 10 % 17);
+        // tracker 明确要求的最小间隔优先（私有 tracker 超频会被封）
+        assert_eq!(announce_interval_secs(50, false, 1800, 1800), 1800);
     }
 }
