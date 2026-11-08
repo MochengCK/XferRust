@@ -99,11 +99,30 @@ const GET_PEERS_ALPHA: usize = 8;
 const GET_PEERS_CANDIDATES: usize = 32;
 /// 单次 get_peers 的时间预算（超过就带着已有结果返回，下一轮调度接着查）。
 const GET_PEERS_BUDGET: Duration = Duration::from_secs(8);
+/// 已经拿到 peer 之后**额外**再查多久。
+///
+/// 只在「还没任何 peer」时用满 `GET_PEERS_BUDGET`：一旦手里有地址，多查的
+/// 收益就变成了延迟 —— 调用方要等整个 get_peers 返回才会开始拨号。冷门
+/// 种子恰恰最在意「第一个 peer 多快到手」，所以拿到后就只再给一轮多的时间
+/// 继续凑，而不是死等 8s。
+const GET_PEERS_POST_HIT_BUDGET: Duration = Duration::from_secs(2);
 /// 迭代轮数上限（防病态网络下的无限翻找）。
 const GET_PEERS_MAX_ROUNDS: usize = 8;
 /// 凑够这么多 peer 就提前收工：热门种子一个节点就回几十个，没必要
 /// 把整张路由表翻完；冷门种子根本到不了这个数，会一直查到网络边缘。
-const GET_PEERS_ENOUGH_PEERS: usize = 40;
+const GET_PEERS_ENOUGH_PEERS: usize = 8;
+
+/// 是否该结束 get_peers 迭代。
+///
+/// 三条判据：凑够 `GET_PEERS_ENOUGH_PEERS` / 用满总预算 / 命中过 peer 且
+/// 距首次命中已过 `GET_PEERS_POST_HIT_BUDGET`。第三条是关键：调用方要等
+/// 整个 get_peers 返回才开始拨号，命中后还死等满 8s 会把「第一个 peer
+/// 到手」硬推到预算尽头（公网冒烟里确实观测到了）。
+fn get_peers_should_stop(peers: usize, waited: Duration, since_hit: Option<Duration>) -> bool {
+    peers >= GET_PEERS_ENOUGH_PEERS
+        || waited >= GET_PEERS_BUDGET
+        || since_hit.is_some_and(|d| d >= GET_PEERS_POST_HIT_BUDGET)
+}
 
 /// DHT 节点。
 pub struct Dht {
@@ -597,9 +616,16 @@ impl Dht {
             all_known = table.closest(&target_node, GET_PEERS_CANDIDATES);
         }
 
-        let deadline = tokio::time::Instant::now() + GET_PEERS_BUDGET;
+        let start = tokio::time::Instant::now();
+        // 首次命中 peer 的时刻（用于命中后收紧，见 GET_PEERS_POST_HIT_BUDGET）
+        let mut hit_at: Option<tokio::time::Instant> = None;
         for _ in 0..GET_PEERS_MAX_ROUNDS {
-            if tokio::time::Instant::now() >= deadline {
+            let now = tokio::time::Instant::now();
+            if get_peers_should_stop(
+                all_peers.len(),
+                now.duration_since(start),
+                hit_at.map(|t| now.duration_since(t)),
+            ) {
                 break;
             }
             // 选出未访问的最近若干节点
@@ -654,8 +680,9 @@ impl Dht {
 
             all_peers.sort();
             all_peers.dedup();
-            if all_peers.len() >= GET_PEERS_ENOUGH_PEERS {
-                break;
+            // 命中后只再查一小会儿：不能把「第一个 peer 到手」压到预算尽头
+            if !all_peers.is_empty() && hit_at.is_none() {
+                hit_at = Some(tokio::time::Instant::now());
             }
             if new_nodes.is_empty() {
                 // 这一轮没有任何更近的节点：已经问到网络边缘
@@ -1187,6 +1214,35 @@ mod tests {
             }
         });
         socket
+    }
+
+    /// 命中后必须**很快**返回：调用方要等整个 get_peers 结束才拨号，
+    /// 死等满 8s 会把「第一个 peer 到手」推到预算尽头。
+    #[test]
+    fn get_peers_stops_soon_after_first_hit() {
+        // 还没有 peer：可以用满总预算
+        assert!(!get_peers_should_stop(0, Duration::from_secs(7), None));
+        assert!(get_peers_should_stop(0, GET_PEERS_BUDGET, None));
+        // 有 1 个 peer（冷门种子）：命中后 2s 必须收工，不能等满 8s
+        assert!(!get_peers_should_stop(
+            1,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(1))
+        ));
+        assert!(get_peers_should_stop(
+            1,
+            Duration::from_secs(3),
+            Some(GET_PEERS_POST_HIT_BUDGET)
+        ));
+        // 凑够最小批量：立刻收工（热门种子的常态）
+        assert!(get_peers_should_stop(
+            GET_PEERS_ENOUGH_PEERS,
+            Duration::ZERO,
+            None
+        ));
+        // 「命中后收紧」必须真的更紧，否则这条逻辑名不副实
+        assert!(GET_PEERS_POST_HIT_BUDGET < GET_PEERS_BUDGET);
+        assert!(GET_PEERS_ENOUGH_PEERS > 0);
     }
 
     /// 冷门种子：**第一个回 peers 的节点不能终止迭代**。
