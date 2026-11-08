@@ -320,6 +320,15 @@ pub struct Task {
     /// BT 按片落盘，低速率下某秒 0 片完成会让完成字节差值归零
     /// （peer 明明在传输，任务速度却显示 0）。
     pub received_atomic: AtomicU64,
+    /// 无锁**连续**进度计数器（字节级）：在 `completed`（分片级）之上叠加
+    /// 本轮 `received` 的增量，供界面显示「已下载大小」。
+    ///
+    /// BT 的 `completedLength` 只有整片校验落盘才会变（片 4~16MB，低速率下
+    /// 十几秒甚至一分钟才跳一次），而速度是每秒刷新的字节级量，两者并排
+    /// 显示时左边像卡住。这个值是「已完成片 + 在途片已收字节」，最多领先
+    /// 真实落盘量一个分片，片落盘后由 `max(done)` 收敛；不会倒退、不超过总量。
+    /// 非 BT 任务无人更新它，恒为 0，读侧 `max(completed)` 自动退回精确值。
+    pub live_completed_atomic: AtomicU64,
     /// 无锁上传速度计数器：speed_ticker 按上传字节差值 store。
     pub upload_speed_atomic: AtomicU64,
     /// 单任务下载限速（bytes/s，0 = 跟随全局）：`max-download-limit`
@@ -411,6 +420,7 @@ impl Task {
             speed_atomic: AtomicU64::new(0),
             uploaded_atomic: AtomicU64::new(0),
             received_atomic: AtomicU64::new(0),
+            live_completed_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
             task_dl_limit: AtomicU64::new(dl0),
             task_ul_limit: AtomicU64::new(ul0),
@@ -486,6 +496,7 @@ impl Task {
             speed_atomic: AtomicU64::new(0),
             uploaded_atomic: AtomicU64::new(0),
             received_atomic: AtomicU64::new(0),
+            live_completed_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
             task_dl_limit: AtomicU64::new(dl0),
             task_ul_limit: AtomicU64::new(ul0),
@@ -556,6 +567,7 @@ impl Task {
             speed_atomic: AtomicU64::new(0),
             uploaded_atomic: AtomicU64::new(0),
             received_atomic: AtomicU64::new(0),
+            live_completed_atomic: AtomicU64::new(0),
             upload_speed_atomic: AtomicU64::new(0),
             task_dl_limit: AtomicU64::new(dl0),
             task_ul_limit: AtomicU64::new(ul0),
@@ -703,6 +715,26 @@ impl Task {
     /// 与完成字节（含 resume 历史）无关。
     pub fn received_live(&self) -> u64 {
         self.received_atomic.load(Ordering::Relaxed)
+    }
+
+    /// 界面用的**连续**「已下载」字节数。
+    ///
+    /// 以 `completed`（分片级精确值）为下界，叠加本轮接收字节的增量；
+    /// 再用 `totalLength` 封顶。无人维护 `live_completed_atomic`（HTTP/SFTP、
+    /// 会话刚恢复、旧引擎）时自然退化为 `completed`，完全向后兼容。
+    pub fn live_completed_live(&self) -> u64 {
+        let done = self.completed_live();
+        let mut v = self
+            .live_completed_atomic
+            .load(Ordering::Relaxed)
+            .max(done);
+        let total = self.shared.lock().unwrap().total_len;
+        if let Some(t) = total {
+            if t > 0 {
+                v = v.min(t);
+            }
+        }
+        v
     }
 }
 
@@ -1091,6 +1123,11 @@ pub fn status_json(task: &Task) -> Value {
         "receivedLength".into(),
         json!(task.received_live().to_string()),
     );
+    // 界面显示用的连续进度（字节级；分片级 completedLength 仍保留原语义）
+    m.insert(
+        "liveCompletedLength".into(),
+        json!(task.live_completed_live().to_string()),
+    );
     // 本次启动从磁盘已有文件继承并校验通过的大小（普通新任务为 0）
     m.insert("verifiedLength".into(), json!(verified_total.to_string()));
     m.insert("uploadLength".into(), json!(s.uploaded.to_string()));
@@ -1267,6 +1304,8 @@ pub fn status_json_native(task: &Task) -> Value {
         // 本轮已接收字节（BT 字节级上报，含未校验/重复下载的部分）：
         // 首片落盘前 completedLength 恒为 0，界面据此显示"已接收 X"。
         "receivedLength": task.received_live(),
+        // 界面显示用的连续进度（字节级；分片级 completedLength 仍保留原语义）
+        "liveCompletedLength": task.live_completed_live(),
         // 本次启动从磁盘已有文件继承并校验通过的大小（普通新任务为 0）
         "verifiedLength": verified_total,
         // 已有数据校验进行中：checked/total 为实时进度（未校验时为 false/0）

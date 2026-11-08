@@ -5185,8 +5185,43 @@ async fn drive_bt_download(
                 task.uploaded_atomic
                     .store(engine.uploaded(), Ordering::Relaxed);
                 // 接收字节（字节级实时）：speed_ticker 的速度窗口采样源
-                task.received_atomic
-                    .store(engine.received_total(), Ordering::Relaxed);
+                let received_now = engine.received_total();
+                let received_prev = task.received_atomic.swap(received_now, Ordering::Relaxed);
+                let received_delta = received_now.saturating_sub(received_prev);
+                // 连续进度：在分片级 done 之上叠加本轮接收增量，界面上的
+                // 「已下载大小」才会像右侧速度一样每秒都在涨。
+                // received 含 BEP 47 对齐填充（以及跨文件边界片里未选文件
+                // 一侧的字节），按「内容 / 总数据」折算到 totalLength 的口径，
+                // 否则尾段会提前显示 100%。引擎重启后 received 归零 →
+                // delta 为 0，显示值不倒退；片落盘时 max(done) 自动收敛。
+                let content_delta = {
+                    let meta = task.bt_meta.lock().unwrap();
+                    match meta.as_ref() {
+                        Some(m) => {
+                            let whole = m.info.total_length();
+                            let content = m.info.content_length();
+                            if whole > 0 && content > 0 && content < whole {
+                                (received_delta as u128 * content as u128 / whole as u128) as u64
+                            } else {
+                                received_delta
+                            }
+                        }
+                        None => received_delta,
+                    }
+                };
+                let done = p.done;
+                let total = p.total;
+                let _ = task.live_completed_atomic.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |old| {
+                        let mut v = old.saturating_add(content_delta).max(done);
+                        if total > 0 {
+                            v = v.min(total);
+                        }
+                        Some(v)
+                    },
+                );
                 *task.bt_peers.lock().unwrap() = peers;
                 // 分片位图同步（分片展示用）：暂停后任务字段保留最后状态
                 if let Some(bf) = engine.bitfield() {
