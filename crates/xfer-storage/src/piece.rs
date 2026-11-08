@@ -809,6 +809,81 @@ impl PieceStore {
         Ok(())
     }
 
+    /// 该片是否有分段落在「未选文件」里（这些字节没有句柄，写不进磁盘）。
+    ///
+    /// 只有这类片（跨「选/未选文件」边界的片）需要把块攒在内存里校验；
+    /// 其余片一律**收到即落盘**，见 [`Self::write_block`]。
+    pub fn piece_needs_buffer(&self, index: u32) -> bool {
+        self.layout
+            .piece_segments(index)
+            .iter()
+            .any(|(fi, _, _)| self.files[*fi].is_none())
+    }
+
+    /// 把单个块写到它在片内的位置（接收热路径）。
+    ///
+    /// 为什么按块落盘而不是攒整片：块缓存在每个 peer 的会话里，片长
+    /// 8MiB + 50 条连接就是 400MiB 常驻内存，且每条连接要为此分配
+    /// 512 个 16KiB 的 `Vec`。改成收到即写进目标文件后，内存只剩
+    /// 「哪些块到了」的键集合（每条连接几十 KB），校验时再从页缓存
+    /// 回读整片算 SHA-1。
+    ///
+    /// 前提：调用方必须先确认 [`Self::piece_needs_buffer`] 为假 ——
+    /// 未选文件的分段没有句柄，既写不进去、也不该为它创建文件。
+    pub fn write_block(&mut self, index: u32, begin: u32, data: &[u8]) -> std::io::Result<()> {
+        // 越界块直接拒绝：写进邻片区域会造成难以定位的数据损坏
+        // （片号越界时 piece_len 为 0，同样在这里被挡掉）。
+        let plen = self.layout.piece_len(index);
+        if data.is_empty() || begin as u64 + data.len() as u64 > plen {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "块越界：片 {index} 长 {plen}，块 [{begin}, {})",
+                    begin as u64 + data.len() as u64
+                ),
+            ));
+        }
+        let piece_start = index as u64 * self.layout.piece_length;
+        let block_start = piece_start + begin as u64;
+        let block_end = block_start + data.len() as u64;
+        let mut written = 0usize;
+        for (fi, f_layout) in self.layout.files.iter().enumerate() {
+            let f_start = f_layout.offset;
+            let f_end = f_layout.offset + f_layout.length;
+            if block_end <= f_start || block_start >= f_end {
+                continue;
+            }
+            let seg_start = block_start.max(f_start) - f_start;
+            let seg_len = (block_end.min(f_end) - block_start.max(f_start)) as usize;
+            if let Some(file) = self.files[fi].as_mut() {
+                file.file.seek(SeekFrom::Start(seg_start))?;
+                file.file.write_all(&data[written..written + seg_len])?;
+            }
+            written += seg_len;
+        }
+        Ok(())
+    }
+
+    /// 读取整片用于校验（要求该片所有分段都有文件句柄）。
+    ///
+    /// 与 [`Self::read_piece`] 的区别：这是**校验路径**，长度不足说明片
+    /// 布局与句柄状态不一致（例如下载途中改了文件选择），必须报错而不是
+    /// 返回短数据 —— 短数据只会让 SHA-1 永远失败，任务陷入无声的重下循环。
+    pub fn read_piece_for_verify(&mut self, index: u32) -> std::io::Result<Vec<u8>> {
+        let want = self.layout.piece_len(index) as usize;
+        let data = self.read_piece(index)?;
+        if data.len() != want {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "片 {index} 可读 {} 字节，短于片长 {want}（存在未打开的分段）",
+                    data.len()
+                ),
+            ));
+        }
+        Ok(data)
+    }
+
     /// 读取一片（跨文件拼接）。
     ///
     /// 未选文件一侧的分段按缺席跳过：返回的数据短于片长（仅 seed
@@ -1566,5 +1641,109 @@ mod tests {
         let mut short = vec![0u32; 3];
         a.accumulate_rarity(&mut short);
         assert_eq!(short, vec![1, 1, 0]);
+    }
+
+    // ------------------------------------------------------------------
+    // 块级落盘（接收热路径：收到即写进目标文件，不再攒整片）
+    // ------------------------------------------------------------------
+
+    /// 块级落盘与整片写入必须产出**逐字节相同**的文件内容。
+    ///
+    /// 这是本次改造的对拍判据：换成「收到即写块」之后落盘结果不能变。
+    #[test]
+    fn write_block_matches_write_piece() {
+        let (dir_a, mut a, _) = cache_store("blockref");
+        let (dir_b, mut b, _) = cache_store("blocknew");
+        // 25 字节 / 片长 10 → 3 片（10、10、5），末片不满
+        let total = 25u32;
+        let src: Vec<u8> = (0..total as u8).map(|i| i.wrapping_mul(7)).collect();
+        let ranges: Vec<(u32, u32)> = (0..3u32).map(|i| (i * 10, (i * 10 + 10).min(total))).collect();
+
+        // A：整片写入（旧路径）
+        for &(s, e) in &ranges {
+            a.write_piece(s / 10, &src[s as usize..e as usize]).unwrap();
+        }
+        // B：按 4 字节块写入（新路径）
+        for &(s, e) in &ranges {
+            let mut off = s;
+            while off < e {
+                let len = (e - off).min(4);
+                b.write_block(s / 10, off - s, &src[off as usize..(off + len) as usize])
+                    .unwrap();
+                off += len;
+            }
+        }
+        for &(s, _) in &ranges {
+            let idx = s / 10;
+            assert_eq!(
+                a.read_piece(idx).unwrap(),
+                b.read_piece(idx).unwrap(),
+                "片 {idx} 的落盘内容不一致"
+            );
+        }
+        // 校验路径必须拿到完整片长（末片 5 字节）
+        assert_eq!(a.read_piece_for_verify(0).unwrap().len(), 10);
+        assert_eq!(a.read_piece_for_verify(2).unwrap().len(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// 块跨文件边界：写块要按分段拆到两个文件，且两段都不串位。
+    #[test]
+    fn write_block_splits_across_files() {
+        let dir = std::env::temp_dir().join(format!("xfer-piece-blockx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 片长 16，a=24 / b=40：片 1 = a[16..24) + b[0..8)，天然跨文件
+        let layout = PieceLayout::new(
+            16,
+            vec![
+                (vec!["a.bin".into()], 24),
+                (vec!["b.bin".into()], 40),
+            ],
+        );
+        let mut store = PieceStore::open(&dir, "dl", layout, None).unwrap();
+        let src: Vec<u8> = (0..64u8).collect();
+        // 一块就跨边界：片内 [4,12) = global [20,28) = a[20..24) + b[0..4)
+        store.write_block(1, 4, &src[20..28]).unwrap();
+        store.write_block(1, 0, &src[16..20]).unwrap();
+        store.write_block(1, 12, &src[28..32]).unwrap();
+        assert_eq!(store.read_piece(1).unwrap(), &src[16..32]);
+        // 单文件内的块不串位
+        store.write_block(0, 0, &src[0..16]).unwrap();
+        assert_eq!(store.read_piece(0).unwrap(), &src[0..16]);
+        // 越界块必须被拒（写进去会踩到邻片）
+        let err = store.write_block(1, 14, &src[30..34]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(store.read_piece(1).unwrap(), &src[16..32], "越界块不得改动已写内容");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未选文件的分段：该片必须走内存路径（否则字节无处可写），
+    /// 且校验路径要明确报错而不是返回短数据。
+    #[test]
+    fn piece_needs_buffer_only_for_unselected_segments() {
+        let dir = std::env::temp_dir().join(format!("xfer-piece-needbuf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layout = PieceLayout::new(
+            16,
+            vec![
+                (vec!["a.bin".into()], 32),
+                (vec!["b.bin".into()], 32),
+            ],
+        );
+        // 只选 a：b 没有句柄
+        let mut store = PieceStore::open(&dir, "dl", layout, Some(&[0])).unwrap();
+        assert!(!store.piece_needs_buffer(0), "整片落在 a，不需要内存缓冲");
+        assert!(!store.piece_needs_buffer(1), "整片落在 a，不需要内存缓冲");
+        assert!(store.piece_needs_buffer(2), "整片落在未选的 b，必须走内存");
+        assert!(store.piece_needs_buffer(3), "整片落在未选的 b，必须走内存");
+
+        // 校验路径：读不到完整片长必须报错（短数据会让 SHA-1 永远失败）
+        let err = store.read_piece_for_verify(2).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

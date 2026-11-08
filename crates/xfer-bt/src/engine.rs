@@ -234,7 +234,11 @@ const UT_METADATA_EXT_ID: u8 = 2;
 /// 元数据分片大小（BEP 9：固定 16KB，最后一片可能不足）。
 const METADATA_PIECE_SIZE: usize = 16 * 1024;
 /// 磁力链接获取元数据的整体超时。
-const METADATA_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// 60s 对冷门种子太短：DHT 收敛 + 等到一个持有元数据的对端往往要几分钟，
+/// 到点就判失败等于「冷门种子永远下不了」。放宽到 10 分钟，期间仍在按
+/// 2~5s 的节奏补 tracker/DHT（见 `fetch_metadata`）。
+const METADATA_TIMEOUT: Duration = Duration::from_secs(600);
 /// 元数据 total_size 上限（主流客户端元数据普遍 < 1MB，
 /// 4MB 覆盖极端多文件种子的 info 字典；恶意声明更大会被直接拒绝）。
 const MAX_METADATA_SIZE: usize = 4 * 1024 * 1024;
@@ -944,8 +948,16 @@ struct PeerCtx {
     cell: Arc<PeerCell>,
     /// 在途请求集合：(片号, 块偏移)。
     in_flight: HashSet<(u32, u32)>,
-    /// 已收到块缓存：(片号, 块偏移) → 数据。
-    blocks: HashMap<(u32, u32), Vec<u8>>,
+    /// 已收到块（**只记键**：数据收到即落盘，见 `stage_block`）。
+    ///
+    /// 旧实现这里存的是整块数据，等于把「片长 × 连接数」常驻内存
+    /// （8MiB 片 × 50 连接 ≈ 400MiB）。
+    blocks: HashSet<(u32, u32)>,
+    /// 跨界片的块数据：分段落在未选文件里的片没有句柄可写，只能攒在内存。
+    /// 全选文件的任务恒为空。
+    block_buf: HashMap<(u32, u32), Vec<u8>>,
+    /// 走内存路径的片号（见 `block_buf`）。
+    buffered: HashSet<u32>,
     /// 片 → 应收块数（入队时按片长登记）。
     block_need: HashMap<u32, u32>,
     /// 片 → 已收块数（首次收到的块计数；重发块去重不计）。
@@ -2162,14 +2174,17 @@ impl TorrentEngine {
                             last_announce = Instant::now();
                         }
                     }
-                    // DHT get_peers 重试（§7.8：5s/30s/2min 三档）
+                    // DHT get_peers 重试（无 peer 2s/5s、少量 peer 10s、充足 120s）
                     if let Some(dht) = &dht {
                         let active = self.peers.read().unwrap().len();
                         let cold = self.cold_start_at.elapsed() < COLD_START_WINDOW;
                         let dht_interval = if active == 0 {
                             if cold { 2 } else { 5 }
                         } else if active < 5 {
-                            30
+                            // 连接数很少说明这是冷门种子（或对端都在 choke）：
+                            // 不能按「已经有人了」把补充间隔放到 30s，否则
+                            // 剩下的持有者永远凑不齐。
+                            10
                         } else {
                             120
                         };
@@ -2548,16 +2563,21 @@ impl TorrentEngine {
                 if !result.peers.is_empty() {
                     tracing::info!(peers = result.peers.len(), "DHT get_peers 返回 peer");
                     self.add_peers(result.peers, PeerSource::Dht).await;
-
+                } else {
+                    tracing::debug!("DHT get_peers 未找到 peer");
+                }
+                // **一个 peer 都没找到也要 announce**：冷门种子只有把自己
+                // 挂进 info_hash 的 peer 表，别的下载者查这个 hash 时才会
+                // 拿到我们的地址。旧实现只在「找到 peer」时才宣告 —— 于是
+                // 冷门种子永远互相看不见，两边都在空等。
+                let port = self.actual_listen_port.load(Ordering::Relaxed);
+                if port != 0 && !result.announce_nodes.is_empty() {
                     let dht_clone = dht.clone();
-                    let port = self.actual_listen_port.load(Ordering::Relaxed);
                     tokio::spawn(async move {
                         let _ = dht_clone
                             .announce_peer(info_hash, port, &result.announce_nodes)
                             .await;
                     });
-                } else {
-                    tracing::debug!("DHT get_peers 未找到 peer");
                 }
             }
             Err(e) => {
@@ -4404,6 +4424,8 @@ impl TorrentEngine {
                             self.release_all_pieces(&ctx.cell);
                             ctx.in_flight.clear();
                             ctx.blocks.clear();
+                            ctx.block_buf.clear();
+                            ctx.buffered.clear();
                             ctx.block_need.clear();
                             ctx.block_have.clear();
                             ctx.choked_since = None;
@@ -4708,11 +4730,16 @@ impl TorrentEngine {
                             }
                             let blen = block.len() as u64;
                             // 完成计数：仅首次收到的块计数（请求超时重发的重复块
-                            // 覆盖缓存但不计数，否则计数越过应收数、片永不"完成"）
-                            if ctx.blocks.insert((index, begin), block).is_none() {
+                            // 不再计数，否则计数越过应收数、片永不"完成"）。
+                            // 数据本身**收到即落盘**（见 `stage_block`）—— 这里只记
+                            // 「哪些块到了」，不再把整片攒在这条连接的会话里。
+                            ctx.in_flight.remove(&(index, begin));
+                            if !ctx.blocks.contains(&(index, begin))
+                                && self.stage_block(ctx, index, begin, &block)
+                            {
+                                ctx.blocks.insert((index, begin));
                                 *ctx.block_have.entry(index).or_insert(0) += 1;
                             }
-                            ctx.in_flight.remove(&(index, begin));
                             // 累计该 peer 下载量：速度采样（sample_peer_speeds）、
                             // 慢节点淘汰/智能调度都依赖它。缺了它所有 peer 的
                             // recent_speed 恒为 0 → 调度把正常下载的 seed 当死
@@ -4731,20 +4758,6 @@ impl TorrentEngine {
                             self.adjust_pipeline(ctx);
 
                             if self.piece_complete(ctx, index) {
-                                let plen = self.store.lock().unwrap().as_ref().unwrap().piece_len(index);
-                                let mut data = vec![0u8; plen as usize];
-                                let mut ok = true;
-                                for (&(pi, off), blk) in &ctx.blocks {
-                                    if pi != index {
-                                        continue;
-                                    }
-                                    let off = off as usize;
-                                    if off + blk.len() > data.len() {
-                                        ok = false;
-                                        break;
-                                    }
-                                    data[off..off + blk.len()].copy_from_slice(blk);
-                                }
                                 let expected = self
                                     .meta
                                     .read()
@@ -4753,13 +4766,24 @@ impl TorrentEngine {
                                     .expect("元数据未就绪")
                                     .info
                                     .pieces[index as usize];
-                                if ok && self.accept_piece(index, &data, &expected) {
+                                // 整片数据：跨界片从会话缓存拼（其字节写不进
+                                // 未选文件的句柄），其余片从磁盘回读 —— 刚写的
+                                // 块还在页缓存里，回读只是一次片长拷贝。
+                                let accepted = match self.piece_bytes(ctx, index) {
+                                    Some((data, on_disk)) => {
+                                        self.accept_piece(index, &data, &expected, on_disk)
+                                    }
+                                    None => false,
+                                };
+                                if accepted {
                                     // 广播 Have 给所有 peer（BEP 3）
                                     self.broadcast_have(index);
                                 }
                                 // 仅释放该片的槽位与缓存；其余在途片继续下载
                                 self.release_piece(&ctx.cell, index);
-                                ctx.blocks.retain(|&(pi, _), _| pi != index);
+                                ctx.blocks.retain(|&(pi, _)| pi != index);
+                                ctx.block_buf.retain(|&(pi, _), _| pi != index);
+                                ctx.buffered.remove(&index);
                                 ctx.in_flight.retain(|&(pi, _)| pi != index);
                                 ctx.block_need.remove(&index);
                                 ctx.block_have.remove(&index);
@@ -5976,14 +6000,83 @@ impl TorrentEngine {
         self.assigned.lock().unwrap().remove(&piece);
     }
 
+    /// 收块：能落盘就落盘（页缓存写），只有跨界片才留在会话内存里。
+    ///
+    /// 返回是否已成功保存（false = 写盘失败，调用方不标记该块，交给补请求重下）。
+    ///
+    /// 为什么按块落盘：块缓存原本挂在每条连接的会话上，`片长 × 连接数`
+    /// 就是常驻内存（8MiB × 50 = 400MiB，且每条连接还要为整片分配 512 个
+    /// 16KiB 的 `Vec`）。改成收到即写进目标文件后，内存只剩「哪些块到了」
+    /// 的键集合（每条连接几十 KB），校验时从页缓存回读整片算 SHA-1。
+    fn stage_block(&self, ctx: &mut PeerCtx, index: u32, begin: u32, block: &[u8]) -> bool {
+        let mut guard = self.store.lock().unwrap();
+        let Some(store) = guard.as_mut() else {
+            return false;
+        };
+        // 跨界片（有分段落在未选文件里）：这些字节没有句柄可写，只能攒在
+        // 会话内存里校验，校验通过后再整片写盘（旧路径）。
+        if ctx.buffered.contains(&index) || store.piece_needs_buffer(index) {
+            ctx.buffered.insert(index);
+            ctx.block_buf.insert((index, begin), block.to_vec());
+            return true;
+        }
+        match store.write_block(index, begin, block) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(piece = index, begin, error = %e, "块落盘失败，稍后重下");
+                false
+            }
+        }
+    }
+
+    /// 取整片数据（校验用）：返回 (数据, 是否已在磁盘上)。
+    ///
+    /// - 跨界片走内存：其字节写不进未选文件的句柄，只能从会话缓存拼；
+    /// - 其余片走磁盘：块收到时已写到目标位置，这里整片回读。
+    fn piece_bytes(&self, ctx: &PeerCtx, index: u32) -> Option<(Vec<u8>, bool)> {
+        if ctx.buffered.contains(&index) {
+            let plen = self.store.lock().unwrap().as_ref()?.piece_len(index) as usize;
+            let mut data = vec![0u8; plen];
+            for (&(pi, off), blk) in &ctx.block_buf {
+                if pi != index {
+                    continue;
+                }
+                let off = off as usize;
+                if off + blk.len() > data.len() {
+                    tracing::warn!(piece = index, begin = off, "块越界，整片丢弃重下");
+                    return None;
+                }
+                data[off..off + blk.len()].copy_from_slice(blk);
+            }
+            return Some((data, false));
+        }
+        let data = {
+            let mut guard = self.store.lock().unwrap();
+            let store = guard.as_mut()?;
+            match store.read_piece_for_verify(index) {
+                Ok(d) => d,
+                Err(e) => {
+                    // 长度不足 / 读失败：绝不能把短数据当片去校验（那只会
+                    // 让 SHA-1 永远失败、无声重下），直接丢弃重来。
+                    tracing::warn!(piece = index, error = %e, "整片回读失败，丢弃重下");
+                    return None;
+                }
+            }
+        };
+        Some((data, true))
+    }
+
     /// 校验并落盘一片（成功时更新进度）。
+    ///
+    /// `on_disk` 为真表示块已按块写进目标文件，这里只需校验 + 标记；
+    /// 为假（跨界片）才需要整片写盘。
     ///
     /// SHA-1 校验在全局 store 锁外执行：哈希是 CPU 密集操作（每片
     /// 256KiB-1MiB），锁内计算会阻塞所有其他 peer 的 fill_pipeline /
     /// assign_piece。落盘仍需锁（独占文件句柄），但写入走 OS 页缓存，
     /// 耗时远小于哈希。语义与 PieceStore::accept_piece 一致：
     /// 校验失败不落盘、不标记。
-    fn accept_piece(&self, index: u32, data: &[u8], expected: &[u8; 20]) -> bool {
+    fn accept_piece(&self, index: u32, data: &[u8], expected: &[u8; 20], on_disk: bool) -> bool {
         {
             // 快速去重（锁内 O(1) 位查询）：同片已被其他连接完成时跳过，
             // 也避免为已拥有片白白计算一次 SHA-1。
@@ -6007,7 +6100,13 @@ impl TorrentEngine {
         if store.have_piece(index) {
             return false;
         }
-        match store.write_piece(index, data) {
+        // 已在磁盘上的片只标记；跨界片（内存路径）才整片写盘
+        let written = if on_disk {
+            Ok(())
+        } else {
+            store.write_piece(index, data)
+        };
+        match written {
             Ok(()) => {
                 store.mark_done(index);
                 // 进度严格镜像位图（真相源）：位图置位前必经 SHA-1 校验
@@ -6225,7 +6324,7 @@ impl TorrentEngine {
             'outer: for &(piece, ref blocks) in &pieces {
                 for &(begin, len) in blocks {
                     let key = (piece, begin);
-                    if !ctx.blocks.contains_key(&key) && !ctx.in_flight.contains(&key) {
+                    if !ctx.blocks.contains(&key) && !ctx.in_flight.contains(&key) {
                         next = Some((piece, begin, len));
                         break 'outer;
                     }
@@ -6994,7 +7093,9 @@ impl PeerCtx {
         Self {
             cell,
             in_flight: HashSet::new(),
-            blocks: HashMap::new(),
+            blocks: HashSet::new(),
+            block_buf: HashMap::new(),
+            buffered: HashSet::new(),
             block_need: HashMap::new(),
             block_have: HashMap::new(),
             stale_count: 0,

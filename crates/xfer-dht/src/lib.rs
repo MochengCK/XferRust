@@ -33,6 +33,10 @@ pub const BOOTSTRAP_V4: &[(&str, u16)] = &[
     ("dht.transmissionbt.com", 6881),
     ("dht.libtorrent.org", 25401),
     ("dht.aelitis.com", 6881),
+    // 多两个入口：上面几个域名常年有一两个不解析或端口不通，冷门种子
+    // 冷启动要的正是「一次就能问到几百个节点」的那一跳。
+    ("router.utorrent.com", 6881),
+    ("router.bitcomet.com", 6881),
 ];
 
 /// Bootstrap 节点（IPv6）。

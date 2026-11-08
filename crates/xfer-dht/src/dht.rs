@@ -86,6 +86,24 @@ const RECV_CONCURRENCY: usize = 256;
 /// KRPC 查询超时。响应通常几十毫秒到达，3s 无响应即视为对端不可达
 /// （原值 10s 会让不可达节点大幅拖慢 bootstrap / get_peers 迭代）。
 const KRPC_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+/// get_peers 每轮的并发查询数（Kademlia 的 α）。
+///
+/// 旧实现是一条条串行问：一轮 8 个节点里只要有几个不可达，就要排队等
+/// 各自的 KRPC 超时（8 × 3s = 24s）。冷启动阶段（路由表刚建、节点质量差）
+/// 几乎全耗在这上面，表现为「磁力任务转很久才出第一个 peer」。
+const GET_PEERS_ALPHA: usize = 8;
+/// get_peers 的迭代候选池大小。
+///
+/// 必须大于 K：旧实现每轮把候选截到 K=8，一轮问完就再没有更近的候选，
+/// 迭代形同虚设 —— 冷门种子（每轮都问不到 peer）只能干等。
+const GET_PEERS_CANDIDATES: usize = 32;
+/// 单次 get_peers 的时间预算（超过就带着已有结果返回，下一轮调度接着查）。
+const GET_PEERS_BUDGET: Duration = Duration::from_secs(8);
+/// 迭代轮数上限（防病态网络下的无限翻找）。
+const GET_PEERS_MAX_ROUNDS: usize = 8;
+/// 凑够这么多 peer 就提前收工：热门种子一个节点就回几十个，没必要
+/// 把整张路由表翻完；冷门种子根本到不了这个数，会一直查到网络边缘。
+const GET_PEERS_ENOUGH_PEERS: usize = 40;
 
 /// DHT 节点。
 pub struct Dht {
@@ -549,6 +567,13 @@ impl Dht {
 
     /// 迭代式 get_peers：从路由表最近节点开始，逐层向目标 info_hash 靠近。
     /// 返回找到的 peer 列表与访问过的节点（用于 announce_peer）。
+    ///
+    /// 两处与旧实现的实质差别（都是为了冷门种子）：
+    /// 1. **并发查询**（α=8）：串行时每个不可达节点都要等满 KRPC 超时，
+    ///    冷启动一轮就能耗掉 24s。
+    /// 2. **不因「找到 peer」就停**：冷门种子往往只有一两个节点回地址，
+    ///    停止迭代等于放弃剩下的线索。改为继续向更近的节点问，直到
+    ///    候选耗尽 / 时间预算用尽 / 凑够 `GET_PEERS_ENOUGH_PEERS`。
     pub async fn get_peers(
         self: &Arc<Self>,
         info_hash: InfoHash,
@@ -559,79 +584,89 @@ impl Dht {
         let mut announce_nodes: Vec<NodeEntry> = Vec::new();
         let mut all_known: Vec<NodeEntry>;
 
-        // 初始候选：路由表最近 K 个
+        // 初始候选：路由表最近的若干节点（多于 K，留出收窄余地）
         {
             let table = self.table.read().await;
-            all_known = table.closest(&target_node, K);
+            all_known = table.closest(&target_node, GET_PEERS_CANDIDATES);
         }
 
         // 如果路由表为空，尝试 bootstrap
         if all_known.is_empty() {
             self.bootstrap().await?;
             let table = self.table.read().await;
-            all_known = table.closest(&target_node, K);
+            all_known = table.closest(&target_node, GET_PEERS_CANDIDATES);
         }
 
-        // 迭代：向最近节点发 get_peers
-        let mut iterations = 0;
-        let max_iterations = 20; // 防止无限循环
-        while iterations < max_iterations {
-            iterations += 1;
-
-            // 选出未访问的最近 K 个节点
+        let deadline = tokio::time::Instant::now() + GET_PEERS_BUDGET;
+        for _ in 0..GET_PEERS_MAX_ROUNDS {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            // 选出未访问的最近若干节点
             let to_query: Vec<NodeEntry> = all_known
                 .iter()
                 .filter(|n| !visited.contains(&n.id))
-                .take(K)
+                .take(GET_PEERS_ALPHA)
                 .cloned()
                 .collect();
             if to_query.is_empty() {
                 break;
             }
-
-            let mut new_nodes: Vec<NodeEntry> = Vec::new();
-            let mut found_peers = false;
             for n in &to_query {
                 visited.insert(n.id);
-                match self.get_peers_query(n.addr, info_hash).await {
+            }
+
+            // 并发查询本轮节点：串行会让「有几个不可达节点」直接变成
+            // 几倍于 RTT 的冷启动延迟。
+            let mut set = tokio::task::JoinSet::new();
+            for n in to_query {
+                let dht = self.clone();
+                set.spawn(async move {
+                    let r = dht.get_peers_query(n.addr, info_hash).await;
+                    (n, r)
+                });
+            }
+
+            let mut new_nodes: Vec<NodeEntry> = Vec::new();
+            while let Some(joined) = set.join_next().await {
+                let Ok((node, r)) = joined else { continue };
+                match r {
                     Ok(resp) => {
-                        announce_nodes.push(n.clone());
+                        announce_nodes.push(node.clone());
                         if let Some(peers) = resp.peers {
-                            for p in &peers {
-                                all_peers.push(p.addr);
-                            }
-                            found_peers = true;
-                        } else {
-                            // 继续：加入新发现的节点
-                            for n2 in &resp.nodes {
-                                new_nodes.push(n2.clone());
-                            }
+                            all_peers.extend(peers.iter().map(|p| p.addr));
+                        }
+                        // 回了 peers 的节点同样可能带回更近的节点：
+                        // 旧实现把两者当成互斥（有 peers 就不看 nodes），
+                        // 冷门种子因此丢掉一半线索。
+                        for n2 in &resp.nodes {
+                            new_nodes.push(n2.clone());
                         }
                     }
                     Err(e) => {
-                        tracing::debug!(addr = %n.addr, error = %e, "get_peers 查询失败");
+                        tracing::debug!(addr = %node.addr, error = %e, "get_peers 查询失败");
                         // 标记坏节点
                         let mut table = self.table.write().await;
-                        table.mark_bad(&n.id);
+                        table.mark_bad(&node.id);
                     }
                 }
             }
 
-            if found_peers {
-                // 找到 peers，停止迭代
+            all_peers.sort();
+            all_peers.dedup();
+            if all_peers.len() >= GET_PEERS_ENOUGH_PEERS {
                 break;
             }
-
             if new_nodes.is_empty() {
-                // 没有更多候选，停止
+                // 这一轮没有任何更近的节点：已经问到网络边缘
                 break;
             }
 
-            // 合并新旧候选，去重后按距离排序，取最近 K 个
+            // 合并新旧候选，去重后按距离排序，保留最近的若干
             all_known.extend(new_nodes);
             all_known.sort_by_key(|n| n.id.xor(&target_node));
             all_known.dedup_by(|a, b| a.id == b.id);
-            all_known.truncate(K);
+            all_known.truncate(GET_PEERS_CANDIDATES);
 
             // 加入路由表
             let mut table = self.table.write().await;
@@ -872,31 +907,28 @@ fn response_tid(data: &[u8]) -> Option<[u8; 2]> {
 /// `enable_ipv6` 时一并解析 BOOTSTRAP_V6（IPv6 节点）；单族解析失败
 /// 只记 debug，不影响另一族。两族都解析不到时退回已知 IPv4 兜底 IP。
 async fn resolve_bootstrap(enable_ipv6: bool) -> Vec<SocketAddr> {
-    let mut addrs = Vec::new();
-    // IPv4 bootstrap
+    // **并发解析**：串行时每个慢/挂掉的域名都要等满一次 DNS 超时，冷启动
+    // 的第一跳就耗在这上面（bootstrap 域名常年有一两个解析不出来）。
+    let mut set = tokio::task::JoinSet::new();
     for (host, port) in crate::BOOTSTRAP_V4 {
-        if let Ok(addr) = tokio::net::lookup_host(format!("{host}:{port}")).await {
-            for a in addr {
-                if a.is_ipv4() {
-                    addrs.push(a);
-                }
-            }
-        }
+        let (host, port) = (*host, *port);
+        set.spawn(async move { (true, tokio::net::lookup_host(format!("{host}:{port}")).await) });
     }
-    // IPv6 bootstrap（DHT over IPv6）
     if enable_ipv6 {
         for (host, port) in crate::BOOTSTRAP_V6 {
-            match tokio::net::lookup_host(format!("{host}:{port}")).await {
-                Ok(iter) => {
-                    for a in iter {
-                        if a.is_ipv6() {
-                            addrs.push(a);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(host = %host, error = %e, "IPv6 bootstrap 节点解析失败");
-                }
+            let (host, port) = (*host, *port);
+            set.spawn(async move { (false, tokio::net::lookup_host(format!("{host}:{port}")).await) });
+        }
+    }
+    let mut addrs = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        let Ok((want_v4, Ok(iter))) = joined else {
+            continue;
+        };
+        for a in iter {
+            // IPv4 bootstrap 只取 A 记录，IPv6 bootstrap 只取 AAAA
+            if want_v4 == a.is_ipv4() {
+                addrs.push(a);
             }
         }
     }
@@ -1083,6 +1115,140 @@ mod tests {
         let result = dht.get_peers(ih).await.unwrap();
         assert!(!result.peers.is_empty());
         assert!(result.peers.contains(&"127.0.0.1:51413".parse().unwrap()));
+    }
+
+    /// 构造「peers 与 nodes 同时返回」的 get_peers 响应。
+    ///
+    /// 这是真实 DHT 的常态，但 `encode_get_peers_response_with_peers` 只
+    /// 编 values/token，没有 nodes —— 测试里单独拼一份。
+    fn encode_peers_and_nodes(
+        tid: &[u8],
+        id: &NodeId,
+        peers: &[std::net::Ipv4Addr],
+        nodes: &[NodeEntry],
+    ) -> Vec<u8> {
+        use std::collections::BTreeMap;
+        use xfer_bencode::encode;
+        let mut r = BTreeMap::new();
+        r.insert(b"id".to_vec(), Value::Bytes(id.as_bytes().to_vec()));
+        let values: Vec<Value> = peers
+            .iter()
+            .map(|ip| {
+                let mut b = Vec::with_capacity(6);
+                b.extend_from_slice(&ip.octets());
+                b.extend_from_slice(&51413u16.to_be_bytes());
+                Value::Bytes(b)
+            })
+            .collect();
+        if !values.is_empty() {
+            r.insert(b"values".to_vec(), Value::List(values));
+        }
+        let mut nb = Vec::new();
+        for n in nodes {
+            if let SocketAddr::V4(a) = n.addr {
+                nb.extend_from_slice(n.id.as_bytes());
+                nb.extend_from_slice(&a.ip().octets());
+                nb.extend_from_slice(&a.port().to_be_bytes());
+            }
+        }
+        if !nb.is_empty() {
+            r.insert(b"nodes".to_vec(), Value::Bytes(nb));
+        }
+        r.insert(b"token".to_vec(), Value::Bytes(b"tok".to_vec()));
+        let mut top = BTreeMap::new();
+        top.insert(b"t".to_vec(), Value::Bytes(tid.to_vec()));
+        top.insert(b"y".to_vec(), Value::Bytes(b"r".to_vec()));
+        top.insert(b"r".to_vec(), Value::Dict(r));
+        encode(&Value::Dict(top))
+    }
+
+    /// 模拟一个「回 N 个 peer（可选指路到更近节点）」的 get_peers 节点。
+    async fn spawn_mock_get_peers_node(
+        id: NodeId,
+        port: u16,
+        peers: u8,
+        ip_base: u8,
+        nodes: Vec<NodeEntry>,
+    ) -> Arc<UdpSocket> {
+        let socket = Arc::new(UdpSocket::bind(("127.0.0.1", port)).await.unwrap());
+        let s = socket.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, from)) = s.recv_from(&mut buf).await {
+                let data = &buf[..n];
+                let Ok(IncomingQuery::GetPeers { tid, .. }) = parse_query(data) else {
+                    continue;
+                };
+                let addrs: Vec<std::net::Ipv4Addr> = (0..peers)
+                    .map(|i| std::net::Ipv4Addr::new(127, 0, 1, ip_base.wrapping_add(i)))
+                    .collect();
+                let resp = encode_peers_and_nodes(&tid, &id, &addrs, &nodes);
+                let _ = s.send_to(&resp, from).await;
+            }
+        });
+        socket
+    }
+
+    /// 冷门种子：**第一个回 peers 的节点不能终止迭代**。
+    ///
+    /// 旧实现有两个叠加缺陷：
+    /// 1. 把 `values` 与 `nodes` 当互斥（`if peers {..} else {nodes}`），
+    ///    回了 peers 的节点附带的更近节点被整包丢掉；
+    /// 2. 一见到 peers 就 break。
+    /// 于是「A 有 1 个 peer 且指路到 B，B 还有 2 个 peer」只能拿到 1 个 ——
+    /// 冷门种子恰恰全是这种形状。
+    #[tokio::test]
+    async fn dht_get_peers_keeps_exploring_after_first_hit() {
+        let b_id = node_id_from_seed(b"rare-b");
+        let b_sock = spawn_mock_get_peers_node(b_id, 0, 2, 40, Vec::new()).await;
+        let b_addr = b_sock.local_addr().unwrap();
+        // A：1 个 peer + 指路到 B
+        let a_id = node_id_from_seed(b"rare-a");
+        let a_sock = spawn_mock_get_peers_node(
+            a_id,
+            0,
+            1,
+            30,
+            vec![NodeEntry {
+                id: b_id,
+                addr: b_addr,
+            }],
+        )
+        .await;
+        let a_addr = a_sock.local_addr().unwrap();
+
+        let dht = Dht::new(DhtConfig {
+            node_id: Some(node_id_from_seed(b"test-rare")),
+            listen_port: 0,
+            bind_addr: Some("127.0.0.1".into()),
+            routing_table_file: None,
+            enable_ipv6: false,
+        })
+        .await
+        .unwrap();
+        dht.spawn_background();
+        {
+            let mut table = dht.table.write().await;
+            table.add(NodeEntry {
+                id: a_id,
+                addr: a_addr,
+            });
+        }
+
+        let ih = InfoHash::from_bytes(&[0x77; 20]);
+        let result = dht.get_peers(ih).await.unwrap();
+        assert!(
+            result.peers.len() >= 3,
+            "回 peers 的节点指路后必须继续迭代（应拿到 3 个），实际 {}: {:?}",
+            result.peers.len(),
+            result.peers
+        );
+        assert!(result.peers.contains(&"127.0.1.30:51413".parse().unwrap()));
+        assert!(result.peers.contains(&"127.0.1.40:51413".parse().unwrap()));
+        // 两个节点都答过 → 都可作为 announce 目标（冷门种子要靠它挂名）
+        assert_eq!(result.announce_nodes.len(), 2, "回 peers 的节点也要记进 announce 目标");
+
+        dht.shutdown();
     }
 
     #[tokio::test]
