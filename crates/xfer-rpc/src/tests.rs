@@ -1,6 +1,7 @@
 //! 协议层测试：原生/前端兼容分发、batch、鉴权、事件帧、WS 端到端。
 
 use super::*;
+use crate::transport::{get_query_to_request, is_valid_jsonp_callback, GetRpcQuery};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -379,6 +380,136 @@ async fn ws_e2e_native_and_compat_channels() {
     }
     assert!(got_start_a, "A 应收到 task.start");
     assert!(!got_compat_leak, "A 不应收到前端事件帧");
+
+    shutdown.cancel();
+    let _ = serve_task.await;
+    let _ = events;
+}
+
+// ------------------------------------------------------------------
+// aria2 的 GET/JSONP 形式
+// ------------------------------------------------------------------
+
+/// 查询参数 → JSON-RPC 请求文本：字段名/缺省值/错误分支。
+///
+/// 这条链路是浏览器端插件唯一的入口（Bilibili-Evolved 的「aria2 输出支持」
+/// 用 GET 绕 CORS），拼错一个字段名，用户侧只会看到「发送失败」。
+#[test]
+fn get_query_maps_to_jsonrpc_request() {
+    let q = GetRpcQuery {
+        method: Some("aria2.addUri".into()),
+        id: Some("7".into()),
+        params: Some(r#"["token:x",["http://example.com/a.mp4"],{"dir":"/dl"}]"#.into()),
+        jsonp: Some("cb".into()),
+    };
+    let text = get_query_to_request(&q).expect("应能拼出请求");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["jsonrpc"], "2.0");
+    assert_eq!(v["id"], 7, "数字 id 必须原样透传成数字");
+    assert_eq!(v["method"], "aria2.addUri");
+    assert_eq!(v["params"][1][0], "http://example.com/a.mp4");
+    assert_eq!(v["params"][2]["dir"], "/dl");
+
+    // 不带 params：按「无参数」处理（aria2.getVersion 就这么调）
+    let q = GetRpcQuery {
+        method: Some("aria2.getVersion".into()),
+        id: Some("\"abc\"".into()),
+        params: None,
+        jsonp: None,
+    };
+    let v: Value = serde_json::from_str(&get_query_to_request(&q).unwrap()).unwrap();
+    assert_eq!(v["params"], serde_json::json!([]));
+    assert_eq!(v["id"], "abc", "字符串 id 要保留字符串形态");
+
+    // 缺 method → 明确报错（不能静默当通知丢掉）
+    let q = GetRpcQuery {
+        method: None,
+        ..Default::default()
+    };
+    assert!(get_query_to_request(&q).is_err());
+
+    // params 不是 JSON → 报错，绝不能悄悄降级成空参数执行
+    let q = GetRpcQuery {
+        method: Some("aria2.addUri".into()),
+        params: Some("not-json".into()),
+        ..Default::default()
+    };
+    assert!(get_query_to_request(&q).is_err());
+}
+
+/// JSONP 回调名必须白名单校验：响应体会被调用方当脚本执行。
+#[test]
+fn jsonp_callback_name_is_validated() {
+    for ok in ["cb", "_cb", "$cb", "my.callback", "cb1"] {
+        assert!(is_valid_jsonp_callback(ok), "{ok} 应合法");
+    }
+    for bad in [
+        "",
+        "1cb",
+        "alert(1)",
+        "cb;alert(1)",
+        "cb</script>",
+        "cb-x",
+        "cb[0]",
+    ] {
+        assert!(!is_valid_jsonp_callback(bad), "{bad} 必须被拒");
+    }
+}
+
+/// 端到端：真实 serve 上走 GET + jsonp，返回 `cb(<json>)`；
+/// 同一个地址的 WebSocket 升级仍然要能用（两条路径共用 GET /jsonrpc）。
+#[tokio::test]
+async fn get_jsonrpc_with_jsonp_end_to_end() {
+    let mgr = TaskManager::start(std::env::temp_dir(), 2);
+    let events = mgr.events();
+    let router = Arc::new(Router::new(None, mgr.clone(), events.clone()));
+    let shutdown = CancellationToken::new();
+    let sd = shutdown.clone();
+    let local = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        drop(l);
+        a
+    };
+    let r3 = router.clone();
+    let serve_task = tokio::spawn(async move {
+        crate::serve(local, r3, sd).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // 1) GET + jsonp：响应体必须是 `cb({...})`，Content-Type 是脚本
+    let url = format!("http://{local}/jsonrpc?method=aria2.getVersion&id=1&jsonp=myCb");
+    let resp = reqwest::get(&url).await.expect("GET 应成功");
+    assert!(resp.status().is_success(), "状态码 {}", resp.status());
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(ct.starts_with("text/javascript"), "Content-Type 实际 {ct}");
+    let body = resp.text().await.unwrap();
+    assert!(body.starts_with("myCb("), "JSONP 包装缺失：{body}");
+    assert!(body.ends_with(')'), "JSONP 包装缺失：{body}");
+    let inner = &body["myCb(".len()..body.len() - 1];
+    let v: Value = serde_json::from_str(inner).expect("回调里必须是合法 JSON");
+    assert_eq!(v["result"]["version"], ENGINE_VERSION);
+    assert_eq!(v["id"], 1);
+
+    // 2) 不带 jsonp：回普通 JSON
+    let url = format!("http://{local}/jsonrpc?method=aria2.getVersion&id=2");
+    let v: Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+    assert_eq!(v["result"]["version"], ENGINE_VERSION);
+
+    // 3) 非法回调名必须拒（否则等于开放 JSONP XSS）
+    let url = format!("http://{local}/jsonrpc?method=aria2.getVersion&jsonp=alert(1)");
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 4) 缺 method 必须报 400 而不是挂住
+    let url = format!("http://{local}/jsonrpc?id=3");
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 
     shutdown.cancel();
     let _ = serve_task.await;
