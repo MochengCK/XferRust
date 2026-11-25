@@ -1,10 +1,11 @@
 //! JSON-RPC 2.0 传输层：HTTP POST + aria2 风格的 **GET/JSONP** + WebSocket。
 //!
 //! 三种入口共用同一个 [`Router`]：
-//! - `POST /jsonrpc`：标准 JSON-RPC；
-//! - `GET /jsonrpc?method=…&id=…&params=[…][&jsonp=cb]`：aria2 的 GET 形式，
-//!   浏览器端插件（Bilibili-Evolved 的「aria2 输出支持」等）靠它绕开 CORS；
-//!   带 `jsonp` 时按脚本回调包装返回；
+//! - `POST /jsonrpc`：标准 JSON-RPC（带 CORS 预检，网页可直接 fetch）；
+//! - `GET /jsonrpc?method=…&id=…&params=…[&jsonp=cb]`：aria2 的 GET 形式 ——
+//!   **`params` 是 Base64(JSON)**（也兼容纯 JSON），浏览器端插件
+//!   （Bilibili-Evolved 的「aria2 输出支持」等）靠它绕开 CORS；带 `jsonp`
+//!   时按脚本回调包装返回；
 //! - `GET /jsonrpc` + `Upgrade: websocket`：单连接复用（请求/响应 + 事件推送）。
 //!
 //! 设计目标：一条 WebSocket 连接同时承载请求/响应与事件推送，
@@ -15,8 +16,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::extract::{FromRequestParts, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -54,6 +56,37 @@ pub(crate) fn is_valid_jsonp_callback(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '.')
 }
 
+/// 解出 aria2 GET 形式的 `params`。
+///
+/// **aria2 的官方 GET 形式是 `params=Base64(JSON)`，不是 URL 编码的 JSON** ——
+/// Bilibili-Evolved 的「aria2 输出支持」就是按这个发的（`btoa(JSON.stringify(params))`）。
+/// 只认 URL 编码 JSON 会让它的请求全部落进"params 不是合法 JSON"，而它把
+/// code 1 一律翻译成"请检查您的密钥"—— 用户明明填对了密钥也会看到密钥错误。
+///
+/// 查询串里的 `+` 会被 form 解码成空格（Base64 的字母表里有 `+`），所以先换回去。
+/// 同时保留纯 JSON 的兜底：手写 URL / 旧调用方一直就是这么用的。
+fn decode_get_params(raw: &str) -> Result<Value, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+    let b64 = trimmed.replace(' ', "+");
+    for engine in [
+        &base64::engine::general_purpose::STANDARD,
+        &base64::engine::general_purpose::URL_SAFE,
+    ] {
+        if let Ok(bytes) = engine.decode(b64.as_bytes()) {
+            if let Ok(text) = String::from_utf8(bytes) {
+                if let Ok(v) = serde_json::from_str(&text) {
+                    return Ok(v);
+                }
+            }
+        }
+    }
+    serde_json::from_str(trimmed)
+        .map_err(|e| format!("params 不是合法的 Base64(JSON) 或 JSON：{e}"))
+}
+
 /// 把 aria2 的 GET 查询参数拼成一条 JSON-RPC 请求文本（交给 Router 解析）。
 ///
 /// 单独抽出来是为了能直接单测：拼错一个字段名，浏览器端插件那边只会看到
@@ -67,11 +100,9 @@ pub(crate) fn get_query_to_request(q: &GetRpcQuery) -> Result<String, String> {
         .ok_or_else(|| "缺少 method 参数".to_string())?;
     // params 缺省 = 无参数（aria2 同语义）；给了但解析不出来是调用方的错，
     // 必须回错误而不是悄悄当空数组执行（那会变成"参数丢了还能跑"）
-    let params: Value = match q.params.as_deref().map(str::trim) {
-        Some(s) if !s.is_empty() => {
-            serde_json::from_str(s).map_err(|e| format!("params 不是合法 JSON：{e}"))?
-        }
-        _ => Value::Array(Vec::new()),
+    let params: Value = match q.params.as_deref() {
+        Some(s) => decode_get_params(s)?,
+        None => Value::Array(Vec::new()),
     };
     // id 允许数字或字符串，原样透传；没给就按通知处理
     let id: Value = match q.id.as_deref().map(str::trim) {
@@ -95,12 +126,49 @@ async fn post_jsonrpc(
 ) -> axum::response::Response {
     let text = match std::str::from_utf8(&body) {
         Ok(t) => t,
-        Err(_) => return axum::http::StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => return allow_cors(axum::http::StatusCode::BAD_REQUEST.into_response()),
     };
-    match state.router.handle(text).response {
+    let resp = match state.router.handle(text).response {
         Some(v) => axum::response::Json(v).into_response(),
         None => axum::http::StatusCode::BAD_REQUEST.into_response(),
-    }
+    };
+    allow_cors(resp)
+}
+
+/// 给响应补 CORS 头：浏览器里的网页/插件直接 `fetch` 本地 RPC 时，没有它读不到结果。
+///
+/// 放开 `*` 是安全的：RPC 监听在 127.0.0.1，写操作仍要 `token:` 鉴权；
+/// 跨源只能"读到错误"，拿不到未授权的操作。
+fn allow_cors(mut resp: Response) -> Response {
+    let headers = resp.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    headers.insert(
+        HeaderName::from_static("access-control-allow-private-network"),
+        HeaderValue::from_static("true"),
+    );
+    resp
+}
+
+/// CORS 预检。浏览器对 `POST /jsonrpc`（`Content-Type: application/json`）会先发
+/// OPTIONS；没有这个入口时预检直接 405，用户侧只看到"发送失败"。
+async fn options_jsonrpc() -> Response {
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    let headers = resp.headers_mut();
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("POST, GET, OPTIONS"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("content-type"),
+    );
+    headers.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+    headers.insert(
+        HeaderName::from_static("access-control-allow-private-network"),
+        HeaderValue::from_static("true"),
+    );
+    resp
 }
 
 fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
@@ -115,6 +183,10 @@ fn is_websocket_upgrade(headers: &axum::http::HeaderMap) -> bool {
 
 /// GET 形式的响应：带 `jsonp` 时包装成脚本回调，否则回 JSON。
 fn get_rpc_response(router: &Router, q: &GetRpcQuery) -> Response {
+    allow_cors(get_rpc_response_inner(router, q))
+}
+
+fn get_rpc_response_inner(router: &Router, q: &GetRpcQuery) -> Response {
     let text = match get_query_to_request(q) {
         Ok(t) => t,
         Err(msg) => {
@@ -232,7 +304,9 @@ pub async fn serve(
     let app = axum::Router::new()
         .route(
             "/jsonrpc",
-            axum::routing::post(post_jsonrpc).get(get_jsonrpc),
+            axum::routing::post(post_jsonrpc)
+                .get(get_jsonrpc)
+                .options(options_jsonrpc),
         )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;

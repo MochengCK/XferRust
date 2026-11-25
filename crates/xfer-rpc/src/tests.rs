@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::transport::{get_query_to_request, is_valid_jsonp_callback, GetRpcQuery};
+use base64::Engine as _;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -437,6 +438,37 @@ fn get_query_maps_to_jsonrpc_request() {
     assert!(get_query_to_request(&q).is_err());
 }
 
+/// aria2 的 GET 形式实际发的是 **Base64(JSON)**（Bilibili-Evolved 就是
+/// `btoa(JSON.stringify(params))`），不是 URL 编码 JSON。
+/// 只认后者会让它的 addUri 全部被判成"参数错"，而它把 code 1 显示成"密钥错误"。
+#[test]
+fn get_query_accepts_aria2_base64_params() {
+    let json = r#"["token:x",["http://example.com/a.mp4"],{"out":"a b.mp4","dir":"/dl"}]"#;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(json);
+    // 查询串里的 `+` 会被 form 解码成空格：模拟真实到达服务端的样子
+    let q = GetRpcQuery {
+        method: Some("aria2.addUri".into()),
+        id: Some("标题".into()),
+        params: Some(b64.replace('+', " ")),
+        jsonp: None,
+    };
+    let v: Value = serde_json::from_str(&get_query_to_request(&q).expect("Base64 params 应能解开"))
+        .unwrap();
+    assert_eq!(v["params"][0], "token:x");
+    assert_eq!(v["params"][1][0], "http://example.com/a.mp4");
+    assert_eq!(v["params"][2]["out"], "a b.mp4");
+    assert_eq!(v["id"], "标题", "URL 编码过的标题要还原成字符串");
+
+    // 空数组的 Base64（`W10=`）也是常见形态
+    let q = GetRpcQuery {
+        method: Some("aria2.getVersion".into()),
+        params: Some("W10=".into()),
+        ..Default::default()
+    };
+    let v: Value = serde_json::from_str(&get_query_to_request(&q).unwrap()).unwrap();
+    assert_eq!(v["params"], serde_json::json!([]));
+}
+
 /// JSONP 回调名必须白名单校验：响应体会被调用方当脚本执行。
 #[test]
 fn jsonp_callback_name_is_validated() {
@@ -510,6 +542,36 @@ async fn get_jsonrpc_with_jsonp_end_to_end() {
     let url = format!("http://{local}/jsonrpc?id=3");
     let resp = reqwest::get(&url).await.unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 5) aria2 官方 GET 形式：`params` 是 Base64(JSON)（B-E 用的就是这个）
+    let url = format!("http://{local}/jsonrpc?method=aria2.getVersion&id=5&params=W10%3D");
+    let v: Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+    assert_eq!(v["result"]["version"], ENGINE_VERSION);
+
+    // 6) CORS 预检：浏览器对 `POST /jsonrpc` 会先发 OPTIONS
+    let resp = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, format!("http://{local}/jsonrpc"))
+        .header(reqwest::header::ORIGIN, "https://www.bilibili.com")
+        .header("access-control-request-method", "POST")
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "OPTIONS 状态码 {}", resp.status());
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*"),
+        "预检必须允许跨源"
+    );
+    assert!(
+        resp.headers()
+            .get("access-control-allow-methods")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .contains("POST"),
+        "预检必须允许 POST"
+    );
 
     shutdown.cancel();
     let _ = serve_task.await;
